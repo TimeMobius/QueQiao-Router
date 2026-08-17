@@ -21,10 +21,13 @@ use axum::{
     Json,
 };
 use eventsource_stream::{Event as UpstreamEvent, Eventsource};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::error;
@@ -370,6 +373,45 @@ fn ensure_non_empty_choices(value: &mut Value, is_chat: bool) -> bool {
     true
 }
 
+/// 在 SSE 流自然结束时补发 `[DONE]` 哨兵，防止客户端永远收不到流结束标记。
+///
+/// 背景：`eventsource-stream` 在以下两种情况下会**静默**丢弃最后一个不完整的 SSE 事件，
+/// 不会发 Err 也不会发 events：
+/// 1. 上游发送 `data: ...\n`（单换行）后关闭连接（缺少结尾的 `\n\n` 分隔符）。
+/// 2. 上游 TCP 连接在写出最后一个 chunk 后被对端关闭，但 buffer 中仍有未解析的残余字节。
+///
+/// 这两种情况下 `eventsource-stream` 直接返回 `Poll::Ready(None)`，
+/// `process_streaming_response` 的 flat_map 不会收到任何新的项，因此也不会
+/// 触发现有的 `[DONE]` 发射路径 —— 客户端只能通过流量结束判断关闭，但 OpenAI 兼容
+/// 客户端（如 OpenAI Python SDK）会因此在 `for chunk in stream` 处永久阻塞。
+///
+/// 行为约定：
+/// - 上游已显式发送过 `[DONE]` → 直接结束（避免重复）
+/// - 上游触发了错误解析路径（Err 分支已发 error chunk）→ 直接结束（保留原"错误不再发 [DONE]"语义）
+/// - 上游流自然结束但未发 `[DONE]` → 补发一个
+struct DoneSentinel {
+    flag: Arc<AtomicBool>,
+    emitted: bool,
+}
+
+impl Stream for DoneSentinel {
+    type Item = Result<Event, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.emitted {
+            return Poll::Ready(None);
+        }
+        self.emitted = true;
+        if self.flag.load(Ordering::Relaxed) {
+            // 上游已发 [DONE]（Ok 分支）或已发 error chunk（Err 分支），无需补发
+            Poll::Ready(None)
+        } else {
+            // 兜底：流自然结束但未发 [DONE]，补发以让客户端能正常退出
+            Poll::Ready(Some(Ok(Event::default().data("[DONE]"))))
+        }
+    }
+}
+
 pub async fn process_streaming_response(
     app_state: Arc<AppState>,
     headers: HeaderMap,
@@ -490,11 +532,18 @@ pub async fn process_streaming_response(
     let needs_json_roundtrip = apply_thinking || !special_prefix.is_empty();
     let model_for_error = model_for_meta.clone();
 
+    // 共享标志：上游/错误路径需要通知尾巴处的 DoneSentinel 是否已经走过 [DONE]
+    // 或 error chunk 发射路径，避免兜底时重复发送或破坏"错误不再发 [DONE]"语义。
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let done_flag_in_flat_map = done_flag.clone();
+
     // 使用 eventsource-stream 进行鲁棒的 SSE 解析
     let sse_stream = stream.eventsource().flat_map(move |result| {
         match result {
             Ok(event) => {
                 if event.data == "[DONE]" {
+                    // 上游显式发送 [DONE]：通知尾巴不再补发
+                    done_flag_in_flat_map.store(true, Ordering::Relaxed);
                     if apply_thinking {
                         if let Some(flush_delta) = thinking_transformer.finalize() {
                             let flush_chunk =
@@ -566,6 +615,9 @@ pub async fn process_streaming_response(
             }
             Err(e) => {
                 error!("Error parsing SSE stream: {}", e);
+                // 错误路径不再发 [DONE]（保持 OpenAI 兼容客户端既有期望），
+                // 通知尾巴处的 DoneSentinel 也不要补发。
+                done_flag_in_flat_map.store(true, Ordering::Relaxed);
                 // OpenAI 标准: 以标准 chat.completion.chunk 格式下发错误，
                 // 顶层 error 字段 + choices 带 finish_reason:"error"，不再发 [DONE]。
                 let err_chunk = json!({
@@ -591,8 +643,17 @@ pub async fn process_streaming_response(
         }
     });
 
+    // 在流尾部连接 DoneSentinel：当上游因 eventsource-stream 静默丢弃最后一个
+    // 不完整事件而自然结束（Poll::Ready(None)）时，兜底补发 `[DONE]`，避免
+    // 客户端永远收不到流结束标记。上游已显式发过 [DONE] 或触发了错误路径
+    // 时，DoneSentinel 看到 flag 后会直接结束，不会重复也不破坏既有语义。
+    let appended = sse_stream.chain(DoneSentinel {
+        flag: done_flag.clone(),
+        emitted: false,
+    });
+
     // Create response and add AccessLogMeta for metrics tracking
-    let mut response = Sse::new(sse_stream)
+    let mut response = Sse::new(appended)
         .keep_alive(KeepAlive::default())
         .into_response();
 
@@ -720,5 +781,58 @@ mod tests {
 
         assert!(!is_chat_completion_ping(&choices));
         assert!(!is_chat_completion_ping(&error));
+    }
+
+    use futures::executor::block_on;
+    use futures::StreamExt;
+
+    fn collect_done_sentinel_count(flag: Arc<AtomicBool>) -> usize {
+        let mut s = DoneSentinel {
+            flag,
+            emitted: false,
+        };
+        let mut count = 0;
+        block_on(async {
+            while let Some(item) = s.next().await {
+                item.expect("DoneSentinel never emits Err");
+                count += 1;
+            }
+        });
+        count
+    }
+
+    #[test]
+    fn done_sentinel_emits_done_when_flag_unset() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert_eq!(collect_done_sentinel_count(flag), 1);
+    }
+
+    #[test]
+    fn done_sentinel_skips_when_done_already_seen() {
+        let flag = Arc::new(AtomicBool::new(true));
+        assert_eq!(collect_done_sentinel_count(flag), 0);
+    }
+
+    #[test]
+    fn done_sentinel_skips_after_error_path() {
+        let flag = Arc::new(AtomicBool::new(true));
+        assert_eq!(collect_done_sentinel_count(flag), 0);
+    }
+
+    #[test]
+    fn done_sentinel_emits_at_most_once() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut s = DoneSentinel {
+            flag,
+            emitted: false,
+        };
+        block_on(async {
+            let first = s.next().await;
+            let second = s.next().await;
+            let third = s.next().await;
+            assert!(first.is_some(), "first poll must emit");
+            assert!(second.is_none(), "second poll must end");
+            assert!(third.is_none(), "third poll must end");
+        });
     }
 }
