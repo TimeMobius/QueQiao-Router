@@ -107,7 +107,7 @@ docker run -d \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/logs:/app/logs \
   --restart always \
-  ghcr.io/timemobius/queqiao-router:b475
+  ghcr.io/timemobius/queqiao-router:b477
 ```
 
 > **数据库路径说明**: 源码默认 `RECD_PATH=sqlite:./record.db`（数据库文件在运行目录），而 Docker 镜像默认设为 `sqlite:./logs/record.db`（写入挂载的 logs 卷）。若使用 Docker，建议将 logs 目录挂载为主机持久化路径，或显式设置 `RECD_PATH` 环境变量指向挂载路径，避免容器重启后数据丢失。
