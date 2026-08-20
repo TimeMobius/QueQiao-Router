@@ -32,6 +32,11 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::error;
 
+/// Sentinel pushed into the logger channel when an upstream SSE error
+/// terminates the stream, so the logger task can mark the request failed
+/// in the success-rate metrics. Cannot collide with a valid SSE JSON chunk.
+const STREAM_UPSTREAM_ERROR_SENTINEL: &str = "\u{0}__STREAM_UPSTREAM_ERROR__\u{0}";
+
 struct ToolCallAccumulator {
     index: u64,
     id: Option<String>,
@@ -151,8 +156,16 @@ async fn stream_logger_task(
     let mut captured_usage: Option<Value> = None;
     let mut captured_finish_reason: Option<String> = None;
     let mut _ttft_recorded = false;
+    let mut stream_failed = false;
 
     while let Some(chunk_str) = rx.recv().await {
+        // The upstream SSE stream terminated with an error; record the request
+        // as unsuccessful but do not treat the sentinel as stream content.
+        if chunk_str == STREAM_UPSTREAM_ERROR_SENTINEL {
+            stream_failed = true;
+            continue;
+        }
+
         // Deserialize in background task
         let chunk: Value = match serde_json::from_str(&chunk_str) {
             Ok(v) => v,
@@ -323,7 +336,7 @@ async fn stream_logger_task(
             model: model.clone(),
             backend: backend.clone(),
             latency: total_elapsed,
-            is_success: true,
+            is_success: !stream_failed,
             completion_tokens,
             prompt_tokens,
             elapsed: Some(total_elapsed),
@@ -689,6 +702,10 @@ pub async fn process_streaming_response(
                 let err_str = simd_json::to_string(&err_chunk).unwrap_or_else(|_| {
                     "{\"object\":\"chat.completion.chunk\",\"error\":{\"code\":\"upstream_error\",\"message\":\"upstream stream interrupted\"},\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}".to_string()
                 });
+                // Notify the logger task that this stream failed upstream,
+                // so its MetricEvent records the request as unsuccessful and
+                // the success-rate metrics reflect the error.
+                let _ = tx.send(STREAM_UPSTREAM_ERROR_SENTINEL.to_string());
                 stream::iter(vec![
                     Ok(Event::default().data(err_str)),
                 ])
@@ -887,6 +904,17 @@ mod tests {
             assert!(second.is_none(), "second poll must end");
             assert!(third.is_none(), "third poll must end");
         });
+    }
+
+    #[test]
+    fn stream_upstream_error_sentinel_is_distinct_from_json_chunks() {
+        assert!(
+            serde_json::from_str::<Value>(STREAM_UPSTREAM_ERROR_SENTINEL).is_err(),
+            "sentinel must not be parseable as a JSON SSE chunk"
+        );
+        let chunk = r#"{"object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}"#;
+        assert_ne!(chunk, STREAM_UPSTREAM_ERROR_SENTINEL);
+        assert_ne!("[DONE]", STREAM_UPSTREAM_ERROR_SENTINEL);
     }
 
     #[test]
