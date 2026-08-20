@@ -2,21 +2,24 @@ use crate::app_error::AppError;
 use crate::client::client_manager::ClientManager;
 use crate::client::routing::select_clients;
 use crate::config::config_manager::ConfigManager;
-use crate::config::types::{ClientConfig, LoadBalancingStrategy};
+use crate::config::types::{ClientConfig, HealthCheckConfig, LoadBalancingStrategy};
 use crate::metrics::active_requests::get_active_counts_for_clients;
 use crate::metrics::prometheus::FAILOVER_TOTAL;
 use crate::models::AccessLogMeta;
+use crate::services::circuit_breaker::{AttemptPermission, CircuitBreakerRegistry};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct DispatcherService {
     config_manager: Arc<ConfigManager>,
     client_manager: Arc<ClientManager>,
+    circuit_breakers: CircuitBreakerRegistry,
 }
 
 fn select_fallback_model(clients: &[ClientConfig]) -> Option<String> {
@@ -28,6 +31,7 @@ impl DispatcherService {
         Self {
             config_manager,
             client_manager,
+            circuit_breakers: CircuitBreakerRegistry::new(HealthCheckConfig::default()),
         }
     }
 
@@ -89,6 +93,8 @@ impl DispatcherService {
         F: FnMut(&ClientConfig, &str) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Response, AppError>> + Send + 'static,
     {
+        let config = self.config_manager.get_config().await;
+        self.circuit_breakers.configure(config.health_check);
         let cb = Arc::new(Mutex::new(request_callback));
         let mut current_model = initial_model.to_string();
         let mut all_tried_clients = Vec::new();
@@ -102,13 +108,14 @@ impl DispatcherService {
                 Err(e) => return e.into_response(),
             };
 
-            let execution_result = Self::execute_client_chain(
-                &clients,
-                &current_model,
-                cb.clone(),
-                &mut all_tried_clients,
-            )
-            .await;
+            let execution_result = self
+                .execute_client_chain_with_breaker(
+                    &clients,
+                    &current_model,
+                    cb.clone(),
+                    &mut all_tried_clients,
+                )
+                .await;
             // ... (后面保持不变)
             match execution_result {
                 // 成功获得响应（包括 4xx 客户端错误，这些被视为业务成功处理）
@@ -177,6 +184,28 @@ impl DispatcherService {
         }
     }
 
+    async fn execute_client_chain_with_breaker<F, Fut>(
+        &self,
+        clients: &[ClientConfig],
+        model_name: &str,
+        request_callback: Arc<Mutex<F>>,
+        tried_clients_accumulator: &mut Vec<String>,
+    ) -> Result<Response, Option<String>>
+    where
+        F: FnMut(&ClientConfig, &str) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Response, AppError>> + Send + 'static,
+    {
+        Self::execute_client_chain_with_registry(
+            &self.circuit_breakers,
+            clients,
+            model_name,
+            request_callback,
+            tried_clients_accumulator,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn execute_client_chain<F, Fut>(
         clients: &[ClientConfig],
         model_name: &str,
@@ -187,159 +216,110 @@ impl DispatcherService {
         F: FnMut(&ClientConfig, &str) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Response, AppError>> + Send + 'static,
     {
-        if clients.is_empty() {
-            return Err(None);
-        }
+        let registry = CircuitBreakerRegistry::new(HealthCheckConfig {
+            enabled: false,
+            ..HealthCheckConfig::default()
+        });
+        Self::execute_client_chain_with_registry(
+            &registry,
+            clients,
+            model_name,
+            request_callback,
+            tried_clients_accumulator,
+        )
+        .await
+    }
 
-        let primary_client = &clients[0];
-        tried_clients_accumulator.push(primary_client.name.clone());
-        debug!(
-            "Dispatching request to primary client: {}",
-            primary_client.name
-        );
+    async fn execute_client_chain_with_registry<F, Fut>(
+        registry: &CircuitBreakerRegistry,
+        clients: &[ClientConfig],
+        model_name: &str,
+        request_callback: Arc<Mutex<F>>,
+        tried_clients_accumulator: &mut Vec<String>,
+    ) -> Result<Response, Option<String>>
+    where
+        F: FnMut(&ClientConfig, &str) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Response, AppError>> + Send + 'static,
+    {
+        let mut attempted_client = false;
 
-        let primary_result = {
-            let mut cb = request_callback.lock().await;
-            cb(primary_client, model_name).await
-        };
-
-        match primary_result {
-            Ok(mut resp) => {
-                let status = resp.status();
-                let should_fallback =
-                    status.is_client_error() && Self::should_retry_on_client_error(&resp);
-
-                if status.is_success() || (status.is_client_error() && !should_fallback) {
-                    if resp.extensions().get::<AccessLogMeta>().is_none() {
-                        resp.extensions_mut().insert(AccessLogMeta {
-                            model: model_name.to_string(),
-                            backend: primary_client.name.clone(),
-                            error: if status.is_client_error() {
-                                Some(format!("Upstream client error: {}", status))
-                            } else {
-                                None
-                            },
-                            request_body: None,
-                        });
-                    }
-                    return Ok(resp);
+        for client in clients {
+            match registry.allow(client) {
+                AttemptPermission::Blocked { .. } => {
+                    debug!("Skipping cooling backend {}", client.name);
+                    continue;
                 }
-                warn!(
-                    "Primary client {} returned retryable error {}. Triggering fallback...",
-                    primary_client.name, status
-                );
+                AttemptPermission::Allowed | AttemptPermission::HalfOpen => {}
             }
-            Err(e) => {
-                warn!(
-                    "Primary client {} failed with error: {}. Triggering concurrent fallback...",
-                    primary_client.name, e
-                );
-            }
-        }
 
-        let fallback_clients = &clients[1..];
-        if fallback_clients.is_empty() {
-            if let Some(fallback_model) = select_fallback_model(clients) {
-                return Err(Some(fallback_model));
-            }
-            return Err(None);
-        }
+            attempted_client = true;
+            tried_clients_accumulator.push(client.name.clone());
+            debug!("Dispatching request to client: {}", client.name);
 
-        debug!(
-            "Starting concurrent fallback with {} clients",
-            fallback_clients.len()
-        );
-
-        let (tx, mut rx) =
-            mpsc::channel::<(usize, Result<Response, AppError>)>(fallback_clients.len());
-
-        for (idx, client_config) in fallback_clients.iter().enumerate() {
-            let client = client_config.clone();
-            let model = model_name.to_string();
-            let cb_clone = request_callback.clone();
-            let tx_clone = tx.clone();
-
-            tokio::spawn(async move {
-                let result = {
-                    let mut cb = cb_clone.lock().await;
-                    cb(&client, &model).await
-                };
-                let _ = tx_clone.send((idx, result)).await;
-            });
-        }
-
-        drop(tx);
-
-        let mut last_response: Option<Response> = None;
-        let mut remaining = fallback_clients.len();
-
-        while let Some((idx, result)) = rx.recv().await {
-            remaining -= 1;
-            tried_clients_accumulator.push(fallback_clients[idx].name.clone());
+            let result = {
+                let mut cb = request_callback.lock().await;
+                cb(client, model_name).await
+            };
 
             match result {
                 Ok(mut resp) => {
                     let status = resp.status();
-                    if status.is_success() {
-                        debug!("Fallback client {} succeeded", fallback_clients[idx].name);
+                    let should_fallback =
+                        status.is_client_error() && Self::should_retry_on_client_error(&resp);
+
+                    if status.is_success() || (status.is_client_error() && !should_fallback) {
+                        registry.record_success(client);
                         if resp.extensions().get::<AccessLogMeta>().is_none() {
                             resp.extensions_mut().insert(AccessLogMeta {
                                 model: model_name.to_string(),
-                                backend: fallback_clients[idx].name.clone(),
-                                error: None,
+                                backend: client.name.clone(),
+                                error: if status.is_client_error() {
+                                    Some(format!("Upstream client error: {}", status))
+                                } else {
+                                    None
+                                },
                                 request_body: None,
                             });
                         }
                         return Ok(resp);
                     }
-                    if status.is_client_error() {
-                        if !Self::should_retry_on_client_error(&resp) {
-                            if resp.extensions().get::<AccessLogMeta>().is_none() {
-                                resp.extensions_mut().insert(AccessLogMeta {
-                                    model: model_name.to_string(),
-                                    backend: fallback_clients[idx].name.clone(),
-                                    error: Some(format!("Upstream client error: {}", status)),
-                                    request_body: None,
-                                });
-                            }
-                            return Ok(resp);
-                        }
 
-                        warn!(
-                            "Fallback client {} returned retryable error {}. Continuing fallback chain...",
-                            fallback_clients[idx].name, status
-                        );
-                    }
-                    last_response = Some(resp);
+                    registry.record_failure(client);
+                    warn!(
+                        "Client {} returned retryable error {}. Continuing ordered fallback...",
+                        client.name, status
+                    );
                 }
                 Err(e) => {
+                    registry.record_failure(client);
                     warn!(
-                        "Fallback client {} failed: {}",
-                        fallback_clients[idx].name, e
+                        "Client {} failed with error: {}. Continuing ordered fallback...",
+                        client.name, e
                     );
-                    last_response = Some(e.into_response());
                 }
-            }
-
-            if remaining == 0 {
-                break;
             }
         }
 
-        if let Some(mut resp) = last_response {
-            if let Some(meta) = resp.extensions_mut().get_mut::<AccessLogMeta>() {
-                meta.model = model_name.to_string();
-            } else {
-                resp.extensions_mut().insert(AccessLogMeta {
-                    model: model_name.to_string(),
-                    backend: fallback_clients
-                        .last()
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    error: Some("All fallback clients failed".to_string()),
-                    request_body: None,
-                });
-            }
+        if !attempted_client {
+            let error_message = format!(
+                "All upstream providers for model '{}' are cooling down",
+                model_name
+            );
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(crate::app_error::build_error_body(
+                    &error_message,
+                    "upstream_unavailable",
+                )),
+            )
+                .into_response();
+            response.extensions_mut().insert(AccessLogMeta {
+                model: model_name.to_string(),
+                backend: "unknown".to_string(),
+                error: Some(error_message),
+                request_body: None,
+            });
+            return Ok(response);
         }
 
         if let Some(fallback_model) = select_fallback_model(clients) {
@@ -354,6 +334,7 @@ impl DispatcherService {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn client_with_fallback(fallback: Option<&str>) -> ClientConfig {
         ClientConfig {
@@ -429,7 +410,13 @@ mod tests {
             result,
             Err(Some(fallback_model)) if fallback_model == "DeepSeek-V4-Pro"
         ));
-        assert_eq!(tried_clients.len(), clients.len());
+        assert_eq!(
+            tried_clients,
+            clients
+                .iter()
+                .map(|client| client.name.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
@@ -452,6 +439,52 @@ mod tests {
             result,
             Err(Some(fallback_model)) if fallback_model == "DeepSeek-V4-Pro"
         ));
-        assert_eq!(tried_clients.len(), clients.len());
+        assert_eq!(
+            tried_clients,
+            clients
+                .iter()
+                .map(|client| client.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_service_unavailable_without_calling_cooling_backends() {
+        let clients = fallback_clients();
+        let registry = CircuitBreakerRegistry::new(HealthCheckConfig {
+            failure_threshold: 1,
+            cooldown_seconds: 30,
+            ..HealthCheckConfig::default()
+        });
+        for client in &clients {
+            registry.record_failure(client);
+        }
+
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&callback_calls);
+        let request_callback = move |_: &ClientConfig, _: &str| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<Response, AppError>((StatusCode::OK, ()).into_response())
+            }
+        };
+        let mut tried_clients = Vec::new();
+
+        let result = DispatcherService::execute_client_chain_with_registry(
+            &registry,
+            &clients,
+            "MiniMax-M3",
+            Arc::new(Mutex::new(request_callback)),
+            &mut tried_clients,
+        )
+        .await;
+
+        match result {
+            Ok(response) => assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE),
+            Err(fallback) => panic!("expected 503 response, received fallback: {fallback:?}"),
+        }
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+        assert!(tried_clients.is_empty());
     }
 }
