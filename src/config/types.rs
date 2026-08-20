@@ -86,6 +86,56 @@ pub struct ModelsCacheConfig {
     pub ttl_seconds: u64,
 }
 
+/// Global backend health and circuit-breaker policy.
+///
+/// Recovery uses the next real user request as the half-open probe, so this
+/// configuration never causes an extra model request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    #[serde(default = "default_health_check_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_health_check_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_health_check_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+    #[serde(default = "default_health_check_max_cooldown_seconds")]
+    pub max_cooldown_seconds: u64,
+    #[serde(default = "default_health_check_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+}
+
+const fn default_health_check_enabled() -> bool {
+    true
+}
+
+const fn default_health_check_failure_threshold() -> u32 {
+    3
+}
+
+const fn default_health_check_cooldown_seconds() -> u64 {
+    30
+}
+
+const fn default_health_check_max_cooldown_seconds() -> u64 {
+    300
+}
+
+const fn default_health_check_backoff_multiplier() -> f64 {
+    2.0
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_check_enabled(),
+            failure_threshold: default_health_check_failure_threshold(),
+            cooldown_seconds: default_health_check_cooldown_seconds(),
+            max_cooldown_seconds: default_health_check_max_cooldown_seconds(),
+            backoff_multiplier: default_health_check_backoff_multiplier(),
+        }
+    }
+}
+
 const fn default_models_cache_ttl() -> u64 {
     600
 }
@@ -109,6 +159,9 @@ pub struct Config {
     /// Set ttl_seconds to 0 to disable caching.
     #[serde(default)]
     pub models_cache: ModelsCacheConfig,
+    /// Global backend health and circuit-breaker policy.
+    #[serde(default)]
+    pub health_check: HealthCheckConfig,
     /// Internal generation counter, incremented on each successful hot reload.
     /// Skipped during serialization/deserialization; initialized to 1 by ConfigManager.
     #[serde(skip)]
@@ -189,6 +242,7 @@ mod tests {
             load_balancing: LoadBalancingConfig::default(),
             thinking_format: global_format,
             models_cache: ModelsCacheConfig::default(),
+            health_check: HealthCheckConfig::default(),
             config_generation: 1,
         }
     }
@@ -211,6 +265,17 @@ models_cache:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(cfg.models_cache.ttl_seconds, 0);
+    }
+
+    #[test]
+    fn test_health_check_defaults_when_omitted_from_yaml() {
+        let config: Config = serde_yaml::from_str("openai_clients: []").unwrap();
+
+        assert!(config.health_check.enabled);
+        assert_eq!(config.health_check.failure_threshold, 3);
+        assert_eq!(config.health_check.cooldown_seconds, 30);
+        assert_eq!(config.health_check.max_cooldown_seconds, 300);
+        assert_eq!(config.health_check.backoff_multiplier, 2.0);
     }
 
     #[test]
