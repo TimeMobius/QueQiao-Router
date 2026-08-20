@@ -412,6 +412,51 @@ impl Stream for DoneSentinel {
     }
 }
 
+/// Forwards an upstream stream until its first error, then becomes terminal.
+///
+/// The upstream body must not be polled again after a transport/decode error:
+/// some body implementations keep returning the same error, which otherwise
+/// turns one failed request into a tight log and SSE error loop.
+struct TerminateOnError<S> {
+    inner: Pin<Box<S>>,
+    terminated: bool,
+}
+
+impl<S> TerminateOnError<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            terminated: false,
+        }
+    }
+}
+
+impl<S, T, E> Stream for TerminateOnError<S>
+where
+    S: Stream<Item = Result<T, E>>,
+{
+    type Item = Result<T, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+
+        let next = self.inner.as_mut().poll_next(cx);
+        match next {
+            Poll::Ready(Some(Err(error))) => {
+                self.terminated = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.terminated = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
 pub async fn process_streaming_response(
     app_state: Arc<AppState>,
     headers: HeaderMap,
@@ -531,6 +576,7 @@ pub async fn process_streaming_response(
     // skip the simd-json parse→transform→reserialize round-trip entirely.
     let needs_json_roundtrip = apply_thinking || !special_prefix.is_empty();
     let model_for_error = model_for_meta.clone();
+    let backend_for_error = backend_for_meta.clone();
 
     // 共享标志：上游/错误路径需要通知尾巴处的 DoneSentinel 是否已经走过 [DONE]
     // 或 error chunk 发射路径，避免兜底时重复发送或破坏"错误不再发 [DONE]"语义。
@@ -538,7 +584,7 @@ pub async fn process_streaming_response(
     let done_flag_in_flat_map = done_flag.clone();
 
     // 使用 eventsource-stream 进行鲁棒的 SSE 解析
-    let sse_stream = stream.eventsource().flat_map(move |result| {
+    let sse_stream = TerminateOnError::new(stream.eventsource()).flat_map(move |result| {
         match result {
             Ok(event) => {
                 if event.data == "[DONE]" {
@@ -614,7 +660,14 @@ pub async fn process_streaming_response(
                 }
             }
             Err(e) => {
-                error!("Error parsing SSE stream: {}", e);
+                error!(
+                    error = %e,
+                    error_source = "upstream_sse_stream",
+                    backend = %backend_for_error,
+                    model = %model_for_error,
+                    is_chat = %is_chat,
+                    "upstream SSE stream terminated after first error"
+                );
                 // 错误路径不再发 [DONE]（保持 OpenAI 兼容客户端既有期望），
                 // 通知尾巴处的 DoneSentinel 也不要补发。
                 done_flag_in_flat_map.store(true, Ordering::Relaxed);
@@ -794,7 +847,7 @@ mod tests {
         let mut count = 0;
         block_on(async {
             while let Some(item) = s.next().await {
-                item.expect("DoneSentinel never emits Err");
+                let _ = item.expect("DoneSentinel never emits Err");
                 count += 1;
             }
         });
@@ -834,5 +887,39 @@ mod tests {
             assert!(second.is_none(), "second poll must end");
             assert!(third.is_none(), "third poll must end");
         });
+    }
+
+    #[test]
+    fn terminate_on_error_stops_polling_after_first_error() {
+        struct PollCountingStream {
+            items: std::collections::VecDeque<Result<i32, &'static str>>,
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Stream for PollCountingStream {
+            type Item = Result<i32, &'static str>;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(self.items.pop_front())
+            }
+        }
+
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = PollCountingStream {
+            items: std::collections::VecDeque::from([Ok(1), Err("first"), Err("second"), Ok(2)]),
+            polls: polls.clone(),
+        };
+        let mut stream = TerminateOnError::new(source);
+
+        let items = block_on(async { stream.by_ref().collect::<Vec<_>>().await });
+
+        assert_eq!(items, vec![Ok(1), Err("first")]);
+        assert_eq!(polls.load(Ordering::Relaxed), 2);
+        assert!(block_on(async { stream.next().await }).is_none());
+        assert_eq!(polls.load(Ordering::Relaxed), 2);
     }
 }
