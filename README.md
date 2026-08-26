@@ -23,7 +23,7 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
 - **配置缓存**: `extra_body` 在配置加载时预解析为 Value 树，运行时零开销注入。
 - **内存优化**: 默认集成 `mimalloc` 分配器，在高并发场景下大幅减少内存碎片与锁竞争。
 - **无锁流式处理**: 流式响应处理采用 `mpsc` 通道与后台任务分离架构，避免深拷贝 (Deep Clone)，确保首字节延迟 (TTFT) 最小化。
-- **连接池调优**: TCP keepalive（30s）、空闲连接存活（15s）、每 host 最大空闲连接（64），减少高并发建连开销。
+- **连接池调优**: TCP keepalive（30s）、空闲连接存活（15s）、每 host 最大空闲连接（64），减少高并发建连开销。以上参数可通过顶层 `connection_pool` 配置项调整（重启生效）。
 
 ### 🔀 智能流量调度
 - **多策略路由**: 支持关键字匹配 (`keyword`) 和精确匹配 (`exact`)。
@@ -160,6 +160,13 @@ load_balancing:
 
 # 全局思考格式归一化（可选，每客户端可覆盖）
 # thinking_format: "reasoning"   # passthrough | think_tag | reasoning | reasoning_content
+
+# reqwest 连接池（默认值如下；修改后需重启服务，共享 HTTP 客户端仅在启动时构建一次）
+connection_pool:
+  enabled: true              # 是否启用连接池 keep-alive（false 时等价于 max_idle_per_host: 0）
+  max_idle_per_host: 64      # 每 host 最大空闲连接数
+  idle_timeout_seconds: 15   # 空闲连接淘汰时间（秒）；0 表示不淘汰空闲连接
+  tcp_keepalive_seconds: 30  # TCP keepalive 探测间隔（秒）；0 表示禁用 TCP keepalive
 ```
 
 ### 客户端配置项
@@ -206,6 +213,8 @@ openai_clients:
 | 客户端全局超时 | 1800s（30min） | 非流式请求的整体超时上限，防止永久挂起 |
 | 连接池空闲淘汰 | 15s | 短于常见云 LB/网关的 keepalive 窗口（5~30s），避免取出已被对端关闭的陈旧连接 |
 | TCP keepalive | 30s | 防止 NAT/负载均衡器静默切断长连接 |
+
+连接池相关参数（每 host 最大空闲连接数、空闲淘汰时间、TCP keepalive 间隔）由顶层 `connection_pool` 配置项控制，默认值如上表。由于共享 HTTP 客户端仅在启动时构建一次，修改 `connection_pool` 后需重启服务才会生效。
 
 **重试行为**: 仅在发送阶段遇到连接/请求错误（非超时）时自动重建连接重试一次。流式请求使用 60s TTFB 超时快速失败；非流式请求受 1800s 全局超时限制。上游失败时，调度器会尝试其他匹配客户端；所有候选客户端失败后才使用配置的 `fallback`。
 
@@ -255,7 +264,7 @@ cargo test
 - **文件描述符**: 确保宿主机 `ulimit -n` 大于 65535。
 - **数据库**: `record.db` (SQLite) 应置于高性能 SSD 上以避免 I/O 瓶颈。
 - **日志级别**: 设置 `RUST_LOG=info` 以获取关键审计信息，`error` 仅记录故障。
-- **连接池**: reqwest 客户端已内置 TCP keepalive（30s）、空闲连接存活（15s）、每 host 最大空闲连接数（64），无需额外配置。
+- **连接池**: reqwest 客户端已内置 TCP keepalive（30s）、空闲连接存活（15s）、每 host 最大空闲连接数（64），并可通过顶层 `connection_pool` 配置项调整这些参数（修改后需重启服务，共享 HTTP 客户端仅在启动时构建一次）。
 
 ---
 
