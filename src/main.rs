@@ -50,9 +50,10 @@ fn main() {
 
         let config_manager = Arc::new(config_manager);
 
-        // Initialize client manager
-        let client_manager = Arc::new(ClientManager::new());
+        // Initialize client manager (built once at startup; connection-pool
+        // settings are read from the loaded config and require a restart to change)
         let config = config_manager.get_config().await;
+        let client_manager = Arc::new(ClientManager::new(config.connection_pool));
 
         // Initialize database pool
         let db_pool = init_db_pool(&config)
