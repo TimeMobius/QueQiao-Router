@@ -20,22 +20,25 @@ use axum::{
     },
     Json,
 };
+use bytes::Bytes;
 use eventsource_stream::{Event as UpstreamEvent, Eventsource};
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{debug, error, Level};
 
 /// Sentinel pushed into the logger channel when an upstream SSE error
 /// terminates the stream, so the logger task can mark the request failed
 /// in the success-rate metrics. Cannot collide with a valid SSE JSON chunk.
 const STREAM_UPSTREAM_ERROR_SENTINEL: &str = "\u{0}__STREAM_UPSTREAM_ERROR__\u{0}";
+const DEBUG_RAW_BODY_TAIL_LIMIT: usize = 16 * 1024;
+type RawBodyTail = Arc<Mutex<Vec<u8>>>;
 
 struct ToolCallAccumulator {
     index: u64,
@@ -386,6 +389,68 @@ fn ensure_non_empty_choices(value: &mut Value, is_chat: bool) -> bool {
     true
 }
 
+enum UpstreamBodyStream<S> {
+    Passthrough(S),
+    Capturing { inner: S, tail: Arc<Mutex<Vec<u8>>> },
+}
+
+fn make_upstream_body_stream<S>(
+    stream: S,
+    capture_enabled: bool,
+) -> (UpstreamBodyStream<S>, Option<RawBodyTail>) {
+    if capture_enabled {
+        let tail = Arc::new(Mutex::new(Vec::with_capacity(DEBUG_RAW_BODY_TAIL_LIMIT)));
+        (
+            UpstreamBodyStream::Capturing {
+                inner: stream,
+                tail: tail.clone(),
+            },
+            Some(tail),
+        )
+    } else {
+        (UpstreamBodyStream::Passthrough(stream), None)
+    }
+}
+
+fn append_debug_raw_body_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= DEBUG_RAW_BODY_TAIL_LIMIT {
+        tail.clear();
+        tail.extend_from_slice(&bytes[bytes.len() - DEBUG_RAW_BODY_TAIL_LIMIT..]);
+        return;
+    }
+
+    let overflow = (tail.len() + bytes.len()).saturating_sub(DEBUG_RAW_BODY_TAIL_LIMIT);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+    tail.extend_from_slice(bytes);
+}
+
+impl<S, E> Stream for UpstreamBodyStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.as_mut().get_mut() {
+            Self::Passthrough(inner) => Pin::new(inner).poll_next(cx),
+            Self::Capturing { inner, tail } => match Pin::new(inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    match tail.lock() {
+                        Ok(mut guard) => append_debug_raw_body_tail(&mut guard, &bytes),
+                        Err(poisoned) => {
+                            append_debug_raw_body_tail(&mut poisoned.into_inner(), &bytes);
+                        }
+                    }
+                    Poll::Ready(Some(Ok(bytes)))
+                }
+                other => other,
+            },
+        }
+    }
+}
+
 /// 在 SSE 流自然结束时补发 `[DONE]` 哨兵，防止客户端永远收不到流结束标记。
 ///
 /// 背景：`eventsource-stream` 在以下两种情况下会**静默**丢弃最后一个不完整的 SSE 事件，
@@ -510,7 +575,8 @@ pub async fn process_streaming_response(
 
         return Ok(resp);
     }
-    let stream = response.bytes_stream();
+    let (stream, raw_body_tail) =
+        make_upstream_body_stream(response.bytes_stream(), tracing::enabled!(Level::DEBUG));
     let special_prefix = client_config.special_prefix.clone().unwrap_or_default();
     let mut prefix_applied = false;
 
@@ -590,6 +656,7 @@ pub async fn process_streaming_response(
     let needs_json_roundtrip = apply_thinking || !special_prefix.is_empty();
     let model_for_error = model_for_meta.clone();
     let backend_for_error = backend_for_meta.clone();
+    let raw_body_tail_for_error = raw_body_tail.clone();
 
     // 共享标志：上游/错误路径需要通知尾巴处的 DoneSentinel 是否已经走过 [DONE]
     // 或 error chunk 发射路径，避免兜底时重复发送或破坏"错误不再发 [DONE]"语义。
@@ -681,6 +748,25 @@ pub async fn process_streaming_response(
                     is_chat = %is_chat,
                     "upstream SSE stream terminated after first error"
                 );
+                if let Some(tail) = raw_body_tail_for_error.as_ref() {
+                    let (raw_bytes_len, raw_body) = match tail.lock() {
+                        Ok(guard) => (guard.len(), String::from_utf8_lossy(&guard).into_owned()),
+                        Err(poisoned) => {
+                            let guard = poisoned.into_inner();
+                            (guard.len(), String::from_utf8_lossy(&guard).into_owned())
+                        }
+                    };
+                    if !raw_body.is_empty() {
+                        debug!(
+                            backend = %backend_for_error,
+                            model = %model_for_error,
+                            is_chat = %is_chat,
+                            raw_bytes_len,
+                            raw_body = ?raw_body,
+                            "captured upstream response body tail after SSE stream error"
+                        );
+                    }
+                }
                 // 错误路径不再发 [DONE]（保持 OpenAI 兼容客户端既有期望），
                 // 通知尾巴处的 DoneSentinel 也不要补发。
                 done_flag_in_flat_map.store(true, Ordering::Relaxed);
@@ -949,5 +1035,44 @@ mod tests {
         assert_eq!(polls.load(Ordering::Relaxed), 2);
         assert!(block_on(async { stream.next().await }).is_none());
         assert_eq!(polls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn debug_raw_body_tail_keeps_only_the_newest_bytes() {
+        let mut tail = Vec::new();
+
+        append_debug_raw_body_tail(&mut tail, &vec![b'a'; DEBUG_RAW_BODY_TAIL_LIMIT]);
+        append_debug_raw_body_tail(&mut tail, b"bcdef");
+
+        assert_eq!(tail.len(), DEBUG_RAW_BODY_TAIL_LIMIT);
+        assert_eq!(&tail[DEBUG_RAW_BODY_TAIL_LIMIT - 5..], b"bcdef");
+    }
+
+    #[test]
+    fn non_debug_body_stream_has_no_capture_state() {
+        let (stream, capture) = make_upstream_body_stream(
+            stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from_static(b"chunk"))]),
+            false,
+        );
+
+        assert!(capture.is_none());
+        assert!(matches!(stream, UpstreamBodyStream::Passthrough(_)));
+    }
+
+    #[test]
+    fn debug_body_stream_captures_received_bytes() {
+        let (mut stream, capture) = make_upstream_body_stream(
+            stream::iter([
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: first\n\n")),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: second\n\n")),
+            ]),
+            true,
+        );
+
+        block_on(async { while stream.next().await.is_some() {} });
+
+        let capture = capture.expect("debug capture must expose its tail");
+        let tail = capture.lock().expect("capture mutex must not be poisoned");
+        assert_eq!(&*tail, b"data: first\n\ndata: second\n\n");
     }
 }
