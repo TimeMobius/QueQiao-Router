@@ -1,3 +1,4 @@
+use super::connection_pool::ConnectionPoolConfig;
 use serde::{Deserialize, Serialize};
 
 /// Pre-parsed extra_body cache (set at config load, used at runtime).
@@ -162,6 +163,10 @@ pub struct Config {
     /// Global backend health and circuit-breaker policy.
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// reqwest connection-pool settings, applied once when the shared HTTP client
+    /// is built at startup. Hot reload does NOT rebuild the client; restart to apply.
+    #[serde(default)]
+    pub connection_pool: ConnectionPoolConfig,
     /// Internal generation counter, incremented on each successful hot reload.
     /// Skipped during serialization/deserialization; initialized to 1 by ConfigManager.
     #[serde(skip)]
@@ -243,6 +248,7 @@ mod tests {
             thinking_format: global_format,
             models_cache: ModelsCacheConfig::default(),
             health_check: HealthCheckConfig::default(),
+            connection_pool: ConnectionPoolConfig::default(),
             config_generation: 1,
         }
     }
