@@ -232,6 +232,21 @@ fn build_request_body_inner(
             if let Some(temp) = p.temperature {
                 body["temperature"] = json!(temp);
             }
+            if let Some(top_p) = p.top_p {
+                body["top_p"] = json!(top_p);
+            }
+            if let Some(frequency_penalty) = p.frequency_penalty {
+                body["frequency_penalty"] = json!(frequency_penalty);
+            }
+            if let Some(presence_penalty) = p.presence_penalty {
+                body["presence_penalty"] = json!(presence_penalty);
+            }
+            if let Some(repetition_penalty) = p.repetition_penalty {
+                body["repetition_penalty"] = json!(repetition_penalty);
+            }
+            if let Some(seed) = p.seed {
+                body["seed"] = json!(seed);
+            }
             if let Some(tokens) = adjusted_max_tokens {
                 body["max_tokens"] = json!(tokens);
             }
@@ -858,5 +873,47 @@ mod tests {
         apply_extra_body_cached(&mut body, &ExtraBodyCached(None), "test");
 
         assert_eq!(body, before);
+    }
+
+    #[test]
+    fn test_build_chat_request_preserves_sampling_parameters() {
+        let request =
+            serde_json::from_value::<crate::models::requests::ChatCompletionRequest>(json!({
+                "model": "xiaoke-5",
+                "messages": [],
+                "stream": false,
+                "top_p": 0.37,
+                "frequency_penalty": 0.11,
+                "presence_penalty": 0.22,
+                "repetition_penalty": 1.15,
+                "seed": 42
+            }))
+            .unwrap();
+        let payload = RequestPayload::Chat(request);
+        let client_config = ClientConfig {
+            name: "test".to_string(),
+            base_url: "http://localhost/v1".to_string(),
+            api_key: None,
+            model_match: crate::config::types::ModelMatch {
+                match_type: "exact".to_string(),
+                value: vec!["xiaoke-5".to_string()],
+            },
+            priority: None,
+            fallback: None,
+            special_prefix: None,
+            stop: None,
+            max_tokens: None,
+            extra_body: None,
+            thinking_format: None,
+            extra_body_cached: ExtraBodyCached::default(),
+        };
+
+        let body = build_request_body_generic(&payload, &client_config, false);
+
+        assert_eq!(body["top_p"], json!(0.37_f32));
+        assert_eq!(body["frequency_penalty"], json!(0.11_f32));
+        assert_eq!(body["presence_penalty"], json!(0.22_f32));
+        assert_eq!(body["repetition_penalty"], json!(1.15_f32));
+        assert_eq!(body["seed"], json!(42));
     }
 }

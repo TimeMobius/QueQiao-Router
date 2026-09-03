@@ -163,6 +163,11 @@ mod tests {
             stream_options: None,
             logprobs: None,
             top_logprobs: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            seed: None,
         })
     }
 
