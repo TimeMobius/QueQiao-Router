@@ -18,7 +18,7 @@ use tracing::{debug, error, info};
 /// the same export) never generate inotify events here, no matter how the
 /// file is written. Periodically polling the file's (mtime, size) guarantees
 /// hot reload works regardless of which client wrote the config.
-const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Fingerprint of the config file on disk: (modification time, size).
 type FileFingerprint = (SystemTime, u64);
