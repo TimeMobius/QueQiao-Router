@@ -373,6 +373,49 @@
             gap: 8px;
         }
 
+        .model-table .model-expand-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            text-align: left;
+            cursor: pointer;
+        }
+
+        .model-table .model-expand-button:focus-visible {
+            outline: 2px solid var(--text-secondary);
+            outline-offset: 3px;
+            border-radius: 6px;
+        }
+
+        .model-table .model-expand-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            color: var(--text-secondary);
+            font-size: 14px;
+            line-height: 1;
+            transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+        }
+
+        .model-table .model-expand-button:hover .model-expand-icon {
+            background: var(--bg-secondary);
+            border-color: var(--text-secondary);
+            color: var(--text-primary);
+        }
+
+        .model-table .model-expand-button:active {
+            transform: translateY(1px);
+        }
+
         .model-table .backend-label::before {
             content: '';
             width: 7px;
@@ -619,7 +662,7 @@
                 <div class="chart-header">
                     <div>
                         <div class="chart-title">活跃请求趋势</div>
-                        <div class="chart-subtitle">各模型当前并发请求数</div>
+                        <div class="chart-subtitle">各模型当前并发请求数（保留最近1小时）</div>
                     </div>
                 </div>
                 <div class="chart-container" id="activeRequestsTrend"></div>
@@ -701,7 +744,7 @@
                 <div class="chart-header">
                     <div>
                         <div class="chart-title">Token 吞吐趋势</div>
-                        <div class="chart-subtitle">每秒处理 Token 数</div>
+                        <div class="chart-subtitle">每秒处理 Token 数（保留最近1小时）</div>
                     </div>
                 </div>
                 <div class="chart-container" id="tpsTrend"></div>
@@ -871,10 +914,12 @@
             timestamps: [],
             tpsByModel: {}  // { model: [tps1, tps2, ...] }
         };
-        
+        let currentModelList = [];
+        const expandedModels = new Set();
+
         const METRICS_API = '/metrics';
         const REFRESH_INTERVAL = 5000;
-        const MAX_HISTORY = 20;
+        const MAX_HISTORY = 720;
         
         // Color palette
         const colors = {
@@ -907,6 +952,78 @@
             return assignedModelColors[model];
         }
         
+        // Toggle a model's backend detail rows, keeping the summary row visible.
+        // Single-backend models have no expansion control and are never affected.
+        function toggleModelExpansion(modelIndex) {
+            const model = currentModelList[modelIndex];
+            if (!model || model.backendCount <= 1) return;
+
+            if (expandedModels.has(model.model)) {
+                expandedModels.delete(model.model);
+            } else {
+                expandedModels.add(model.model);
+            }
+            renderModelTable(currentModelList);
+        }
+
+        // Render the model performance table. Summary rows are always shown;
+        // backend detail rows only render for expanded multi-backend models.
+        function renderModelTable(modelList) {
+            const tbody = document.querySelector('#modelTable tbody');
+            const formatCount = value => Math.round(value).toLocaleString();
+            const renderSuccessRate = rate => {
+                const boundedRate = Math.min(100, Math.max(0, rate));
+                const color = boundedRate >= 90 ? 'green' : boundedRate >= 70 ? 'yellow' : 'red';
+                return `
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="progress-bar" style="width: 60px;">
+                            <div class="fill ${color}" style="width: ${boundedRate}%"></div>
+                        </div>
+                        ${boundedRate.toFixed(1)}%
+                    </div>`;
+            };
+
+            tbody.innerHTML = modelList.map((m, modelIndex) => {
+                const mc = getModelColor(m.model);
+                const isExpandable = m.backendCount > 1;
+                const isExpanded = isExpandable && expandedModels.has(m.model);
+                const modelLabel = isExpandable ? `
+                    <button type="button" class="model-expand-button" data-model-index="${modelIndex}"
+                        aria-expanded="${isExpanded}" aria-label="${isExpanded ? '收起' : '展开'} 后端详情">
+                        <span class="model-expand-icon" aria-hidden="true">${isExpanded ? '−' : '+'}</span>
+                        <span class="model-badge" style="background: ${mc}22; color: ${mc}; border-left: 3px solid ${mc};">${m.model}</span>
+                    </button>` : `
+                    <span class="model-badge" style="background: ${mc}22; color: ${mc}; border-left: 3px solid ${mc};">${m.model}</span>`;
+                const summaryRow = `
+                    <tr class="model-summary-row">
+                        <td>
+                            ${modelLabel}
+                            <span class="model-meta">${m.backendCount} 个后端 · 模型合计</span>
+                        </td>
+                        <td><strong>${formatCount(m.total)}</strong></td>
+                        <td><strong>${formatCount(m.active)}</strong></td>
+                        <td>${renderSuccessRate(m.successRate)}</td>
+                        <td>${m.latency > 0 ? m.latency.toFixed(2) + 's' : '-'}</td>
+                        <td>${m.ttft > 0 ? m.ttft.toFixed(2) + 's' : '-'}</td>
+                        <td>${m.tps > 0 ? m.tps.toFixed(1) : '-'}</td>
+                    </tr>`;
+                const backendRows = isExpanded ? m.backends.map(backend => `
+                    <tr class="backend-row">
+                        <td>
+                            <span class="backend-label">${backend.backend}</span>
+                            <span class="backend-meta">后端独立统计</span>
+                        </td>
+                        <td><strong>${formatCount(backend.total)}</strong></td>
+                        <td>${formatCount(backend.active)}</td>
+                        <td>${renderSuccessRate(backend.successRate)}</td>
+                        <td>${backend.latency > 0 ? backend.latency.toFixed(2) + 's' : '-'}</td>
+                        <td>${backend.ttft > 0 ? backend.ttft.toFixed(2) + 's' : '-'}</td>
+                        <td>${backend.tps > 0 ? backend.tps.toFixed(1) : '-'}</td>
+                    </tr>`).join('') : '';
+                return summaryRow + backendRows;
+            }).join('');
+        }
+
         function lightenColor(hex, amount) {
             // Lighten a hex color by blending with white
             const num = parseInt(hex.replace('#', ''), 16);
@@ -1266,7 +1383,7 @@
                     }
                 },
                 dataZoom: [
-                    { type: 'slider', show: true, xAxisIndex: 0, start: 50, end: 100, height: 20, bottom: 5, borderColor: '#e2e8f0', fillerColor: 'rgba(59,130,246,0.2)' },
+                    { type: 'slider', show: true, xAxisIndex: 0, start: 80, end: 100, height: 20, bottom: 5, borderColor: '#e2e8f0', fillerColor: 'rgba(59,130,246,0.2)' },
                     { type: 'inside', xAxisIndex: 0 }
                 ],
                 grid: { left: 50, right: 20, top: 60, bottom: 50 },
@@ -1627,7 +1744,7 @@
                     }
                 },
                 dataZoom: [
-                    { type: 'slider', show: true, xAxisIndex: 0, start: 50, end: 100, height: 20, bottom: 5, borderColor: '#e2e8f0', fillerColor: 'rgba(139,92,246,0.2)' },
+                    { type: 'slider', show: true, xAxisIndex: 0, start: 80, end: 100, height: 20, bottom: 5, borderColor: '#e2e8f0', fillerColor: 'rgba(139,92,246,0.2)' },
                     { type: 'inside', xAxisIndex: 0 }
                 ],
                 grid: { left: 50, right: 20, top: 40, bottom: 50 },
@@ -2187,51 +2304,10 @@
                 series: tpsSeries
             });
             
-            // Model table: one summary row per model, followed by backend detail rows
-            const tbody = document.querySelector('#modelTable tbody');
-            const formatCount = value => Math.round(value).toLocaleString();
-            const renderSuccessRate = rate => {
-                const boundedRate = Math.min(100, Math.max(0, rate));
-                const color = boundedRate >= 90 ? 'green' : boundedRate >= 70 ? 'yellow' : 'red';
-                return `
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        <div class="progress-bar" style="width: 60px;">
-                            <div class="fill ${color}" style="width: ${boundedRate}%"></div>
-                        </div>
-                        ${boundedRate.toFixed(1)}%
-                    </div>`;
-            };
-
-            tbody.innerHTML = modelList.map(m => {
-                const mc = getModelColor(m.model);
-                const summaryRow = `
-                    <tr class="model-summary-row">
-                        <td>
-                            <span class="model-badge" style="background: ${mc}22; color: ${mc}; border-left: 3px solid ${mc};">${m.model}</span>
-                            <span class="model-meta">${m.backendCount} 个后端 · 模型合计</span>
-                        </td>
-                        <td><strong>${formatCount(m.total)}</strong></td>
-                        <td><strong>${formatCount(m.active)}</strong></td>
-                        <td>${renderSuccessRate(m.successRate)}</td>
-                        <td>${m.latency > 0 ? m.latency.toFixed(2) + 's' : '-'}</td>
-                        <td>${m.ttft > 0 ? m.ttft.toFixed(2) + 's' : '-'}</td>
-                        <td>${m.tps > 0 ? m.tps.toFixed(1) : '-'}</td>
-                    </tr>`;
-                const backendRows = m.backends.map(backend => `
-                    <tr class="backend-row">
-                        <td>
-                            <span class="backend-label">${backend.backend}</span>
-                            <span class="backend-meta">后端独立统计</span>
-                        </td>
-                        <td><strong>${formatCount(backend.total)}</strong></td>
-                        <td>${formatCount(backend.active)}</td>
-                        <td>${renderSuccessRate(backend.successRate)}</td>
-                        <td>${backend.latency > 0 ? backend.latency.toFixed(2) + 's' : '-'}</td>
-                        <td>${backend.ttft > 0 ? backend.ttft.toFixed(2) + 's' : '-'}</td>
-                        <td>${backend.tps > 0 ? backend.tps.toFixed(1) : '-'}</td>
-                    </tr>`).join('');
-                return summaryRow + backendRows;
-            }).join('');
+            // Model table: one summary row per model, followed by backend detail rows.
+            // Backend rows are collapsed by default; expanded state persists across refreshes.
+            currentModelList = modelList;
+            renderModelTable(modelList);
         }
         
         // Update histogram chart based on selected metric and model
@@ -2432,6 +2508,15 @@
             initCharts();
             fetchMetrics();
             setInterval(fetchMetrics, REFRESH_INTERVAL);
+
+            // Delegate expand/collapse clicks on the model table so expanded state
+            // survives the table re-renders triggered by every metrics refresh.
+            const modelTable = document.querySelector('#modelTable');
+            modelTable.addEventListener('click', event => {
+                const expandButton = event.target.closest('.model-expand-button');
+                if (!expandButton) return;
+                toggleModelExpansion(Number(expandButton.dataset.modelIndex));
+            });
         });
     </script>
 </body>
