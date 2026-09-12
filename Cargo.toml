@@ -27,6 +27,7 @@ tracing-appender = "0.2.3"
 tower-http = { version = "0.5", features = ["cors"] }
 eventsource-stream = "0.2.3"
 mime = "0.3.17"
+rust-embed = "8"
 once_cell = "1.21.3"
 mimalloc = "0.1.48"
 simd-json = "0.17.0"
