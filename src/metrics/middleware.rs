@@ -47,7 +47,11 @@ pub fn get_metrics_sender() -> Option<&'static MetricsSender> {
 const METRICS_SKIP_ENDPOINTS: &[&str] = &["/metrics", "/health", "/v1/models"];
 
 fn should_skip_metrics(endpoint: &str) -> bool {
-    METRICS_SKIP_ENDPOINTS.iter().any(|&skip| endpoint == skip)
+    endpoint == "/"
+        || endpoint == "/favicon.ico"
+        || endpoint == "/dashboard"
+        || endpoint.starts_with("/dashboard/")
+        || METRICS_SKIP_ENDPOINTS.iter().any(|&skip| endpoint == skip)
 }
 
 /// Helper to extract model from request body
@@ -120,4 +124,25 @@ pub async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_metrics;
+
+    #[test]
+    fn skips_dashboard_root_and_static_asset_requests() {
+        assert!(should_skip_metrics("/"));
+        assert!(should_skip_metrics("/favicon.ico"));
+        assert!(should_skip_metrics("/dashboard"));
+        assert!(should_skip_metrics("/dashboard/"));
+        assert!(should_skip_metrics("/dashboard/vendor/echarts.min.js"));
+    }
+
+    #[test]
+    fn keeps_api_requests_in_metrics() {
+        assert!(!should_skip_metrics("/v1/chat/completions"));
+        assert!(!should_skip_metrics("/rerank"));
+        assert!(!should_skip_metrics("/score"));
+    }
 }
