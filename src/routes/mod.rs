@@ -13,6 +13,7 @@ use tower_http::cors::{Any, CorsLayer};
 pub mod audio;
 pub mod chat;
 pub mod completions;
+pub mod dashboard;
 pub mod embeddings;
 pub mod extras;
 pub mod health;
@@ -47,6 +48,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             post(audio::handle_audio_translation),
         )
         .merge(create_metrics_router())
+        .nest("/dashboard", dashboard::dashboard_router())
         .layer(cors)
         .layer(axum_middleware::from_fn(metrics_middleware))
         .with_state(app_state)
