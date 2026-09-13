@@ -43,15 +43,22 @@ pub fn get_metrics_sender() -> Option<&'static MetricsSender> {
     METRICS_SENDER.get()
 }
 
-/// Endpoints that should be excluded from metrics
-const METRICS_SKIP_ENDPOINTS: &[&str] = &["/metrics", "/health", "/v1/models"];
+const LLM_METRIC_ENDPOINTS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/rerank",
+    "/rerank",
+    "/score",
+    "/classify",
+];
 
 fn should_skip_metrics(endpoint: &str) -> bool {
-    endpoint == "/"
-        || endpoint == "/favicon.ico"
-        || endpoint == "/dashboard"
-        || endpoint.starts_with("/dashboard/")
-        || METRICS_SKIP_ENDPOINTS.iter().any(|&skip| endpoint == skip)
+    !LLM_METRIC_ENDPOINTS.contains(&endpoint)
 }
 
 /// Helper to extract model from request body
@@ -142,7 +149,30 @@ mod tests {
     #[test]
     fn keeps_api_requests_in_metrics() {
         assert!(!should_skip_metrics("/v1/chat/completions"));
+        assert!(!should_skip_metrics("/v1/responses"));
+        assert!(!should_skip_metrics("/v1/messages"));
+        assert!(!should_skip_metrics("/v1/completions"));
+        assert!(!should_skip_metrics("/v1/embeddings"));
+        assert!(!should_skip_metrics("/v1/audio/transcriptions"));
+        assert!(!should_skip_metrics("/v1/audio/translations"));
+        assert!(!should_skip_metrics("/v1/rerank"));
         assert!(!should_skip_metrics("/rerank"));
         assert!(!should_skip_metrics("/score"));
+        assert!(!should_skip_metrics("/classify"));
+    }
+
+    #[test]
+    fn skips_non_llm_routes_even_when_not_explicitly_listed() {
+        assert!(should_skip_metrics("/unknown"));
+        assert!(should_skip_metrics("/admin"));
+        assert!(should_skip_metrics("/v1/models/extra"));
+        assert!(should_skip_metrics("/dashboard/unknown.js"));
+    }
+
+    #[test]
+    fn skips_existing_non_llm_routes() {
+        assert!(should_skip_metrics("/metrics"));
+        assert!(should_skip_metrics("/health"));
+        assert!(should_skip_metrics("/v1/models"));
     }
 }
