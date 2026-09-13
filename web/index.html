@@ -673,7 +673,7 @@
                 <div class="chart-header">
                     <div>
                         <div class="chart-title">延迟分布</div>
-                        <div class="chart-subtitle">各模型平均响应时间</div>
+                        <div class="chart-subtitle">各模型平均响应时间（按活跃请求加权估算）</div>
                     </div>
                 </div>
                 <div class="chart-container" id="latencyChart"></div>
@@ -684,7 +684,7 @@
                 <div class="chart-header">
                     <div>
                         <div class="chart-title">TTFT 首字延迟</div>
-                        <div class="chart-subtitle">各模型首次响应时间</div>
+                        <div class="chart-subtitle">各模型首次响应时间（按活跃请求加权估算）</div>
                     </div>
                 </div>
                 <div class="chart-container" id="ttftChart"></div>
@@ -744,7 +744,7 @@
                 <div class="chart-header">
                     <div>
                         <div class="chart-title">Token 吞吐趋势</div>
-                        <div class="chart-subtitle">每秒处理 Token 数（保留最近1小时）</div>
+                        <div class="chart-subtitle">每秒处理 Token 数（按活跃请求加权估算，保留最近1小时）</div>
                     </div>
                 </div>
                 <div class="chart-container" id="tpsTrend"></div>
@@ -774,7 +774,7 @@
                 <div class="chart-header">
                     <div>
                         <div class="chart-title">模型性能详情</div>
-                        <div class="chart-subtitle">按模型分组展示各后端独立指标，包含累计请求量</div>
+                        <div class="chart-subtitle">按模型分组展示各后端独立指标；模型指标按活跃请求加权估算</div>
                     </div>
                 </div>
                 <div style="max-height: 320px; overflow: auto;">
@@ -1070,6 +1070,37 @@
             return metrics;
         }
         
+        function calculateWeightedModelPerformance(backends, metric) {
+            const weightedAverage = weightKey => {
+                const weightedBackends = backends.filter(backend =>
+                    Number.isFinite(backend[metric]) &&
+                    Number.isFinite(backend[weightKey]) &&
+                    backend[weightKey] > 0
+                );
+                const weightTotal = weightedBackends.reduce(
+                    (sum, backend) => sum + backend[weightKey], 0
+                );
+                return weightTotal > 0
+                    ? weightedBackends.reduce(
+                        (sum, backend) => sum + backend[weightKey] * backend[metric], 0
+                    ) / weightTotal
+                    : null;
+            };
+
+            const activeWeighted = weightedAverage('active');
+            if (activeWeighted !== null) return activeWeighted;
+
+            const totalWeighted = weightedAverage('total');
+            if (totalWeighted !== null) return totalWeighted;
+
+            const positiveMetrics = backends
+                .map(backend => backend[metric])
+                .filter(value => Number.isFinite(value) && value > 0);
+            return positiveMetrics.length > 0
+                ? positiveMetrics.reduce((sum, value) => sum + value, 0) / positiveMetrics.length
+                : 0;
+        }
+
         // Process metrics into usable data
         function processMetrics(metrics) {
             const data = {
@@ -1077,10 +1108,10 @@
                 totalRequests: {},       // 按 model 累加 success/failed
                 errors: {},              // 按 model 累加
                 successRate: {},         // 按 model 计算
-                latency: {},             // 按 model 加权平均
+                latency: {},             // 按 backend performance 加权平均
                 tokens: {},              // 按 model 累加
-                tps: {},                 // 按 model 累加
-                ttft: {},                // 按 model 取最大
+                tps: {},                 // 按 backend performance 加权平均
+                ttft: {},                // 按 backend performance 加权平均
                 backendStats: {},        // { model: { backend: { ... } } }
                 histograms: {}           // { metricName: { model: { buckets: {}, sum: 0, count: 0 } } }
             };
@@ -1233,9 +1264,8 @@
                 }
             });
             
-            // Latency - 按 model 加权平均（需要累加 sum 和 count）
+            // Latency - 按 backend 统计 sum 和 count，model 值稍后统一计算
             if (metrics.gpt_api_latency_seconds_count && metrics.gpt_api_latency_seconds_sum) {
-                const latencyData = {};  // { model: { sum: 0, count: 0 } }
                 metrics.gpt_api_latency_seconds_count.forEach(m => {
                     const model = m.labels.model || 'unknown';
                     const backend = m.labels.backend || 'unknown';
@@ -1246,14 +1276,7 @@
                         const backendData = getBackendStats(model, backend);
                         backendData.latencySum += sumMetric.value;
                         backendData.latencyCount += m.value;
-                        if (!latencyData[model]) latencyData[model] = { sum: 0, count: 0 };
-                        latencyData[model].sum += sumMetric.value;
-                        latencyData[model].count += m.value;
                     }
-                });
-                // 计算加权平均
-                Object.keys(latencyData).forEach(model => {
-                    data.latency[model] = latencyData[model].sum / latencyData[model].count;
                 });
             }
             
@@ -1273,8 +1296,6 @@
                     const model = m.labels.model || 'unknown';
                     const backend = m.labels.backend || 'unknown';
                     getBackendStats(model, backend).tps += m.value;
-                    if (!data.tps[model]) data.tps[model] = 0;
-                    data.tps[model] += m.value;
                 });
             }
             
@@ -1285,11 +1306,22 @@
                     const backend = m.labels.backend || 'unknown';
                     const backendData = getBackendStats(model, backend);
                     backendData.ttft = Math.max(backendData.ttft, m.value);
-                    if (!data.ttft[model]) data.ttft[model] = 0;
-                    data.ttft[model] = Math.max(data.ttft[model], m.value);
                 });
             }
-            
+
+            Object.entries(data.backendStats).forEach(([model, backendStats]) => {
+                const backends = Object.values(backendStats).map(stats => ({
+                    active: stats.active,
+                    total: stats.success + stats.failed,
+                    latency: stats.latencyCount > 0 ? stats.latencySum / stats.latencyCount : 0,
+                    ttft: stats.ttft,
+                    tps: stats.tps
+                }));
+                data.latency[model] = calculateWeightedModelPerformance(backends, 'latency');
+                data.ttft[model] = calculateWeightedModelPerformance(backends, 'ttft');
+                data.tps[model] = calculateWeightedModelPerformance(backends, 'tps');
+            });
+
             return data;
         }
         
@@ -2158,6 +2190,9 @@
                 name: model,
                 type: 'line',
                 smooth: true,
+                symbol: 'circle',
+                symbolSize: 6,
+                showSymbol: false,
                 data: historicalData.activeRequests.map(d => d[model] || 0),
                 itemStyle: { color: getModelColor(model) }
             }));
@@ -2255,30 +2290,27 @@
             // TPS trend - 按模型显示多条折线
             const models = Object.keys(data.tps);
             
-            // 更新每个模型的历史数据
-            models.forEach(model => {
-                if (!historicalData.tpsByModel[model]) {
-                    historicalData.tpsByModel[model] = [];
+            // Keep every model series aligned with the shared timestamp array.
+            // A model that appears mid-history gets zero placeholders for earlier ticks.
+            const allTpsModels = new Set([
+                ...Object.keys(historicalData.tpsByModel),
+                ...models
+            ]);
+            allTpsModels.forEach(model => {
+                let values = historicalData.tpsByModel[model] || [];
+                const previousTimestampCount = historicalData.timestamps.length - 1;
+                if (values.length < previousTimestampCount) {
+                    values = Array(previousTimestampCount - values.length).fill(0).concat(values);
+                } else if (values.length > previousTimestampCount) {
+                    values = values.slice(-previousTimestampCount);
                 }
-                historicalData.tpsByModel[model].push(data.tps[model] || 0);
-                if (historicalData.tpsByModel[model].length > MAX_HISTORY) {
-                    historicalData.tpsByModel[model].shift();
-                }
+                values.push(models.includes(model) ? (data.tps[model] || 0) : 0);
+                if (values.length > MAX_HISTORY) values.shift();
+                historicalData.tpsByModel[model] = values;
             });
-            
-            // 清理不再有数据的模型
-            Object.keys(historicalData.tpsByModel).forEach(model => {
-                if (!models.includes(model) && historicalData.tpsByModel[model].length > 0) {
-                    historicalData.tpsByModel[model].push(0);
-                    if (historicalData.tpsByModel[model].length > MAX_HISTORY) {
-                        historicalData.tpsByModel[model].shift();
-                    }
-                }
-            });
-            
-            // 构建 series 数据
-            const allTpsModels = Object.keys(historicalData.tpsByModel);
-            const tpsSeries = allTpsModels.map(model => ({
+
+            // Build series after every model has one value for the current tick.
+            const tpsSeries = [...allTpsModels].map(model => ({
                 name: model,
                 type: 'line',
                 smooth: true,
