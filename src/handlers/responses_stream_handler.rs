@@ -2,7 +2,7 @@ use crate::app_error::AppError;
 use crate::config::types::ClientConfig;
 use crate::db::records::log_non_streaming_request;
 use crate::handlers::stream_handler::extract_error_msg;
-use crate::handlers::utils::truncate_json;
+use crate::handlers::utils::{log_stream_interruption, truncate_json};
 use crate::metrics::middleware::get_metrics_sender;
 use crate::metrics::prometheus::{TTFT, TTFT_10M_MAX, TTFT_1H_MAX, TTFT_1M_MAX};
 use crate::metrics::sliding_window;
@@ -196,6 +196,8 @@ pub async fn process_responses_streaming_response(
     let client_ip_clone = client_ip.clone();
     let model_name = payload.get_model().to_string();
     let backend_name = client_config.name.clone();
+    let model_for_error = model_name.clone();
+    let backend_for_error = backend_name.clone();
     let stream_start_time = Instant::now();
 
     // Spawn logger task
@@ -231,7 +233,13 @@ pub async fn process_responses_streaming_response(
                 Ok::<_, std::io::Error>(out)
             }
             Err(e) => {
-                error!("Error parsing SSE stream for responses: {}", e);
+                log_stream_interruption(
+                    &client_ip,
+                    "/v1/responses",
+                    &model_for_error,
+                    &backend_for_error,
+                    &e.to_string(),
+                );
                 // Responses API 标准: type:"error" typed event 格式
                 let err_data = json!({
                     "type": "error",

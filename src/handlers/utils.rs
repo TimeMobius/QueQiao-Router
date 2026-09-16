@@ -476,6 +476,32 @@ where
     }
 }
 
+/// Records a mid-stream SSE interruption in `error.log`.
+///
+/// SSE responses are committed as `200` before the body is polled, so the
+/// access-log middleware can never classify these failures as errors. The
+/// `access_log` target is what routes the record to `error.log`; its layers keep
+/// only the message, so all fields are folded into the formatted line.
+pub fn log_stream_interruption(
+    client_ip: &str,
+    endpoint: &str,
+    model: &str,
+    backend: &str,
+    error: &str,
+) {
+    let time_str = chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z");
+    tracing::error!(
+        target: "access_log",
+        "[{}] STREAM_INTERRUPTED client={} endpoint={} model={} backend={} error={:?}",
+        time_str,
+        client_ip,
+        endpoint,
+        model,
+        backend,
+        error
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

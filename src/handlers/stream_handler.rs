@@ -1,7 +1,7 @@
 use crate::app_error::AppError;
 use crate::config::types::ClientConfig;
 use crate::db::records::log_non_streaming_request;
-use crate::handlers::utils::truncate_json;
+use crate::handlers::utils::{log_stream_interruption, truncate_json};
 use crate::metrics::middleware::get_metrics_sender;
 use crate::metrics::prometheus::{
     TOKENS_TOTAL, TPS, TPS_10M_AVG, TPS_1H_AVG, TPS_1M_AVG, TTFT, TTFT_10M_MAX, TTFT_1H_MAX,
@@ -740,13 +740,16 @@ pub async fn process_streaming_response(
                 }
             }
             Err(e) => {
-                error!(
-                    error = %e,
-                    error_source = "upstream_sse_stream",
-                    backend = %backend_for_error,
-                    model = %model_for_error,
-                    is_chat = %is_chat,
-                    "upstream SSE stream terminated after first error"
+                log_stream_interruption(
+                    &client_ip,
+                    if is_chat {
+                        "/v1/chat/completions"
+                    } else {
+                        "/v1/completions"
+                    },
+                    &model_for_error,
+                    &backend_for_error,
+                    &e.to_string(),
                 );
                 if let Some(tail) = raw_body_tail_for_error.as_ref() {
                     let (raw_bytes_len, raw_body) = match tail.lock() {
