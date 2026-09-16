@@ -1,5 +1,6 @@
 use chrono::{DateTime, Datelike, Local};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use sqlx::Row;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -10,6 +11,150 @@ use crate::state::app_state::AppState;
 use std::sync::Arc;
 
 pub mod records;
+
+const SCHEMA_VERSION: i64 = 1;
+
+/// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
+const NEW_COLUMNS: &[(&str, &str)] = &[
+    ("TimeMs", "INTEGER"),
+    ("Method", "TEXT"),
+    ("Endpoint", "TEXT"),
+    ("Backend", "TEXT"),
+    ("SessionId", "TEXT"),
+    ("ParentSessionId", "TEXT"),
+    ("SessionAffinity", "TEXT"),
+    ("UserAgent", "TEXT"),
+    ("ClientName", "TEXT"),
+    ("ClientVersion", "TEXT"),
+    ("ApiKey", "TEXT"),
+    ("Status", "INTEGER"),
+    ("Error", "TEXT"),
+    ("RetryCount", "INTEGER"),
+    ("FinishReason", "TEXT"),
+    ("LatencyMs", "REAL"),
+    ("TtftMs", "REAL"),
+    ("UpstreamMs", "REAL"),
+    ("StreamMs", "REAL"),
+    ("RequestBytes", "INTEGER"),
+    ("ResponseBytes", "INTEGER"),
+    ("PromptBytes", "INTEGER"),
+    ("RequestTailBytes", "INTEGER"),
+    ("AnswerBytes", "INTEGER"),
+    ("MessageCount", "INTEGER"),
+    ("SystemCount", "INTEGER"),
+    ("ToolCount", "INTEGER"),
+    ("AssistantCount", "INTEGER"),
+    ("ToolResultCount", "INTEGER"),
+    ("ImageCount", "INTEGER"),
+    ("Prompt", "TEXT"),
+    ("RequestTail", "TEXT"),
+    ("Answer", "TEXT"),
+    ("ToolNames", "TEXT"),
+    ("payload_id", "INTEGER"),
+];
+
+/// v1 索引：(SQL, 依赖列)。仅当依赖列齐备时创建，避免测试预建表缺列导致失败。
+const NEW_INDEXES: &[(&str, &[&str])] = &[
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_time ON records(TimeMs)",
+        &["TimeMs"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_type_time ON records(Type, TimeMs)",
+        &["Type", "TimeMs"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_model_time ON records(Model, TimeMs)",
+        &["Model", "TimeMs"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_status_time ON records(Status, TimeMs)",
+        &["Status", "TimeMs"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_session ON records(SessionId)",
+        &["SessionId"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_parent_session ON records(ParentSessionId)",
+        &["ParentSessionId"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_ip_time ON records(IP, TimeMs)",
+        &["IP", "TimeMs"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_backend_time ON records(Backend, TimeMs)",
+        &["Backend", "TimeMs"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_list_covering ON records(\
+             Type, TimeMs DESC, id, Model, Status, Backend, LatencyMs, TtftMs, \
+             PromptTokens, CompletionTokens, TotalTokens, MessageCount, ToolCount, FinishReason)",
+        &[
+            "Type",
+            "TimeMs",
+            "Model",
+            "Status",
+            "Backend",
+            "LatencyMs",
+            "TtftMs",
+            "PromptTokens",
+            "CompletionTokens",
+            "TotalTokens",
+            "MessageCount",
+            "ToolCount",
+            "FinishReason",
+        ],
+    ),
+];
+
+/// 读取指定表的现有列名。
+async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({})", table))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect())
+}
+
+async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let existing = table_columns(pool, "records").await?;
+
+    for (name, decl) in NEW_COLUMNS {
+        if !existing.iter().any(|c| c == name) {
+            sqlx::query(&format!("ALTER TABLE records ADD COLUMN {} {}", name, decl))
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    let has_col =
+        |c: &str| existing.iter().any(|e| e == c) || NEW_COLUMNS.iter().any(|(n, _)| *n == c);
+
+    for (sql, required) in NEW_INDEXES {
+        if required.iter().all(|c| has_col(c)) {
+            sqlx::query(sql).execute(pool).await?;
+        }
+    }
+
+    // PRAGMA 不支持绑定参数；此处为编译期常量，无注入风险。
+    sqlx::query(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))
+        .execute(pool)
+        .await?;
+
+    info!("Database schema migrated to version {}", SCHEMA_VERSION);
+    Ok(())
+}
 
 /// 初始化数据库连接池
 pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
@@ -24,6 +169,7 @@ pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
 
     let pool = SqlitePool::connect_with(options).await?;
 
+    // 保留原表名与 12 列以兼容测试套件；新增列由 migrate 补齐
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS records (
@@ -45,6 +191,8 @@ pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
     )
     .execute(&pool)
     .await?;
+
+    migrate(&pool).await?;
 
     info!("Database at '{}' initialized successfully", db_path);
     Ok(pool)
