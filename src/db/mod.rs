@@ -11,9 +11,10 @@ use crate::state::app_state::AppState;
 use std::sync::Arc;
 
 pub mod extract;
+pub mod payload;
 pub mod records;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
 const NEW_COLUMNS: &[(&str, &str)] = &[
@@ -110,6 +111,20 @@ const NEW_INDEXES: &[(&str, &[&str])] = &[
     ),
 ];
 
+const PAYLOADS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS payloads (
+    record_id INTEGER PRIMARY KEY REFERENCES records(id),
+    codec TEXT NOT NULL,
+    dict_id TEXT,
+    request BLOB,
+    response BLOB,
+    headers BLOB,
+    request_raw_len INTEGER,
+    response_raw_len INTEGER,
+    headers_raw_len INTEGER
+)
+"#;
+
 /// 读取指定表的现有列名。
 async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query(&format!("PRAGMA table_info({})", table))
@@ -147,6 +162,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             sqlx::query(sql).execute(pool).await?;
         }
     }
+
+    sqlx::query(PAYLOADS_DDL).execute(pool).await?;
 
     // PRAGMA 不支持绑定参数；此处为编译期常量，无注入风险。
     sqlx::query(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))

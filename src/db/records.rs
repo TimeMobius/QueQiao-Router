@@ -1,6 +1,7 @@
 use axum::http::HeaderMap;
 use chrono::Local;
 use serde_json::Value;
+use sqlx::Row;
 use std::sync::Arc;
 use tracing::error;
 
@@ -89,7 +90,12 @@ pub struct Record {
 /// 记录请求到数据库
 pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<(), sqlx::Error> {
     let pool = app_state.db_pool.read().await;
-    sqlx::query(
+    let req = crate::db::payload::compress(record.request.as_bytes());
+    let resp = crate::db::payload::compress(record.response.as_bytes());
+    let hdr = crate::db::payload::compress(record.headers.as_bytes());
+
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
         r#"
         INSERT INTO records (
             Time, TimeMs, IP, Method, Endpoint, Type, Model, Backend,
@@ -157,13 +163,68 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
     .bind(&record.request_tail)
     .bind(&record.answer)
     .bind(&record.tool_names)
-    .bind(&record.headers)
-    .bind(&record.request)
-    .bind(&record.response)
-    .execute(&*pool)
+    .bind("")
+    .bind("")
+    .bind("")
+    .execute(&mut *tx)
     .await?;
 
+    let record_id = inserted.last_insert_rowid();
+    sqlx::query(
+        r#"
+        INSERT INTO payloads (
+            record_id, codec, dict_id,
+            request, response, headers,
+            request_raw_len, response_raw_len, headers_raw_len
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(record_id)
+    .bind(&req.codec)
+    .bind(req.dict_id.as_deref())
+    .bind(&req.bytes)
+    .bind(&resp.bytes)
+    .bind(&hdr.bytes)
+    .bind(req.raw_len)
+    .bind(resp.raw_len)
+    .bind(hdr.raw_len)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
     Ok(())
+}
+
+#[derive(Debug, Default)]
+pub struct StoredPayload {
+    pub request: String,
+    pub response: String,
+    pub headers: String,
+}
+
+pub async fn load_payload(app_state: &Arc<AppState>, record_id: i64) -> Option<StoredPayload> {
+    let pool = app_state.db_pool.read().await;
+    let row = sqlx::query(
+        "SELECT codec, dict_id, request, response, headers FROM payloads WHERE record_id = ?",
+    )
+    .bind(record_id)
+    .fetch_optional(&*pool)
+    .await
+    .ok()??;
+
+    let codec: String = row.get("codec");
+    let dict_id: Option<String> = row.get("dict_id");
+    let decode = |blob: Option<Vec<u8>>| -> String {
+        blob.and_then(|b| crate::db::payload::decompress(&codec, dict_id.as_deref(), &b))
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    };
+
+    Some(StoredPayload {
+        request: decode(row.get("request")),
+        response: decode(row.get("response")),
+        headers: decode(row.get("headers")),
+    })
 }
 
 /// 为非流式请求记录日志
