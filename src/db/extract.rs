@@ -63,6 +63,7 @@ pub struct HeaderMeta {
     pub client_name: Option<String>,
     pub client_version: Option<String>,
     pub api_key: Option<String>,
+    pub request_id: Option<String>,
 }
 
 fn truncate_head(s: &str, max: usize) -> String {
@@ -513,6 +514,23 @@ pub fn header_meta(headers: &HeaderMap) -> HeaderMeta {
         None
     };
 
+    let raw_header = |name: &str| {
+        headers
+            .get(name)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+    };
+    let request_id = [
+        "x-request-id",
+        "x-trace-id",
+        "request-id",
+        "x-correlation-id",
+    ]
+    .iter()
+    .filter_map(|name| raw_header(name))
+    .map(|v| v.trim().to_string())
+    .find(|v| !v.is_empty())
+    .map(|v| v.chars().take(200).collect::<String>());
+
     HeaderMeta {
         session_id: get("x-session-id"),
         parent_session_id: get("x-parent-session-id"),
@@ -521,6 +539,7 @@ pub fn header_meta(headers: &HeaderMap) -> HeaderMeta {
         client_name,
         client_version,
         api_key,
+        request_id,
     }
 }
 
@@ -528,6 +547,7 @@ pub fn header_meta(headers: &HeaderMap) -> HeaderMeta {
 mod tests {
     use super::*;
     use crate::models::requests::{Message, MessageContent};
+    use axum::http::HeaderValue;
 
     fn chat(messages: Vec<Message>) -> RequestPayload {
         RequestPayload::Chat(ChatCompletionRequest {
@@ -622,5 +642,34 @@ mod tests {
             echo: None,
         });
         assert_eq!(extract_request(&payload).prompt, "hello completion");
+    }
+
+    #[test]
+    fn request_id_prefers_first_present_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-correlation-id", HeaderValue::from_static("corr"));
+        headers.insert("request-id", HeaderValue::from_static("req"));
+        headers.insert("x-trace-id", HeaderValue::from_static("trace"));
+        headers.insert("x-request-id", HeaderValue::from_static("xreq"));
+        assert_eq!(header_meta(&headers).request_id.as_deref(), Some("xreq"));
+
+        let mut only_corr = HeaderMap::new();
+        only_corr.insert("x-correlation-id", HeaderValue::from_static("corr"));
+        assert_eq!(header_meta(&only_corr).request_id.as_deref(), Some("corr"));
+    }
+
+    #[test]
+    fn request_id_ignores_empty_and_truncates_to_200_chars() {
+        let mut empty = HeaderMap::new();
+        empty.insert("x-request-id", HeaderValue::from_static("   "));
+        empty.insert("x-trace-id", HeaderValue::from_static("  trace  "));
+        assert_eq!(header_meta(&empty).request_id.as_deref(), Some("trace"));
+
+        let long = "模".repeat(250);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_str(&long).unwrap());
+        let got = header_meta(&headers).request_id.unwrap();
+        assert_eq!(got.chars().count(), 200);
+        assert!(got.starts_with("模"));
     }
 }

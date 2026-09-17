@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>日志记录 - QueQiao Router</title>
+<style>
+    :root {
+        --navy: #1F3A6D;
+        --navy-deep: #1A2550;
+        --bg: #F0F2F5;
+        --card: #ffffff;
+        --border: #DCDFE6;
+        --border-light: #EBEEF5;
+        --text: #303133;
+        --text-sub: #606266;
+        --text-muted: #909399;
+        --placeholder: #C0C4CC;
+        --table-head: #F5F7FA;
+        --link: #2B6CB0;
+        --green: #67C23A;
+        --orange: #E6A23C;
+        --red: #F56C6C;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                     "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+        font-size: 14px;
+    }
+    .topbar {
+        height: 52px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 20px;
+        color: #fff;
+        background: linear-gradient(135deg, var(--navy-deep) 0%, var(--navy) 100%);
+        position: relative;
+        overflow: hidden;
+    }
+    .topbar::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: repeating-linear-gradient(115deg, rgba(255,255,255,0.05) 0 40px, rgba(255,255,255,0) 40px 110px);
+        pointer-events: none;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 26px; z-index: 1; }
+    .brand { font-weight: 700; font-size: 15px; letter-spacing: .5px; }
+    .topnav { display: flex; gap: 22px; }
+    .topnav a {
+        color: rgba(255,255,255,.72);
+        text-decoration: none;
+        font-size: 14px;
+        padding: 4px 0;
+        border-bottom: 2px solid transparent;
+    }
+    .topnav a.active { color: #fff; font-weight: 600; border-bottom-color: rgba(255,255,255,.85); }
+    .topbar-right { display: flex; align-items: center; gap: 12px; z-index: 1; }
+    .avatar {
+        width: 28px; height: 28px; border-radius: 50%;
+        background: rgba(255,255,255,.22);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 12px; font-weight: 600;
+    }
+    .card {
+        background: var(--card);
+        margin: 10px;
+        border-radius: 8px 8px 0 0;
+        min-height: calc(100vh - 72px);
+        box-shadow: 0 1px 4px rgba(0,0,0,.06);
+        display: flex;
+        flex-direction: column;
+    }
+    .tabs { display: flex; gap: 28px; padding: 0 20px; border-bottom: 1px solid var(--border-light); }
+    .tab {
+        padding: 14px 2px 12px;
+        font-size: 14px;
+        color: var(--text-sub);
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        user-select: none;
+    }
+    .tab.active { color: var(--navy); font-weight: 600; border-bottom-color: var(--navy); }
+    .panel { display: none; flex: 1; flex-direction: column; }
+    .panel.active { display: flex; }
+    .filters {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        padding: 16px 20px;
+    }
+    .segmented { display: inline-flex; }
+    .segmented button {
+        height: 32px;
+        padding: 0 16px;
+        font-size: 13.5px;
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--text-sub);
+        cursor: pointer;
+    }
+    .segmented button:first-child { border-radius: 4px 0 0 4px; }
+    .segmented button:last-child { border-radius: 0 4px 4px 0; border-left: none; }
+    .segmented button.active { background: var(--navy); color: #fff; border-color: var(--navy); }
+    input[type="text"], input[type="datetime-local"], select {
+        height: 32px;
+        padding: 0 10px;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        font-size: 13.5px;
+        color: var(--text);
+        background: #fff;
+        outline: none;
+        font-family: inherit;
+    }
+    input::placeholder { color: var(--placeholder); }
+    input:focus, select:focus { border-color: var(--navy); }
+    .input-wrap { position: relative; display: inline-flex; align-items: center; }
+    .input-wrap .counter {
+        position: absolute; right: 8px; font-size: 11px; color: var(--placeholder); pointer-events: none;
+    }
+    .input-wrap input { padding-right: 44px; }
+    .range { display: inline-flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 13px; }
+    .btn-primary {
+        height: 32px;
+        padding: 0 16px;
+        border: none;
+        border-radius: 4px;
+        background: var(--navy);
+        color: #fff;
+        font-size: 13.5px;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: auto;
+        font-family: inherit;
+    }
+    .btn-primary:hover { background: #24467f; }
+    .btn-primary svg { width: 14px; height: 14px; }
+    .banner {
+        display: none;
+        margin: 0 20px 12px;
+        padding: 10px 14px;
+        border-radius: 4px;
+        background: #FEF0F0;
+        color: var(--red);
+        border: 1px solid #FDE2E2;
+        font-size: 13px;
+    }
+    .banner.show { display: block; }
+    .table-scroll { flex: 1; overflow: auto; padding: 0 20px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+    thead th {
+        position: sticky; top: 0; z-index: 2;
+        background: var(--table-head);
+        color: var(--text);
+        font-weight: 600;
+        text-align: center;
+        padding: 11px 8px;
+        white-space: nowrap;
+        border-bottom: 1px solid var(--border-light);
+    }
+    tbody td {
+        padding: 11px 8px;
+        text-align: center;
+        color: var(--text);
+        border-bottom: 1px solid var(--border-light);
+        white-space: nowrap;
+        max-width: 190px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    tbody tr:hover { background: #FAFBFC; }
+    td.preview, th.preview { text-align: left; white-space: normal; }
+    td.preview {
+        max-width: 380px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        color: var(--text-sub);
+    }
+    .clamp2 {
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        word-break: break-word;
+    }
+    .expand-link { color: var(--link); cursor: pointer; font-size: 12px; font-family: inherit; }
+    td.actions { white-space: nowrap; }
+    .link { color: var(--link); cursor: pointer; }
+    .status-2xx { color: var(--green); }
+    .status-3xx, .status-4xx { color: var(--orange); }
+    .status-5xx { color: var(--red); }
+    .state-row td { text-align: center; color: var(--text-muted); padding: 46px 8px; }
+    .pager {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 14px;
+        padding: 14px 20px 18px;
+        color: var(--text-sub);
+        font-size: 13px;
+        flex-wrap: wrap;
+    }
+    .pager button {
+        background: none; border: none; color: var(--link); cursor: pointer; font-size: 13px;
+        padding: 2px 4px; font-family: inherit;
+    }
+    .pager button:disabled { color: var(--placeholder); cursor: default; }
+    .pager select { height: 28px; }
+    .drawer-backdrop {
+        position: fixed; inset: 0; background: rgba(0,0,0,.35);
+        opacity: 0; visibility: hidden; transition: opacity .2s; z-index: 40;
+    }
+    .drawer-backdrop.open { opacity: 1; visibility: visible; }
+    .drawer {
+        position: fixed; top: 0; right: 0; height: 100%; width: 660px; max-width: 100%;
+        background: #fff; box-shadow: -4px 0 18px rgba(0,0,0,.14);
+        transform: translateX(100%); transition: transform .24s ease; z-index: 41;
+        display: flex; flex-direction: column;
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 16px 20px; border-bottom: 1px solid var(--border-light);
+    }
+    .drawer-title { font-size: 15px; font-weight: 600; color: var(--navy); }
+    .drawer-close { background: none; border: none; font-size: 20px; line-height: 1; color: var(--text-muted); cursor: pointer; }
+    .drawer-body { padding: 18px 20px 40px; overflow: auto; }
+    .meta-grid { display: grid; grid-template-columns: 116px 1fr; gap: 9px 14px; font-size: 13px; }
+    .meta-grid dt { color: var(--text-muted); }
+    .meta-grid dd { margin: 0; color: var(--text); word-break: break-all; }
+    .section { margin-top: 20px; border: 1px solid var(--border-light); border-radius: 6px; }
+    .section summary {
+        cursor: pointer; padding: 10px 14px; font-size: 13.5px; font-weight: 600;
+        color: var(--text); background: var(--table-head); border-radius: 6px;
+    }
+    .section pre {
+        margin: 0; padding: 14px; max-height: 320px; overflow: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+        color: var(--text-sub);
+    }
+    .drawer-btn {
+        margin-top: 16px; height: 32px; padding: 0 16px; border: 1px solid var(--navy);
+        border-radius: 4px; background: #fff; color: var(--navy); font-size: 13.5px;
+        cursor: pointer; font-family: inherit;
+    }
+    .drawer-btn:disabled { opacity: .6; cursor: default; }
+    @media (max-width: 900px) {
+        .btn-primary { margin-left: 0; }
+        .table-scroll { padding: 0 10px; }
+        .drawer { width: 100%; }
+    }
+</style>
+</head>
+<body>
+<header class="topbar">
+    <div class="topbar-left">
+        <div class="brand">鹊桥路由 QueQiao Router</div>
+        <nav class="topnav">
+            <a href="/dashboard">监控总览</a>
+            <a href="/dashboard/records" class="active">日志记录</a>
+        </nav>
+    </div>
+    <div class="topbar-right">
+        <div class="avatar">管</div>
+        <span>系统管理员</span>
+    </div>
+</header>
+
+<div class="card">
+    <div class="tabs">
+        <div class="tab active" data-tab="records">日志记录</div>
+        <div class="tab" data-tab="analysis">日志分析</div>
+    </div>
+
+    <section class="panel active" id="panel-records">
+        <div class="filters">
+            <div class="segmented" id="modeToggle">
+                <button data-errors="0" class="active">推理日志</button>
+                <button data-errors="1">错误日志</button>
+            </div>
+            <div class="input-wrap">
+                <input type="text" id="modelInput" placeholder="请输入模型名称" maxlength="50" list="modelOptions" style="width:190px;">
+                <span class="counter" id="modelCounter">0/50</span>
+            </div>
+            <datalist id="modelOptions"></datalist>
+            <div class="input-wrap">
+                <input type="text" id="searchInput" placeholder="请输入关键词" maxlength="50" style="width:200px;">
+                <span class="counter" id="searchCounter">0/50</span>
+            </div>
+            <select id="scopeSelect">
+                <option value="q">关键词</option>
+                <option value="ip">请求IP</option>
+                <option value="client">客户端</option>
+                <option value="session_id">会话ID</option>
+                <option value="parent_session_id">父会话ID</option>
+                <option value="request_id">请求ID</option>
+            </select>
+            <div class="range">
+                <input type="datetime-local" id="fromInput" step="1">
+                <span>至</span>
+                <input type="datetime-local" id="toInput" step="1">
+            </div>
+            <button class="btn-primary" id="refreshBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+                    <path d="M21 3v6h-6"></path>
+                </svg>
+                刷新
+            </button>
+        </div>
+        <div class="banner" id="errorBanner"></div>
+        <div class="table-scroll">
+            <table>
+                <thead>
+                    <tr>
+                        <th>序号</th><th>请求时间</th><th>类型</th><th>模型</th><th>状态</th>
+                        <th>客户端</th><th>服务IP</th><th>会话ID</th><th>请求ID</th>
+                        <th>时延</th><th>TTFT</th><th>提问Token</th><th>回复Token</th><th>总Token</th>
+                        <th>消息数</th><th>工具数</th><th class="preview">提问预览</th><th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="tableBody"></tbody>
+            </table>
+        </div>
+        <div class="pager">
+            <span id="totalText">共 0 条</span>
+            <button id="prevBtn" disabled>上一页</button>
+            <span id="pageText">第 1 页</span>
+            <button id="nextBtn" disabled>下一页</button>
+            <select id="sizeSelect">
+                <option value="10">10 条/页</option>
+                <option value="20" selected>20 条/页</option>
+                <option value="50">50 条/页</option>
+                <option value="100">100 条/页</option>
+            </select>
+        </div>
+    </section>
+
+    <section class="panel" id="panel-analysis">
+        <div style="padding:80px 8px;text-align:center;color:var(--text-muted);">日志分析功能开发中</div>
+    </section>
+</div>
+
+<div class="drawer-backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer">
+    <div class="drawer-head">
+        <div class="drawer-title" id="drawerTitle">请求详情</div>
+        <button class="drawer-close" id="drawerClose">&times;</button>
+    </div>
+    <div class="drawer-body" id="drawerBody"></div>
+</aside>
+
+<script>
+(function () {
+    var API = "/dashboard/api/records";
+    var state = { errors: false, cursor: null, stack: [], limit: 20, total: 0, nextCursor: null };
+
+    var $ = function (id) { return document.getElementById(id); };
+    var esc = function (v) {
+        return String(v === null || v === undefined ? "" : v).replace(/[&<>"']/g, function (c) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+    };
+    var dash = function (v) { return (v === null || v === undefined || v === "") ? "-" : v; };
+    var fmtMs = function (v) {
+        if (v === null || v === undefined) return "-";
+        var n = Number(v);
+        if (!isFinite(n)) return "-";
+        return n >= 1000 ? (n / 1000).toFixed(2) + " s" : n.toFixed(1) + " ms";
+    };
+    var fmtBytes = function (v) {
+        if (v === null || v === undefined) return "-";
+        var n = Number(v);
+        if (!isFinite(n)) return "-";
+        if (n >= 1048576) return (n / 1048576).toFixed(2) + " MB";
+        if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+        return n + " B";
+    };
+    var clientText = function (it) {
+        if (it.clientName) return it.clientName + (it.clientVersion ? " " + it.clientVersion : "");
+        if (it.userAgent) return it.userAgent;
+        return "-";
+    };
+    var statusClass = function (s, err) {
+        if (s === null || s === undefined) return err ? "status-5xx" : "";
+        if (s >= 500) return "status-5xx";
+        if (s >= 400) return "status-4xx";
+        if (s >= 300) return "status-3xx";
+        if (s >= 200) return "status-2xx";
+        return "";
+    };
+    var localToMs = function (value) {
+        if (!value) return null;
+        var t = new Date(value).getTime();
+        return isFinite(t) ? t : null;
+    };
+
+    function buildParams() {
+        var p = new URLSearchParams();
+        if (state.errors) p.set("errors", "1");
+        var model = $("modelInput").value.trim();
+        if (model) p.set("model", model);
+        var search = $("searchInput").value.trim();
+        if (search) p.set($("scopeSelect").value, search);
+        var from = localToMs($("fromInput").value);
+        var to = localToMs($("toInput").value);
+        if (from !== null) p.set("from", String(from));
+        if (to !== null) p.set("to", String(to));
+        p.set("limit", String(state.limit));
+        if (state.cursor) p.set("cursor", state.cursor);
+        return p;
+    }
+
+    function showError(msg) {
+        var b = $("errorBanner");
+        b.textContent = msg;
+        b.classList.add("show");
+    }
+    function clearError() { $("errorBanner").classList.remove("show"); }
+    function setRows(html) { $("tableBody").innerHTML = html; }
+
+    function renderItems(items) {
+        if (!items.length) {
+            setRows('<tr class="state-row"><td colspan="18">暂无数据</td></tr>');
+            return;
+        }
+        var offset = state.stack.length * state.limit;
+        var html = items.map(function (it, i) {
+            var seq = offset + i + 1;
+            var preview = it.promptPreview ? esc(it.promptPreview) : '<span style="color:var(--placeholder)">-</span>';
+            return '<tr>' +
+                '<td>' + seq + '</td>' +
+                '<td>' + esc(dash(it.time)) + '</td>' +
+                '<td>' + esc(dash(it.type)) + '</td>' +
+                '<td title="' + esc(it.model) + '">' + esc(dash(it.model)) + '</td>' +
+                '<td class="' + statusClass(it.status, it.error) + '">' + esc(dash(it.status)) + '</td>' +
+                '<td title="' + esc(clientText(it)) + '">' + esc(clientText(it)) + '</td>' +
+                '<td>' + esc(dash(it.ip)) + '</td>' +
+                '<td title="' + esc(it.sessionId) + '">' + esc(dash(it.sessionId)) + '</td>' +
+                '<td title="' + esc(it.requestId) + '">' + esc(dash(it.requestId)) + '</td>' +
+                '<td>' + esc(fmtMs(it.latencyMs)) + '</td>' +
+                '<td>' + esc(fmtMs(it.ttftMs)) + '</td>' +
+                '<td>' + esc(it.promptTokens) + '</td>' +
+                '<td>' + esc(it.completionTokens) + '</td>' +
+                '<td>' + esc(it.totalTokens) + '</td>' +
+                '<td>' + esc(dash(it.messageCount)) + '</td>' +
+                '<td>' + esc(dash(it.toolCount)) + '</td>' +
+                '<td class="preview"><div class="clamp2">' + preview + '</div>' +
+                    (it.promptPreview ? '<span class="expand-link" data-open="' + esc(it.id) + '">展开全部</span>' : '') + '</td>' +
+                '<td class="actions"><span class="link" data-open="' + esc(it.id) + '">查看详情</span></td>' +
+                '</tr>';
+        }).join("");
+        setRows(html);
+    }
+
+    function renderPager() {
+        $("totalText").textContent = "共 " + state.total + " 条";
+        $("pageText").textContent = "第 " + (state.stack.length + 1) + " 页";
+        $("prevBtn").disabled = state.stack.length === 0;
+        $("nextBtn").disabled = !state.nextCursor;
+    }
+
+    function load(reset) {
+        if (reset) { state.cursor = null; state.stack = []; }
+        clearError();
+        setRows('<tr class="state-row"><td colspan="18">加载中…</td></tr>');
+        fetch(API + "?" + buildParams().toString())
+            .then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.json();
+            })
+            .then(function (data) {
+                state.total = data.total || 0;
+                state.nextCursor = data.nextCursor || null;
+                renderItems(data.items || []);
+                renderPager();
+            })
+            .catch(function (e) {
+                setRows('<tr class="state-row"><td colspan="18">加载失败</td></tr>');
+                showError("加载记录失败：" + e.message);
+                renderPager();
+            });
+    }
+
+    function loadFacets() {
+        fetch(API + "/facets").then(function (r) { return r.json(); }).then(function (d) {
+            $("modelOptions").innerHTML = (d.models || []).map(function (m) {
+                return '<option value="' + esc(m) + '"></option>';
+            }).join("");
+        }).catch(function () {});
+    }
+
+    function openDrawer() {
+        $("drawer").classList.add("open");
+        $("backdrop").classList.add("open");
+    }
+    function closeDrawer() {
+        $("drawer").classList.remove("open");
+        $("backdrop").classList.remove("open");
+    }
+
+    function metaRow(label, value) {
+        return "<dt>" + esc(label) + "</dt><dd>" + esc(dash(value)) + "</dd>";
+    }
+
+    function section(title, text, open) {
+        if (!text) return "";
+        return '<details class="section"' + (open ? " open" : "") + '><summary>' + esc(title) +
+            '</summary><pre>' + esc(text) + "</pre></details>";
+    }
+
+    function pretty(raw) {
+        if (!raw) return "";
+        try { return JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { return raw; }
+    }
+
+    function renderDetail(d) {
+        var html = '<dl class="meta-grid">' +
+            metaRow("记录 ID", d.id) +
+            metaRow("请求时间", d.time) +
+            metaRow("时间戳(ms)", d.timeMs) +
+            metaRow("类型", d.type) +
+            metaRow("模型", d.model) +
+            metaRow("状态", d.status) +
+            metaRow("后端", d.backend) +
+            metaRow("方法", d.method) +
+            metaRow("端点", d.endpoint) +
+            metaRow("客户端", clientText(d)) +
+            metaRow("User-Agent", d.userAgent) +
+            metaRow("服务 IP", d.ip) +
+            metaRow("会话 ID", d.sessionId) +
+            metaRow("父会话 ID", d.parentSessionId) +
+            metaRow("请求 ID", d.requestId) +
+            metaRow("时延", fmtMs(d.latencyMs)) +
+            metaRow("TTFT", fmtMs(d.ttftMs)) +
+            metaRow("上游耗时", fmtMs(d.upstreamMs)) +
+            metaRow("流式耗时", fmtMs(d.streamMs)) +
+            metaRow("提问 Token", d.promptTokens) +
+            metaRow("回复 Token", d.completionTokens) +
+            metaRow("总 Token", d.totalTokens) +
+            metaRow("消息数", d.messageCount) +
+            metaRow("系统消息数", d.systemCount) +
+            metaRow("工具数", d.toolCount) +
+            metaRow("助手消息数", d.assistantCount) +
+            metaRow("工具结果数", d.toolResultCount) +
+            metaRow("图片数", d.imageCount) +
+            metaRow("请求体积", fmtBytes(d.requestBytes)) +
+            metaRow("响应体积", fmtBytes(d.responseBytes)) +
+            metaRow("结束原因", d.finishReason) +
+            metaRow("错误", d.error) +
+            metaRow("重试次数", d.retryCount) +
+            "</dl>";
+        html += section("Prompt", d.prompt, true);
+        html += section("RequestTail", d.requestTail);
+        html += section("Answer", d.answer);
+        html += section("ToolNames", d.toolNames);
+        html += '<div id="bodyArea"></div>';
+        html += d.hasPayload
+            ? '<button class="drawer-btn" id="loadBodyBtn">加载完整正文</button>'
+            : '<p style="color:var(--text-muted);font-size:13px;margin-top:16px;">该记录无压缩正文（历史数据或正文为空）</p>';
+        $("drawerBody").innerHTML = html;
+        var btn = $("loadBodyBtn");
+        if (btn) btn.addEventListener("click", function () { loadBody(d.id, btn); });
+    }
+
+    function loadBody(id, btn) {
+        btn.disabled = true;
+        btn.textContent = "加载中…";
+        fetch(API + "/" + id + "?include=body").then(function (r) { return r.json(); }).then(function (d) {
+            $("bodyArea").innerHTML =
+                section("完整请求体", pretty(d.request), true) +
+                section("完整响应体", pretty(d.response)) +
+                section("请求头", pretty(d.headers));
+            btn.remove();
+        }).catch(function (e) {
+            btn.disabled = false;
+            btn.textContent = "加载完整正文";
+            showError("加载正文失败：" + e.message);
+        });
+    }
+
+    function openDetail(id) {
+        $("drawerTitle").textContent = "请求详情 #" + id;
+        $("drawerBody").innerHTML = "加载中…";
+        openDrawer();
+        fetch(API + "/" + id).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(renderDetail).catch(function (e) {
+            $("drawerBody").innerHTML = '<p style="color:var(--red)">加载详情失败：' + esc(e.message) + "</p>";
+        });
+    }
+
+    document.querySelectorAll(".tab").forEach(function (tab) {
+        tab.addEventListener("click", function () {
+            document.querySelectorAll(".tab").forEach(function (t) { t.classList.remove("active"); });
+            tab.classList.add("active");
+            var name = tab.getAttribute("data-tab");
+            $("panel-records").classList.toggle("active", name === "records");
+            $("panel-analysis").classList.toggle("active", name === "analysis");
+        });
+    });
+
+    $("modeToggle").addEventListener("click", function (e) {
+        var btn = e.target.closest("button");
+        if (!btn) return;
+        this.querySelectorAll("button").forEach(function (b) { b.classList.remove("active"); });
+        btn.classList.add("active");
+        state.errors = btn.getAttribute("data-errors") === "1";
+        load(true);
+    });
+
+    $("tableBody").addEventListener("click", function (e) {
+        var el = e.target.closest("[data-open]");
+        if (el) openDetail(el.getAttribute("data-open"));
+    });
+
+    $("refreshBtn").addEventListener("click", function () { load(true); });
+    $("prevBtn").addEventListener("click", function () {
+        if (!state.stack.length) return;
+        state.cursor = state.stack.pop();
+        load(false);
+    });
+    $("nextBtn").addEventListener("click", function () {
+        if (!state.nextCursor) return;
+        state.stack.push(state.cursor);
+        state.cursor = state.nextCursor;
+        load(false);
+    });
+    $("sizeSelect").addEventListener("change", function () {
+        state.limit = parseInt(this.value, 10) || 20;
+        load(true);
+    });
+    $("modelInput").addEventListener("input", function () { $("modelCounter").textContent = this.value.length + "/50"; });
+    $("modelInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
+    $("searchInput").addEventListener("input", function () { $("searchCounter").textContent = this.value.length + "/50"; });
+    $("searchInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
+    $("scopeSelect").addEventListener("change", function () {
+        var labels = {
+            q: "请输入关键词", ip: "请输入请求IP", client: "请输入客户端",
+            session_id: "请输入会话ID", parent_session_id: "请输入父会话ID", request_id: "请输入请求ID"
+        };
+        $("searchInput").placeholder = labels[this.value] || "请输入关键词";
+    });
+    $("drawerClose").addEventListener("click", closeDrawer);
+    $("backdrop").addEventListener("click", closeDrawer);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeDrawer(); });
+
+    loadFacets();
+    load(true);
+})();
+</script>
+</body>
+</html>

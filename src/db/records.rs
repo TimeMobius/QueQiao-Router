@@ -49,6 +49,7 @@ pub struct Record {
     pub backend: Option<String>,
     pub session_id: Option<String>,
     pub parent_session_id: Option<String>,
+    pub request_id: Option<String>,
     pub session_affinity: Option<String>,
     pub user_agent: Option<String>,
     pub client_name: Option<String>,
@@ -99,7 +100,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
         r#"
         INSERT INTO records (
             Time, TimeMs, IP, Method, Endpoint, Type, Model, Backend,
-            SessionId, ParentSessionId, SessionAffinity, UserAgent, ClientName, ClientVersion, ApiKey,
+            SessionId, ParentSessionId, RequestId, SessionAffinity, UserAgent, ClientName, ClientVersion, ApiKey,
             Status, Error, RetryCount, FinishReason,
             LatencyMs, TtftMs, UpstreamMs, StreamMs,
             CompletionTokens, PromptTokens, TotalTokens, Tool, Multimodal,
@@ -109,7 +110,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
             Headers, Request, Response
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
@@ -130,6 +131,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
     .bind(record.backend.as_deref())
     .bind(record.session_id.as_deref())
     .bind(record.parent_session_id.as_deref())
+    .bind(record.request_id.as_deref())
     .bind(record.session_affinity.as_deref())
     .bind(record.user_agent.as_deref())
     .bind(record.client_name.as_deref())
@@ -302,6 +304,7 @@ pub async fn log_non_streaming_request(
         backend: meta.backend.clone(),
         session_id: header.session_id,
         parent_session_id: header.parent_session_id,
+        request_id: header.request_id,
         session_affinity: header.session_affinity,
         user_agent: header.user_agent,
         client_name: header.client_name,
