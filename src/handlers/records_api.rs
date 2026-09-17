@@ -24,6 +24,8 @@ const DETAIL_COLS: &str = "id, Time, TimeMs, Type, Model, Status, Backend, IP, M
     Tool, Multimodal, RequestBytes, ResponseBytes, FinishReason, Error, RetryCount, \
     Prompt, RequestTail, Answer, ToolNames, ApiKey";
 
+const COUNT_CAP: i64 = 10_000;
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
     pub from: Option<i64>,
@@ -82,6 +84,16 @@ fn fts_phrase(value: &str) -> String {
     out
 }
 
+/// Upper bound for a prefix scan: appending the largest code point sorts after every
+/// string that starts with `value`, so `col >= value AND col < bound` is a half-open
+/// range a B-tree can seek, unlike `LIKE 'value%'` on a BINARY column.
+fn prefix_upper(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    out.push_str(value);
+    out.push('\u{10FFFF}');
+    out
+}
+
 fn push_opt_text(sql: &mut String, binds: &mut Vec<Bind>, column: &str, value: Option<&String>) {
     if let Some(v) = value {
         if !v.is_empty() {
@@ -108,8 +120,9 @@ fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
         binds.push(Bind::Text(v.clone()));
     }
     if let Some(v) = p.model.as_ref().filter(|v| !v.is_empty()) {
-        sql.push_str(" AND Model LIKE ? ESCAPE '\\'");
-        binds.push(Bind::Text(like_contains(v)));
+        sql.push_str(" AND Model COLLATE NOCASE >= ? AND Model COLLATE NOCASE < ?");
+        binds.push(Bind::Text(v.clone()));
+        binds.push(Bind::Text(prefix_upper(v)));
     }
     if let Some(v) = p.status {
         sql.push_str(" AND Status = ?");
@@ -119,7 +132,11 @@ fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
         sql.push_str(" AND Backend = ?");
         binds.push(Bind::Text(v.clone()));
     }
-    push_opt_text(&mut sql, &mut binds, "IP", p.ip.as_ref());
+    if let Some(v) = p.ip.as_ref().filter(|v| !v.is_empty()) {
+        sql.push_str(" AND IP COLLATE NOCASE >= ? AND IP COLLATE NOCASE < ?");
+        binds.push(Bind::Text(v.clone()));
+        binds.push(Bind::Text(prefix_upper(v)));
+    }
     if let Some(v) = p.client.as_ref().filter(|v| !v.is_empty()) {
         let pat = like_contains(v);
         sql.push_str(" AND (ClientName LIKE ? ESCAPE '\\' OR UserAgent LIKE ? ESCAPE '\\')");
@@ -282,8 +299,10 @@ pub async fn list_records(
     let (where_sql, base_binds) = build_filters(&params);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
 
-    let count_sql = format!("SELECT COUNT(*) FROM records{where_sql}");
-    let count_row = bind_all(sqlx::query(&count_sql), &base_binds)
+    let mut count_binds = base_binds.clone();
+    count_binds.push(Bind::Int(COUNT_CAP));
+    let count_sql = format!("SELECT COUNT(*) FROM (SELECT 1 FROM records{where_sql} LIMIT ?)");
+    let count_row = bind_all(sqlx::query(&count_sql), &count_binds)
         .fetch_one(&*pool)
         .await
         .map_err(|e| {
@@ -294,6 +313,7 @@ pub async fn list_records(
             )
         })?;
     let total: i64 = count_row.try_get(0).unwrap_or(0);
+    let total_exact = total < COUNT_CAP;
 
     let mut data_binds = base_binds;
     let mut data_where = where_sql;
@@ -333,6 +353,7 @@ pub async fn list_records(
         "items": items,
         "nextCursor": next_cursor,
         "total": total,
+        "totalExact": total_exact,
     })))
 }
 
@@ -424,4 +445,19 @@ pub async fn record_facets(
         "statuses": statuses,
         "backends": backends,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_upper;
+
+    #[test]
+    fn prefix_upper_sorts_after_every_matching_string() {
+        let bound = prefix_upper("gpt");
+        assert!("gpt".to_string() < bound);
+        assert!("gpt-5.6-sol".to_string() < bound);
+        assert!("gptzzz".to_string() < bound);
+        assert!("gp".to_string() < bound);
+        assert!("gpu".to_string() > bound);
+    }
 }

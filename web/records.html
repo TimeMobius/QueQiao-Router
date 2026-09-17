@@ -501,7 +501,7 @@
 (function () {
     var API = "/dashboard/api/records";
     var LOG_API = "/dashboard/api/error-log";
-    var state = { errors: false, cursor: null, stack: [], limit: 20, total: 0, nextCursor: null, logCursor: null, logStack: [], logNext: null };
+    var state = { errors: false, cursor: null, stack: [], limit: 20, total: 0, totalExact: true, nextCursor: null, logCursor: null, logStack: [], logNext: null };
 
     var ICON = {
         tokens: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M4 7l3-3 3 3M17 20V4M14 17l3 3 3-3"></path></svg>',
@@ -625,7 +625,7 @@
     }
 
     function renderPager() {
-        $("totalText").textContent = "共 " + state.total + " 条";
+        $("totalText").textContent = "共 " + state.total + (state.totalExact === false ? "+" : "") + " 条";
         $("pageText").textContent = "第 " + (state.stack.length + 1) + " 页";
         $("prevBtn").disabled = state.stack.length === 0;
         $("nextBtn").disabled = !state.nextCursor;
@@ -728,6 +728,7 @@
             })
             .then(function (data) {
                 state.total = data.total || 0;
+                state.totalExact = data.totalExact !== false;
                 state.nextCursor = data.nextCursor || null;
                 renderItems(data.items || []);
                 renderPager();
@@ -922,7 +923,7 @@
     $("searchInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
     $("scopeSelect").addEventListener("change", function () {
         var labels = {
-            q: "请输入关键词", model: "请输入模型名（支持部分匹配）", ip: "请输入请求IP",
+            q: "请输入关键词", model: "请输入模型名（前缀匹配）", ip: "请输入请求IP（前缀匹配）",
             apikey: "请输入完整 API Key（精确匹配）", client: "请输入客户端",
             session_id: "请输入会话ID", parent_session_id: "请输入父会话ID", request_id: "请输入请求ID"
         };
