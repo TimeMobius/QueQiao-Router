@@ -9,7 +9,7 @@ use axum::{
 use rust_embed::RustEmbed;
 use std::sync::Arc;
 
-use crate::handlers::records_api;
+use crate::handlers::{error_log_api, records_api};
 use crate::state::app_state::AppState;
 
 /// 内嵌的监控面板静态资源（web/ 目录，编译进二进制）
@@ -24,6 +24,7 @@ pub fn dashboard_router() -> Router<Arc<AppState>> {
         .route("/records", get(records_page))
         .route("/api/records", get(records_api::list_records))
         .route("/api/records/facets", get(records_api::record_facets))
+        .route("/api/error-log", get(error_log_api::error_log_tail))
         .route("/api/records/:id", get(records_api::record_detail))
         .route("/*path", get(assets_handler))
 }

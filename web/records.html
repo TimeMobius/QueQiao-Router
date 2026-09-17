@@ -291,6 +291,18 @@
     .pager select { height: 28px; border-radius: 7px; color: var(--text-sub); }
     .pager .page-info { color: var(--text-muted); }
 
+    .log-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 22px; gap: 8px; }
+    .log-meta { font-size: 12px; color: var(--text-muted); }
+    .log-lines {
+        flex: 1; min-height: 0; overflow: auto; margin: 0;
+        border: 1px solid var(--border); border-radius: 9px; background: #FAFBFC;
+        padding: 12px 14px; color: var(--text-sub);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-all;
+    }
+    .filters.file-mode > .field, .filters.file-mode > .range, .filters.file-mode > #scopeSelect { display: none; }
+    .log-wrap[hidden], .table-scroll[hidden] { display: none; }
+
     .drawer-backdrop {
         position: fixed; inset: 0; background: rgba(16,24,40,.42);
         opacity: 0; visibility: hidden; transition: opacity .2s; z-index: 40;
@@ -437,6 +449,10 @@
                 <tbody id="tableBody"></tbody>
             </table>
         </div>
+        <div class="log-wrap" id="logWrap" hidden>
+            <div class="log-meta" id="logMeta"></div>
+            <pre class="log-lines" id="logLines"></pre>
+        </div>
         <div class="pager">
             <span id="totalText">共 0 条</span>
             <button class="btn-ghost" id="prevBtn" disabled>上一页</button>
@@ -467,7 +483,8 @@
 <script>
 (function () {
     var API = "/dashboard/api/records";
-    var state = { errors: false, cursor: null, stack: [], limit: 20, total: 0, nextCursor: null };
+    var LOG_API = "/dashboard/api/error-log";
+    var state = { errors: false, cursor: null, stack: [], limit: 20, total: 0, nextCursor: null, logCursor: null, logStack: [], logNext: null };
 
     var ICON = {
         tokens: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M4 7l3-3 3 3M17 20V4M14 17l3 3 3-3"></path></svg>',
@@ -599,6 +616,50 @@
         $("pageText").textContent = "第 " + (state.stack.length + 1) + " 页";
         $("prevBtn").disabled = state.stack.length === 0;
         $("nextBtn").disabled = !state.nextCursor;
+    }
+
+    function applyView() {
+        var file = state.errors;
+        document.querySelector(".filters").classList.toggle("file-mode", file);
+        document.querySelector(".table-scroll").hidden = file;
+        $("logWrap").hidden = !file;
+    }
+
+    function renderLogPager() {
+        $("pageText").textContent = "第 " + (state.logStack.length + 1) + " 页";
+        $("prevBtn").disabled = state.logStack.length === 0;
+        $("nextBtn").disabled = !state.logNext;
+    }
+
+    function loadErrorLog(reset) {
+        if (reset) { state.logCursor = null; state.logStack = []; }
+        clearError();
+        $("logLines").textContent = "加载中…";
+        var p = new URLSearchParams();
+        p.set("limit", String(state.limit));
+        if (state.logCursor !== null) p.set("before", String(state.logCursor));
+        fetch(LOG_API + "?" + p.toString())
+            .then(function (r) {
+                if (r.status === 404) return { file: null, lines: [], nextBefore: null };
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                return r.json();
+            })
+            .then(function (d) {
+                state.logNext = d.nextBefore || null;
+                $("logMeta").textContent = d.file
+                    ? d.file + "（从文件末尾向前分页，每页 " + state.limit + " 行）"
+                    : "未找到错误日志文件";
+                $("totalText").textContent = d.file || "-";
+                var lines = d.lines || [];
+                $("logLines").textContent = lines.length ? lines.join("\n") : "无错误日志内容";
+                renderLogPager();
+            })
+            .catch(function (e) {
+                $("logLines").textContent = "";
+                $("logMeta").textContent = "";
+                showError("加载错误日志失败：" + e.message);
+                renderLogPager();
+            });
     }
 
     function load(reset) {
@@ -762,7 +823,8 @@
         this.querySelectorAll("button").forEach(function (b) { b.classList.remove("active"); });
         btn.classList.add("active");
         state.errors = btn.getAttribute("data-errors") === "1";
-        load(true);
+        applyView();
+        if (state.errors) { loadErrorLog(true); } else { load(true); }
     });
 
     $("tableBody").addEventListener("click", function (e) {
@@ -772,11 +834,24 @@
 
     $("refreshBtn").addEventListener("click", function () { load(true); });
     $("prevBtn").addEventListener("click", function () {
+        if (state.errors) {
+            if (!state.logStack.length) return;
+            state.logCursor = state.logStack.pop();
+            loadErrorLog(false);
+            return;
+        }
         if (!state.stack.length) return;
         state.cursor = state.stack.pop();
         load(false);
     });
     $("nextBtn").addEventListener("click", function () {
+        if (state.errors) {
+            if (!state.logNext) return;
+            state.logStack.push(state.logCursor);
+            state.logCursor = state.logNext;
+            loadErrorLog(false);
+            return;
+        }
         if (!state.nextCursor) return;
         state.stack.push(state.cursor);
         state.cursor = state.nextCursor;
@@ -784,7 +859,7 @@
     });
     $("sizeSelect").addEventListener("change", function () {
         state.limit = parseInt(this.value, 10) || 20;
-        load(true);
+        if (state.errors) { loadErrorLog(true); } else { load(true); }
     });
     $("modelInput").addEventListener("input", function () { $("modelCounter").textContent = this.value.length + "/50"; });
     $("modelInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
@@ -802,6 +877,7 @@
     $("backdrop").addEventListener("click", closeDrawer);
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeDrawer(); });
 
+    applyView();
     loadFacets();
     load(true);
 })();

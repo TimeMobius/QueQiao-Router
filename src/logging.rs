@@ -12,10 +12,12 @@ pub struct LogConfig {
     pub error_log_retention_days: usize,
 }
 
+pub const DEFAULT_LOG_DIR: &str = "logs";
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
-            log_dir: "logs".to_string(),
+            log_dir: DEFAULT_LOG_DIR.to_string(),
             general_log_retention_days: 10,
             error_log_retention_days: 30,
         }

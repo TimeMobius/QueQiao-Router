@@ -1,6 +1,7 @@
 pub mod anthropic_stream_handler;
 pub mod audio_handler;
 pub mod common_handler;
+pub mod error_log_api;
 pub mod model_handler;
 pub mod records_api;
 pub mod responses_stream_handler;
