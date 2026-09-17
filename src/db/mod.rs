@@ -14,7 +14,7 @@ pub mod extract;
 pub mod payload;
 pub mod records;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
 const NEW_COLUMNS: &[(&str, &str)] = &[
@@ -67,57 +67,26 @@ const NEW_INDEXES: &[(&str, &[&str])] = &[
         &["Type", "TimeMs"],
     ),
     (
-        "CREATE INDEX IF NOT EXISTS idx_records_model_time ON records(Model, TimeMs)",
-        &["Model", "TimeMs"],
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_records_status_time ON records(Status, TimeMs)",
-        &["Status", "TimeMs"],
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_records_session ON records(SessionId)",
-        &["SessionId"],
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_records_parent_session ON records(ParentSessionId)",
-        &["ParentSessionId"],
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_records_request_id ON records(RequestId)",
-        &["RequestId"],
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_records_api_key ON records(ApiKey)",
-        &["ApiKey"],
-    ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_records_ip_time ON records(IP, TimeMs)",
-        &["IP", "TimeMs"],
+        "CREATE INDEX IF NOT EXISTS idx_records_api_key_time ON records(ApiKey, TimeMs)",
+        &["ApiKey", "TimeMs"],
     ),
     (
         "CREATE INDEX IF NOT EXISTS idx_records_backend_time ON records(Backend, TimeMs)",
         &["Backend", "TimeMs"],
     ),
-    (
-        "CREATE INDEX IF NOT EXISTS idx_records_list_covering ON records(\
-             Type, TimeMs DESC, id, Model, Status, Backend, LatencyMs, TtftMs, \
-             PromptTokens, CompletionTokens, TotalTokens, MessageCount, ToolCount, FinishReason)",
-        &[
-            "Type",
-            "TimeMs",
-            "Model",
-            "Status",
-            "Backend",
-            "LatencyMs",
-            "TtftMs",
-            "PromptTokens",
-            "CompletionTokens",
-            "TotalTokens",
-            "MessageCount",
-            "ToolCount",
-            "FinishReason",
-        ],
-    ),
+];
+
+/// v6 移除的索引：筛选谓词为 `LIKE '%v%'` 时无法命中 B-tree，或列本身无区分度。
+/// 它们只增加写入成本，不带来读取收益；若将来改为范围前缀检索，可按需重建。
+const DROPPED_INDEXES: &[&str] = &[
+    "idx_records_status_time",
+    "idx_records_model_time",
+    "idx_records_session",
+    "idx_records_parent_session",
+    "idx_records_request_id",
+    "idx_records_ip_time",
+    "idx_records_list_covering",
+    "idx_records_api_key",
 ];
 
 const PAYLOADS_DDL: &str = r#"
@@ -184,6 +153,14 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let has_col =
         |c: &str| existing.iter().any(|e| e == c) || NEW_COLUMNS.iter().any(|(n, _)| *n == c);
 
+    if version < 6 {
+        for name in DROPPED_INDEXES {
+            sqlx::query(&format!("DROP INDEX IF EXISTS {name}"))
+                .execute(pool)
+                .await?;
+        }
+    }
+
     for (sql, required) in NEW_INDEXES {
         if required.iter().all(|c| has_col(c)) {
             sqlx::query(sql).execute(pool).await?;
@@ -206,6 +183,10 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 .execute(pool)
                 .await;
         }
+    }
+
+    if version < 6 {
+        let _ = sqlx::query("PRAGMA optimize").execute(pool).await;
     }
 
     // PRAGMA 不支持绑定参数；此处为编译期常量，无注入风险。

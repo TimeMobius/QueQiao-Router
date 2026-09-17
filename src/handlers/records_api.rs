@@ -174,8 +174,7 @@ fn with_cursor(sql: &mut String, binds: &mut Vec<Bind>, cursor: Option<&String>)
     }) else {
         return false;
     };
-    sql.push_str(" AND (TimeMs < ? OR (TimeMs = ? AND id < ?))");
-    binds.push(Bind::Int(time_ms));
+    sql.push_str(" AND (TimeMs, id) < (?, ?)");
     binds.push(Bind::Int(time_ms));
     binds.push(Bind::Int(id));
     true
