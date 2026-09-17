@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>日志记录 - QueQiao Router</title>
+<link rel="icon" type="image/svg+xml" href="/dashboard/favicon.svg">
 <style>
     :root {
         --navy: #1F3A6D;
@@ -134,7 +135,7 @@
     }
     .field { position: relative; display: inline-flex; align-items: center; }
     .field > svg { position: absolute; left: 9px; width: 15px; height: 15px; color: var(--text-muted); pointer-events: none; }
-    .field input { padding-left: 30px; }
+    .field input[type="text"], .field input[type="datetime-local"] { padding-left: 30px; }
     input[type="text"], input[type="datetime-local"], select {
         height: 34px;
         padding: 0 11px;
@@ -293,12 +294,35 @@
 
     .log-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 22px; gap: 8px; }
     .log-meta { font-size: 12px; color: var(--text-muted); }
-    .log-lines {
-        flex: 1; min-height: 0; overflow: auto; margin: 0;
-        border: 1px solid var(--border); border-radius: 9px; background: #FAFBFC;
-        padding: 12px 14px; color: var(--text-sub);
+    .log-list { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+    .log-entry {
+        border: 1px solid var(--border); border-radius: 9px; background: #fff;
+        padding: 10px 12px; font-size: 12.5px;
+    }
+    .log-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .log-time {
+        color: var(--text-muted); font-variant-numeric: tabular-nums;
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-all;
+    }
+    .log-path { color: var(--text); font-weight: 500; word-break: break-all; }
+    .log-err {
+        margin-top: 6px; color: #B42318; background: #FEF3F2; border: 1px solid #FEE4E2;
+        border-radius: 7px; padding: 7px 9px; word-break: break-word;
+    }
+    .log-meta-line { margin-top: 6px; color: var(--text-muted); word-break: break-all; }
+    .log-kind { display: inline-flex; align-items: center; border-radius: 999px; padding: 1px 8px; font-size: 11.5px; font-weight: 600; }
+    .log-kind.stream { background: #FFF4E5; color: #B54708; }
+    .log-kind.other { background: #F2F4F7; color: var(--text-sub); }
+    .log-raw {
+        margin: 0; white-space: pre-wrap; word-break: break-all; color: var(--text-sub);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+    }
+    .log-detail { margin-top: 8px; }
+    .log-detail summary { cursor: pointer; color: var(--link); font-size: 12px; }
+    .log-detail pre {
+        margin: 6px 0 0; padding: 9px 11px; background: #FAFBFC; border: 1px solid var(--border);
+        border-radius: 7px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px;
     }
     .filters.file-mode > .field, .filters.file-mode > .range, .filters.file-mode > #scopeSelect { display: none; }
     .log-wrap[hidden], .table-scroll[hidden] { display: none; }
@@ -396,28 +420,21 @@
                 <button data-errors="0" class="active">推理日志</button>
                 <button data-errors="1">错误日志</button>
             </div>
-            <div class="field">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg>
-                <input type="text" id="modelInput" class="has-counter" placeholder="请输入模型名称" maxlength="50" list="modelOptions" style="width:186px;">
-                <span class="counter" id="modelCounter">0/50</span>
-            </div>
-            <datalist id="modelOptions"></datalist>
-            <div class="field">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.2-3.2"></path></svg>
-                <input type="text" id="searchInput" class="has-counter" placeholder="请输入关键词" maxlength="50" style="width:200px;">
-                <span class="counter" id="searchCounter">0/50</span>
-            </div>
             <select id="scopeSelect">
                 <option value="q">按关键词</option>
+                <option value="model">按模型名</option>
                 <option value="ip">按请求IP</option>
+                <option value="apikey">按API Key</option>
                 <option value="client">按客户端</option>
                 <option value="session_id">按会话ID</option>
                 <option value="parent_session_id">按父会话ID</option>
                 <option value="request_id">按请求ID</option>
             </select>
+            <datalist id="modelOptions"></datalist>
             <div class="field">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"></circle><path d="M10.9 12.1 20 3M17 6l2.5 2.5M14.5 8.5 17 11"></path></svg>
-                <input type="text" id="apiKeyInput" placeholder="按 API Key 精确筛选" maxlength="128" style="width:206px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.2-3.2"></path></svg>
+                <input type="text" id="searchInput" class="has-counter" placeholder="请输入关键词" maxlength="128" style="width:246px;">
+                <span class="counter" id="searchCounter">0/128</span>
             </div>
             <div class="range">
                 <div class="field"><input type="datetime-local" id="fromInput" step="1"></div>
@@ -451,7 +468,7 @@
         </div>
         <div class="log-wrap" id="logWrap" hidden>
             <div class="log-meta" id="logMeta"></div>
-            <pre class="log-lines" id="logLines"></pre>
+            <div class="log-list" id="logList"></div>
         </div>
         <div class="pager">
             <span id="totalText">共 0 条</span>
@@ -553,12 +570,8 @@
     function buildParams() {
         var p = new URLSearchParams();
         if (state.errors) p.set("errors", "1");
-        var model = $("modelInput").value.trim();
-        if (model) p.set("model", model);
         var search = $("searchInput").value.trim();
         if (search) p.set($("scopeSelect").value, search);
-        var apiKey = $("apiKeyInput").value.trim();
-        if (apiKey) p.set("apikey", apiKey);
         var from = localToMs($("fromInput").value);
         var to = localToMs($("toInput").value);
         if (from !== null) p.set("from", String(from));
@@ -631,31 +644,73 @@
         $("nextBtn").disabled = !state.logNext;
     }
 
+    function logTime(e) {
+        var m = String(e.time || "").match(/(\d{2}:\d{2}:\d{2})/);
+        return m ? m[1] : (e.time || "");
+    }
+    function logEntryHtml(e) {
+        if (e.kind === "unparsed") {
+            return '<div class="log-entry"><pre class="log-raw">' + esc(e.raw) + "</pre></div>";
+        }
+        var badge = e.kind === "http_error"
+            ? '<span class="status ' + statusClass(e.status, e.error) + '"><span class="dot"></span>' + esc(dash(e.status)) + "</span>"
+            : '<span class="log-kind ' + (e.kind === "stream_interrupted" ? "stream" : "other") + '">' +
+              (e.kind === "stream_interrupted" ? "流式中断" : "其他") + "</span>";
+        var path = e.method ? e.method + " " + (e.path || "") : (e.path || "-");
+        var meta = [];
+        if (e.ip) meta.push("客户端 " + e.ip);
+        if (e.backend) meta.push("后端 " + e.backend);
+        if (e.latency) meta.push("耗时 " + e.latency);
+        if (e.model && e.model !== "-") meta.push("模型 " + e.model);
+        if (e.api_key && e.api_key !== "-") meta.push("Key " + e.api_key);
+        if (e.user_agent) meta.push(e.user_agent);
+        var details = "";
+        if (e.request_body) {
+            details += '<details class="log-detail"><summary>请求体</summary><pre>' + esc(pretty(e.request_body)) + "</pre></details>";
+        }
+        details += '<details class="log-detail"><summary>原始行</summary><pre>' + esc(e.raw) + "</pre></details>";
+        return '<div class="log-entry">' +
+            '<div class="log-head">' + badge +
+                '<span class="log-time">' + esc(logTime(e)) + "</span>" +
+                '<span class="log-path">' + esc(path) + "</span>" +
+            "</div>" +
+            (e.error ? '<div class="log-err">' + esc(e.error) + "</div>" : "") +
+            (meta.length ? '<div class="log-meta-line">' + esc(meta.join(" · ")) + "</div>" : "") +
+            details +
+        "</div>";
+    }
+    function renderLogEntries(entries) {
+        if (!entries.length) {
+            $("logList").innerHTML = '<p class="hint">无错误日志内容</p>';
+            return;
+        }
+        $("logList").innerHTML = entries.map(logEntryHtml).join("");
+    }
+
     function loadErrorLog(reset) {
         if (reset) { state.logCursor = null; state.logStack = []; }
         clearError();
-        $("logLines").textContent = "加载中…";
+        $("logList").innerHTML = '<p class="hint">加载中…</p>';
         var p = new URLSearchParams();
         p.set("limit", String(state.limit));
         if (state.logCursor !== null) p.set("before", String(state.logCursor));
         fetch(LOG_API + "?" + p.toString())
             .then(function (r) {
-                if (r.status === 404) return { file: null, lines: [], nextBefore: null };
+                if (r.status === 404) return { file: null, entries: [], nextBefore: null };
                 if (!r.ok) throw new Error("HTTP " + r.status);
                 return r.json();
             })
             .then(function (d) {
                 state.logNext = d.nextBefore || null;
                 $("logMeta").textContent = d.file
-                    ? d.file + "（从文件末尾向前分页，每页 " + state.limit + " 行）"
+                    ? d.file + "（从文件末尾向前分页，每页 " + state.limit + " 条）"
                     : "未找到错误日志文件";
                 $("totalText").textContent = d.file || "-";
-                var lines = d.lines || [];
-                $("logLines").textContent = lines.length ? lines.join("\n") : "无错误日志内容";
+                renderLogEntries(d.entries || []);
                 renderLogPager();
             })
             .catch(function (e) {
-                $("logLines").textContent = "";
+                $("logList").innerHTML = "";
                 $("logMeta").textContent = "";
                 showError("加载错误日志失败：" + e.message);
                 renderLogPager();
@@ -861,17 +916,22 @@
         state.limit = parseInt(this.value, 10) || 20;
         if (state.errors) { loadErrorLog(true); } else { load(true); }
     });
-    $("modelInput").addEventListener("input", function () { $("modelCounter").textContent = this.value.length + "/50"; });
-    $("modelInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
-    $("searchInput").addEventListener("input", function () { $("searchCounter").textContent = this.value.length + "/50"; });
+    $("searchInput").addEventListener("input", function () {
+        $("searchCounter").textContent = this.value.length + "/" + this.maxLength;
+    });
     $("searchInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
-    $("apiKeyInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
     $("scopeSelect").addEventListener("change", function () {
         var labels = {
-            q: "请输入关键词", ip: "请输入请求IP", client: "请输入客户端",
+            q: "请输入关键词", model: "请输入模型名（支持部分匹配）", ip: "请输入请求IP",
+            apikey: "请输入完整 API Key（精确匹配）", client: "请输入客户端",
             session_id: "请输入会话ID", parent_session_id: "请输入父会话ID", request_id: "请输入请求ID"
         };
         $("searchInput").placeholder = labels[this.value] || "请输入关键词";
+        if (this.value === "model") {
+            $("searchInput").setAttribute("list", "modelOptions");
+        } else {
+            $("searchInput").removeAttribute("list");
+        }
     });
     $("drawerClose").addEventListener("click", closeDrawer);
     $("backdrop").addEventListener("click", closeDrawer);
