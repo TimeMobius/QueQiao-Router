@@ -280,6 +280,125 @@ cargo test
 
 ---
 
+## 🔎 日志检索 API
+
+监控面板（`/dashboard`）背后的只读查询接口，均为 **GET**、返回 JSON。这些接口自身不产生 metrics、不写访问日志，可安全频繁轮询。
+
+### `GET /dashboard/api/records` — 列表检索
+
+| 参数 | 类型 | 匹配方式 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `from` / `to` | i64 | — | 起止时间（**epoch 毫秒**，含） |
+| `model` | string | 前缀，大小写不敏感 | `gpt` 命中 `gpt-4o-mini`、`GPT-5.6-Sol` |
+| `ip` | string | 前缀，大小写不敏感 | `192.168.10` 命中 `192.168.10.32` |
+| `apikey` | string | 精确 | 需填完整 Key |
+| `type` | string | 精确 | `chat.completions` / `responses` / `anthropic.messages` |
+| `backend` | string | 精确 | 上游客户端名 |
+| `status` | i64 | 精确 | HTTP 状态码 |
+| `client` | string | 子串 | 同时匹配 `ClientName` 或 `UserAgent` |
+| `session_id` / `parent_session_id` / `request_id` | string | 子串 | |
+| `q` | string | 见下 | 关键词检索 |
+| `errors` | `1` | — | 仅返回 `Status >= 400` |
+| `cursor` | string | — | 翻页游标 `"<TimeMs>:<id>"` |
+| `limit` | i64 | — | 每页条数，默认 50，范围 1–500 |
+
+`q` 按长度分支：**≥3 字符** 走 FTS5 trigram 子串索引（快）；**<3 字符** 退化为三列 `LIKE '%x%'` 全表扫描，建议前端限制最少 3 字符，或同时附带 `from`/`to` 收窄范围。
+
+返回结果：
+
+```json
+{
+  "items": [{
+    "id": 273, "time": "2026-09-17 18:08:40.742568", "timeMs": 1789639720742,
+    "type": "responses", "model": "gpt-5.6-sol", "status": 200, "ip": "192.168.10.32",
+    "sessionId": "…", "requestId": "…", "toolCount": 34,
+    "promptTokens": 1234, "totalTokens": 5678, "latencyMs": 20484.2, "promptPreview": "……"
+  }],
+  "nextCursor": "1789639720742:273",
+  "total": 273,
+  "totalExact": true
+}
+```
+
+- `items` 已按时间倒序（最新在前），同毫秒再按 `id` 倒序。
+- `total` **最多统计 10000 条**；`totalExact` 为 `false` 时表示 `total` 语义是「**≥ 10000**」。
+- 翻页只支持顺序前后翻：把上一页的 `nextCursor` 原样回传，`null` 表示已是最后一页。翻页时筛选条件必须保持一致。
+
+```bash
+curl 'http://127.0.0.1:8000/dashboard/api/records?model=gpt&limit=20'
+curl 'http://127.0.0.1:8000/dashboard/api/records?ip=192.168.10'
+curl 'http://127.0.0.1:8000/dashboard/api/records?apikey=sk-xxxxxxxx'
+curl 'http://127.0.0.1:8000/dashboard/api/records?q=模型路由'
+curl 'http://127.0.0.1:8000/dashboard/api/records?from=1789629022325&to=1789639720742&errors=1'
+curl 'http://127.0.0.1:8000/dashboard/api/records?limit=20&cursor=1789639720742:273'
+```
+
+### `GET /dashboard/api/records/facets` — 筛选项字典
+
+返回去重后的可选项（每维最多 200 个），用于下拉与自动补全：
+
+```json
+{ "models": ["gpt-5.6-sol"], "types": ["chat.completions", "responses"],
+  "statuses": [200], "backends": ["alpha"] }
+```
+
+### `GET /dashboard/api/records/{id}` — 记录详情
+
+返回列表字段外加 `prompt`、`requestTail`、`answer`、`toolNames`、`apiKey`、`hasPayload`。
+
+| 参数 | 说明 |
+| :--- | :--- |
+| `include=body` | 额外返回完整 `request` / `response` / `headers`（按需 zstd 解压，体积可能很大，建议用户展开时再请求） |
+
+未知 `id` 返回 **404**；`hasPayload=false` 表示该记录无压缩正文。
+
+### `GET /dashboard/api/error-log` — 错误日志（读文件，非数据库）
+
+非 2xx 响应与流式中断**不写入数据库**，只存在于 `logs/error.<日期>.log`。该接口从文件末尾**向前分块读取**，开销与页大小相关而非文件总大小。
+
+| 参数 | 说明 |
+| :--- | :--- |
+| `limit` | 每页条数，默认 100，范围 1–500 |
+| `before` | 字节偏移游标，回传上一页返回的 `nextBefore` |
+
+```json
+{
+  "file": "error.2026-09-17.log",
+  "size": 7040,
+  "entries": [
+    { "kind": "http_error", "time": "17/Sep/2026:07:28:00 +0000", "ip": "10.0.0.5",
+      "method": "POST", "path": "/v1/messages", "status": 500, "model": "claude-x",
+      "userAgent": "python-httpx/0.27.0", "latency": "1.250s",
+      "error": "upstream boom", "requestBody": "{\"model\":\"claude-x\"}" },
+    { "kind": "stream_interrupted", "time": "17/Sep/2026:08:00:00 +0000", "ip": "10.0.0.9",
+      "path": "/v1/chat/completions", "model": "gpt-5", "backend": "alpha",
+      "error": "upstream stream interrupted: connection reset" }
+  ],
+  "nextBefore": 4480,
+  "hasMore": true
+}
+```
+
+`kind` 取值 `http_error` / `stream_interrupted` / `unparsed`（无法解析时仅保留 `raw`）。某字段为 `null` 表示该行不含此信息，不是错误。`nextBefore` 为 `null` 表示已到文件开头。
+
+### 检索性能备注
+
+| 条件 | 索引 |
+| :--- | :--- |
+| `from` / `to` | `idx_records_time`（覆盖索引，兼顾倒序与统计） |
+| `type` / `backend` / `apikey` | 等值索引 |
+| `model` / `ip` | 前缀范围索引（`COLLATE NOCASE`） |
+| `q`（≥3 字） | FTS5 trigram |
+| `session_id` / `parent_session_id` / `request_id` / `client` / `status` / `q`（<3 字） | **无索引，扫描** |
+
+- **前缀 ≠ 子串**：`model=pt` 不会命中 `gpt-4`；任意位置匹配请用 `q`（≥3 字）。
+- **`total` 是带上限的估算**，键集分页不依赖它；需要精确总数请自行带相同条件统计。
+- 前缀/范围条件会附加一次临时排序（范围扫描的固有代价），但候选集已被收窄，影响很小。
+- **详情接口返回完整明文 `apiKey`**（列表接口永不返回）。UI 默认脱敏需点击展开，接口本身不脱敏；本项目默认无网关认证，暴露在网络上等于泄露全部密钥，**部署时务必给 `/dashboard` 加认证或限制来源**。
+- 读取的是 `logs/` 下日期最大的 `error.*.log`，日志目录为进程工作目录下的 `logs/`；该目录在进程启动时会被重建，不要在其中存放需要留存的数据。
+
+---
+
 ## 🔧 可选编译功能
 
 - **`check-api-auth`**: 门控认证插件，编译时启用 `--features check-api-auth`。此功能依赖同目录下 `Check_API/auth-lib` 外部 sibling 库，未编译时不产生任何性能影响，也无默认认证保护。
