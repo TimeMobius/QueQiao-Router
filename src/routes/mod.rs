@@ -21,6 +21,10 @@ pub mod messages;
 pub mod models;
 pub mod responses;
 
+async fn favicon_redirect() -> axum::response::Redirect {
+    axum::response::Redirect::permanent("/dashboard/favicon.svg")
+}
+
 pub fn create_router(app_state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -29,6 +33,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(health::health_check))
+        .route("/favicon.ico", get(favicon_redirect))
         .route("/v1/models", get(models::get_models))
         .route("/v1/chat/completions", post(chat::handle_chat_completion))
         .route("/v1/responses", post(responses::handle_responses))

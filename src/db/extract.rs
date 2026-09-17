@@ -341,7 +341,16 @@ pub fn extract_request(payload: &RequestPayload) -> RequestExtract {
             }
         }
         RequestPayload::Score(p) => value_prompt(&p.text_1),
-        RequestPayload::Responses(p) => responses_input_extract(&p.input),
+        RequestPayload::Responses(p) => {
+            let mut r = responses_input_extract(&p.input);
+            r.tool_count = p
+                .extra
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() as i64)
+                .unwrap_or(0);
+            r
+        }
         RequestPayload::AnthropicMessages(p) => anthropic_extract(p),
     }
 }
@@ -625,6 +634,33 @@ mod tests {
         assert!(a.answer.contains("[reasoning]think"));
         assert_eq!(a.tool_names, "read_file");
         assert_eq!(a.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn responses_request_counts_declared_tools() {
+        let with_tools = RequestPayload::Responses(crate::models::requests::ResponsesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            input: serde_json::json!("hi"),
+            stream: None,
+            extra: serde_json::json!({
+                "tools": [
+                    {"type": "function", "name": "bash"},
+                    {"type": "function", "name": "read_file"},
+                ]
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        });
+        assert_eq!(extract_request(&with_tools).tool_count, 2);
+
+        let without_tools = RequestPayload::Responses(crate::models::requests::ResponsesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            input: serde_json::json!("hi"),
+            stream: None,
+            extra: serde_json::Map::new(),
+        });
+        assert_eq!(extract_request(&without_tools).tool_count, 0);
     }
 
     #[test]
