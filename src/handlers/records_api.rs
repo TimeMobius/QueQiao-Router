@@ -22,7 +22,7 @@ const DETAIL_COLS: &str = "id, Time, TimeMs, Type, Model, Status, Backend, IP, M
     LatencyMs, TtftMs, UpstreamMs, StreamMs, PromptTokens, CompletionTokens, TotalTokens, \
     MessageCount, SystemCount, ToolCount, AssistantCount, ToolResultCount, ImageCount, \
     Tool, Multimodal, RequestBytes, ResponseBytes, FinishReason, Error, RetryCount, \
-    Prompt, RequestTail, Answer, ToolNames";
+    Prompt, RequestTail, Answer, ToolNames, ApiKey";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
@@ -38,6 +38,7 @@ pub struct ListParams {
     pub session_id: Option<String>,
     pub parent_session_id: Option<String>,
     pub request_id: Option<String>,
+    pub apikey: Option<String>,
     pub q: Option<String>,
     pub errors: Option<String>,
     pub cursor: Option<String>,
@@ -133,6 +134,10 @@ fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
         p.parent_session_id.as_ref(),
     );
     push_opt_text(&mut sql, &mut binds, "RequestId", p.request_id.as_ref());
+    if let Some(v) = p.apikey.as_ref().filter(|v| !v.is_empty()) {
+        sql.push_str(" AND ApiKey = ?");
+        binds.push(Bind::Text(v.clone()));
+    }
 
     let error_mode = p
         .errors
@@ -367,6 +372,7 @@ pub async fn record_detail(
     object.insert("requestTail".to_string(), json!(text(&row, "RequestTail")));
     object.insert("answer".to_string(), json!(text(&row, "Answer")));
     object.insert("toolNames".to_string(), json!(text(&row, "ToolNames")));
+    object.insert("apiKey".to_string(), json!(text(&row, "ApiKey")));
     object.insert("hasPayload".to_string(), json!(has_payload));
 
     let include_body = params

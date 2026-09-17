@@ -88,13 +88,15 @@
         padding: 15px 2px 13px;
         font-size: 14px;
         color: var(--text-sub);
-        cursor: pointer;
+        cursor: default;
         border-bottom: 2px solid transparent;
         user-select: none;
-        transition: color .15s;
     }
-    .tab:hover { color: var(--text); }
     .tab.active { color: var(--navy); font-weight: 600; border-bottom-color: var(--navy); }
+    .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12.5px;
+    }
 
     .panel { display: none; flex: 1; flex-direction: column; min-height: 0; }
     .panel.active { display: flex; }
@@ -373,8 +375,7 @@
 
 <div class="card">
     <div class="tabs">
-        <div class="tab active" data-tab="records">日志记录</div>
-        <div class="tab" data-tab="analysis">日志分析</div>
+        <div class="tab active">日志记录</div>
     </div>
 
     <section class="panel active" id="panel-records">
@@ -402,6 +403,10 @@
                 <option value="parent_session_id">按父会话ID</option>
                 <option value="request_id">按请求ID</option>
             </select>
+            <div class="field">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"></circle><path d="M10.9 12.1 20 3M17 6l2.5 2.5M14.5 8.5 17 11"></path></svg>
+                <input type="text" id="apiKeyInput" placeholder="按 API Key 精确筛选" maxlength="128" style="width:206px;">
+            </div>
             <div class="range">
                 <div class="field"><input type="datetime-local" id="fromInput" step="1"></div>
                 <span class="sep">至</span>
@@ -444,10 +449,6 @@
                 <option value="200">200 条/页</option>
             </select>
         </div>
-    </section>
-
-    <section class="panel" id="panel-analysis">
-        <div style="padding:90px 8px;text-align:center;color:var(--text-muted);">日志分析功能开发中</div>
     </section>
 </div>
 
@@ -539,6 +540,8 @@
         if (model) p.set("model", model);
         var search = $("searchInput").value.trim();
         if (search) p.set($("scopeSelect").value, search);
+        var apiKey = $("apiKeyInput").value.trim();
+        if (apiKey) p.set("apikey", apiKey);
         var from = localToMs($("fromInput").value);
         var to = localToMs($("toInput").value);
         if (from !== null) p.set("from", String(from));
@@ -561,9 +564,7 @@
             setRows('<tr class="state-row"><td colspan="10">暂无数据</td></tr>');
             return;
         }
-        var offset = state.stack.length * state.limit;
-        var html = items.map(function (it, i) {
-            var seq = offset + i + 1;
+        var html = items.map(function (it) {
             var type = shortType(it.type);
             var usage =
                 metric("rounds", ICON.rounds, it.messageCount, "消息轮数") +
@@ -577,7 +578,7 @@
                 ? '<div class="preview-text">' + esc(it.promptPreview) + '</div><span class="expand-link" data-open="' + esc(it.id) + '">展开全部</span>'
                 : '<span style="color:var(--text-muted)">-</span>';
             return "<tr>" +
-                '<td class="num">' + seq + "</td>" +
+                '<td class="num">' + esc(it.id) + "</td>" +
                 '<td class="time">' + esc(dash(it.time)) + "</td>" +
                 '<td><span class="model-name" title="' + esc(it.model) + '">' + esc(dash(it.model)) + "</span>" +
                     (type ? '<span class="pill">' + esc(type) + "</span>" : "") + "</td>" +
@@ -645,6 +646,18 @@
     function metaRow(label, value) {
         return "<dt>" + esc(label) + "</dt><dd>" + esc(dash(value)) + "</dd>";
     }
+    function maskKey(v) {
+        if (!v) return "";
+        var s = String(v);
+        if (s.length <= 8) return s.charAt(0) + "••••";
+        return s.slice(0, 8) + "••••" + s.slice(-4);
+    }
+    function apiKeyRow(v) {
+        if (!v) return metaRow("API Key", null);
+        return '<dt>API Key</dt><dd><span class="mono" id="apiKeyVal" data-shown="0" data-full="' +
+            esc(v) + '" data-masked="' + esc(maskKey(v)) + '">' + esc(maskKey(v)) +
+            '</span> <span class="link" id="apiKeyToggle">显示</span></dd>';
+    }
     function section(title, icon, text, open) {
         if (!text) return "";
         return '<details class="section"' + (open ? " open" : "") + "><summary>" + icon + esc(title) +
@@ -676,6 +689,7 @@
                 metaRow("会话 ID", d.sessionId) +
                 metaRow("父会话 ID", d.parentSessionId) +
                 metaRow("请求 ID", d.requestId) +
+                apiKeyRow(d.apiKey) +
             "</dl>") +
             group("用量与耗时", ICON.tokens, '<dl class="meta-grid">' +
                 metaRow("总 Token", d.totalTokens) +
@@ -704,6 +718,14 @@
         $("drawerBody").innerHTML = html;
         var btn = $("loadBodyBtn");
         if (btn) btn.addEventListener("click", function () { loadBody(d.id, btn); });
+        var keyToggle = $("apiKeyToggle");
+        if (keyToggle) keyToggle.addEventListener("click", function () {
+            var el = $("apiKeyVal");
+            var shown = el.getAttribute("data-shown") === "1";
+            el.textContent = shown ? el.getAttribute("data-masked") : el.getAttribute("data-full");
+            el.setAttribute("data-shown", shown ? "0" : "1");
+            keyToggle.textContent = shown ? "显示" : "隐藏";
+        });
     }
 
     function loadBody(id, btn) {
@@ -733,16 +755,6 @@
             $("drawerBody").innerHTML = '<p style="color:var(--red)">加载详情失败：' + esc(e.message) + "</p>";
         });
     }
-
-    document.querySelectorAll(".tab").forEach(function (tab) {
-        tab.addEventListener("click", function () {
-            document.querySelectorAll(".tab").forEach(function (t) { t.classList.remove("active"); });
-            tab.classList.add("active");
-            var name = tab.getAttribute("data-tab");
-            $("panel-records").classList.toggle("active", name === "records");
-            $("panel-analysis").classList.toggle("active", name === "analysis");
-        });
-    });
 
     $("modeToggle").addEventListener("click", function (e) {
         var btn = e.target.closest("button");
@@ -778,6 +790,7 @@
     $("modelInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
     $("searchInput").addEventListener("input", function () { $("searchCounter").textContent = this.value.length + "/50"; });
     $("searchInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
+    $("apiKeyInput").addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
     $("scopeSelect").addEventListener("change", function () {
         var labels = {
             q: "请输入关键词", ip: "请输入请求IP", client: "请输入客户端",

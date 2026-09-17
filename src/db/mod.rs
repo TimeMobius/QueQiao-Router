@@ -14,7 +14,7 @@ pub mod extract;
 pub mod payload;
 pub mod records;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
 const NEW_COLUMNS: &[(&str, &str)] = &[
@@ -85,6 +85,10 @@ const NEW_INDEXES: &[(&str, &[&str])] = &[
     (
         "CREATE INDEX IF NOT EXISTS idx_records_request_id ON records(RequestId)",
         &["RequestId"],
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_records_api_key ON records(ApiKey)",
+        &["ApiKey"],
     ),
     (
         "CREATE INDEX IF NOT EXISTS idx_records_ip_time ON records(IP, TimeMs)",
