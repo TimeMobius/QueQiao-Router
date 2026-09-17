@@ -29,11 +29,20 @@ fn truncate_token_for_log(token: &str) -> String {
     }
 }
 
+/// 面板请求被有意排除在访问日志之外（轮询频繁，记录只产生无谓磁盘 I/O）
+fn should_skip_access_log(path: &str) -> bool {
+    path == "/dashboard" || path.starts_with("/dashboard/")
+}
+
 /// 访问日志中间件
 ///
 /// 记录详细的请求和响应信息，格式模仿 Nginx Combined Log Format。
 /// 并在发生错误时记录请求体以便排查。
 pub async fn access_log_middleware(req: Request<Body>, next: Next) -> Response {
+    if should_skip_access_log(req.uri().path()) {
+        return next.run(req).await;
+    }
+
     let start = Instant::now();
 
     // 1. 提取请求信息
@@ -179,4 +188,27 @@ pub async fn access_log_middleware(req: Request<Body>, next: Next) -> Response {
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_access_log;
+
+    #[test]
+    fn skips_dashboard_requests_including_subpaths() {
+        assert!(should_skip_access_log("/dashboard"));
+        assert!(should_skip_access_log("/dashboard/"));
+        assert!(should_skip_access_log("/dashboard/records"));
+        assert!(should_skip_access_log("/dashboard/api/records"));
+        assert!(should_skip_access_log("/dashboard/vendor/app.css"));
+    }
+
+    #[test]
+    fn keeps_logging_other_routes() {
+        assert!(!should_skip_access_log("/"));
+        assert!(!should_skip_access_log("/health"));
+        assert!(!should_skip_access_log("/metrics"));
+        assert!(!should_skip_access_log("/v1/chat/completions"));
+        assert!(!should_skip_access_log("/dashboardx"));
+    }
 }

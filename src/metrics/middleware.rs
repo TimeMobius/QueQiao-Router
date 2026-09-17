@@ -80,13 +80,13 @@ fn extract_model_from_request(req: &Request<Body>) -> String {
 /// 关键优化：不再在请求路径中直接更新 Prometheus 指标和滑动窗口
 /// 而是只提取数据并通过 channel 异步发送，让 worker 线程处理耗时的指标更新
 pub async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
-    let start = Instant::now();
-    let endpoint = req.uri().path().to_string();
-
-    // Skip metrics for non-API endpoints
-    if should_skip_metrics(&endpoint) {
+    // Skip non-API endpoints before any per-request work (no clock read, no path allocation)
+    if should_skip_metrics(req.uri().path()) {
         return next.run(req).await;
     }
+
+    let start = Instant::now();
+    let endpoint = req.uri().path().to_string();
 
     // Extract model from request at the start (may be updated later from response)
     let initial_model = extract_model_from_request(&req);
