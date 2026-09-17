@@ -14,7 +14,7 @@ pub mod extract;
 pub mod payload;
 pub mod records;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
 const NEW_COLUMNS: &[(&str, &str)] = &[
@@ -125,6 +125,24 @@ CREATE TABLE IF NOT EXISTS payloads (
 )
 "#;
 
+/// v3 全文检索：external-content + trigram（2 字中文用 LIKE，≥3 字用 MATCH）。
+const FTS_DDL: &[&str] = &[
+    "CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(\
+         Prompt, RequestTail, Answer, \
+         content='records', content_rowid='id', tokenize='trigram')",
+    "CREATE TRIGGER IF NOT EXISTS records_fts_ai AFTER INSERT ON records BEGIN \
+         INSERT INTO records_fts(rowid, Prompt, RequestTail, Answer) \
+         VALUES (new.id, new.Prompt, new.RequestTail, new.Answer); END",
+    "CREATE TRIGGER IF NOT EXISTS records_fts_ad AFTER DELETE ON records BEGIN \
+         INSERT INTO records_fts(records_fts, rowid, Prompt, RequestTail, Answer) \
+         VALUES ('delete', old.id, old.Prompt, old.RequestTail, old.Answer); END",
+    "CREATE TRIGGER IF NOT EXISTS records_fts_au AFTER UPDATE ON records BEGIN \
+         INSERT INTO records_fts(records_fts, rowid, Prompt, RequestTail, Answer) \
+         VALUES ('delete', old.id, old.Prompt, old.RequestTail, old.Answer); \
+         INSERT INTO records_fts(rowid, Prompt, RequestTail, Answer) \
+         VALUES (new.id, new.Prompt, new.RequestTail, new.Answer); END",
+];
+
 /// 读取指定表的现有列名。
 async fn table_columns(pool: &SqlitePool, table: &str) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query(&format!("PRAGMA table_info({})", table))
@@ -164,6 +182,22 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     sqlx::query(PAYLOADS_DDL).execute(pool).await?;
+
+    if version < 3 && has_col("Prompt") && has_col("RequestTail") && has_col("Answer") {
+        let mut fts_ready = true;
+        for sql in FTS_DDL {
+            if let Err(e) = sqlx::query(sql).execute(pool).await {
+                warn!("Failed to initialize FTS5 search index: {}", e);
+                fts_ready = false;
+                break;
+            }
+        }
+        if fts_ready {
+            let _ = sqlx::query("INSERT INTO records_fts(records_fts) VALUES('rebuild')")
+                .execute(pool)
+                .await;
+        }
+    }
 
     // PRAGMA 不支持绑定参数；此处为编译期常量，无注入风险。
     sqlx::query(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))
