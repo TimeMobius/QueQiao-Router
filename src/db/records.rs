@@ -1,14 +1,12 @@
-use chrono::Local;
-
 use axum::http::HeaderMap;
+use chrono::Local;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::error;
 
-use crate::{
-    models::requests::{MessageContent, RequestPayload},
-    state::app_state::AppState,
-};
+use crate::db::extract::{extract_request, extract_response, header_meta};
+use crate::models::requests::{MessageContent, RequestPayload};
+use crate::state::app_state::AppState;
 
 /// Returns a static string label for the request type based on the payload variant.
 fn request_type_label(payload: &RequestPayload) -> &'static str {
@@ -24,18 +22,65 @@ fn request_type_label(payload: &RequestPayload) -> &'static str {
     }
 }
 
-/// 数据库记录结构
-#[derive(Debug)]
+/// 由调用点提供的运行期审计信息（时延、状态、后端等）。
+#[derive(Debug, Default, Clone)]
+pub struct LogMeta {
+    pub latency_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    pub upstream_ms: Option<f64>,
+    pub stream_ms: Option<f64>,
+    pub status: Option<i64>,
+    pub backend: Option<String>,
+    pub endpoint: Option<String>,
+    pub error: Option<String>,
+    pub retry_count: Option<i64>,
+}
+
+#[derive(Debug, Default)]
 pub struct Record {
     pub time: String,
+    pub time_ms: i64,
     pub ip: String,
+    pub method: Option<String>,
+    pub endpoint: Option<String>,
     pub model: String,
     pub r#type: String,
+    pub backend: Option<String>,
+    pub session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub session_affinity: Option<String>,
+    pub user_agent: Option<String>,
+    pub client_name: Option<String>,
+    pub client_version: Option<String>,
+    pub api_key: Option<String>,
+    pub status: Option<i64>,
+    pub error: Option<String>,
+    pub retry_count: Option<i64>,
+    pub finish_reason: Option<String>,
+    pub latency_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    pub upstream_ms: Option<f64>,
+    pub stream_ms: Option<f64>,
     pub completion_tokens: i32,
     pub prompt_tokens: i32,
     pub total_tokens: i32,
     pub tool: bool,
     pub multimodal: bool,
+    pub request_bytes: i64,
+    pub response_bytes: i64,
+    pub prompt_bytes: i64,
+    pub request_tail_bytes: i64,
+    pub answer_bytes: i64,
+    pub message_count: i64,
+    pub system_count: i64,
+    pub tool_count: i64,
+    pub assistant_count: i64,
+    pub tool_result_count: i64,
+    pub image_count: i64,
+    pub prompt: String,
+    pub request_tail: String,
+    pub answer: String,
+    pub tool_names: String,
     pub headers: String,
     pub request: String,
     pub response: String,
@@ -47,20 +92,71 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
     sqlx::query(
         r#"
         INSERT INTO records (
-            Time, IP, Model, Type, CompletionTokens, PromptTokens, TotalTokens,
-            tool, multimodal, headers, request, response
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            Time, TimeMs, IP, Method, Endpoint, Type, Model, Backend,
+            SessionId, ParentSessionId, SessionAffinity, UserAgent, ClientName, ClientVersion, ApiKey,
+            Status, Error, RetryCount, FinishReason,
+            LatencyMs, TtftMs, UpstreamMs, StreamMs,
+            CompletionTokens, PromptTokens, TotalTokens, Tool, Multimodal,
+            RequestBytes, ResponseBytes, PromptBytes, RequestTailBytes, AnswerBytes,
+            MessageCount, SystemCount, ToolCount, AssistantCount, ToolResultCount, ImageCount,
+            Prompt, RequestTail, Answer, ToolNames,
+            Headers, Request, Response
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?
+        )
         "#,
     )
     .bind(&record.time)
+    .bind(record.time_ms)
     .bind(&record.ip)
-    .bind(&record.model)
+    .bind(record.method.as_deref())
+    .bind(record.endpoint.as_deref())
     .bind(&record.r#type)
+    .bind(&record.model)
+    .bind(record.backend.as_deref())
+    .bind(record.session_id.as_deref())
+    .bind(record.parent_session_id.as_deref())
+    .bind(record.session_affinity.as_deref())
+    .bind(record.user_agent.as_deref())
+    .bind(record.client_name.as_deref())
+    .bind(record.client_version.as_deref())
+    .bind(record.api_key.as_deref())
+    .bind(record.status)
+    .bind(record.error.as_deref())
+    .bind(record.retry_count)
+    .bind(record.finish_reason.as_deref())
+    .bind(record.latency_ms)
+    .bind(record.ttft_ms)
+    .bind(record.upstream_ms)
+    .bind(record.stream_ms)
     .bind(record.completion_tokens)
     .bind(record.prompt_tokens)
     .bind(record.total_tokens)
     .bind(record.tool)
     .bind(record.multimodal)
+    .bind(record.request_bytes)
+    .bind(record.response_bytes)
+    .bind(record.prompt_bytes)
+    .bind(record.request_tail_bytes)
+    .bind(record.answer_bytes)
+    .bind(record.message_count)
+    .bind(record.system_count)
+    .bind(record.tool_count)
+    .bind(record.assistant_count)
+    .bind(record.tool_result_count)
+    .bind(record.image_count)
+    .bind(&record.prompt)
+    .bind(&record.request_tail)
+    .bind(&record.answer)
+    .bind(&record.tool_names)
     .bind(&record.headers)
     .bind(&record.request)
     .bind(&record.response)
@@ -78,7 +174,12 @@ pub async fn log_non_streaming_request(
     request_body: &Value,
     response_body: &Value,
     client_ip: String,
+    meta: LogMeta,
 ) {
+    let header = header_meta(headers);
+    let req = extract_request(payload);
+    let resp = extract_response(response_body);
+
     let headers_json = serde_json::to_string(
         &headers
             .iter()
@@ -122,19 +223,60 @@ pub async fn log_non_streaming_request(
         false
     };
 
+    let request_str = serde_json::to_string(request_body).unwrap_or_default();
+    let response_str = serde_json::to_string(response_body).unwrap_or_default();
+
+    let now = Local::now();
     let record = Record {
-        time: Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        time: now.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        time_ms: now.timestamp_millis(),
         ip: client_ip.clone(),
+        method: None,
+        endpoint: meta
+            .endpoint
+            .clone()
+            .or_else(|| payload.get_endpoint().map(str::to_string)),
         model: payload.get_model().to_string(),
         r#type: request_type.to_string(),
+        backend: meta.backend.clone(),
+        session_id: header.session_id,
+        parent_session_id: header.parent_session_id,
+        session_affinity: header.session_affinity,
+        user_agent: header.user_agent,
+        client_name: header.client_name,
+        client_version: header.client_version,
+        api_key: header.api_key,
+        status: meta.status,
+        error: meta.error.clone(),
+        retry_count: meta.retry_count,
+        finish_reason: resp.finish_reason,
+        latency_ms: meta.latency_ms,
+        ttft_ms: meta.ttft_ms,
+        upstream_ms: meta.upstream_ms,
+        stream_ms: meta.stream_ms,
         completion_tokens: completion_tokens.try_into().unwrap_or_default(),
         prompt_tokens: prompt_tokens.try_into().unwrap_or_default(),
         total_tokens: total_tokens.try_into().unwrap_or_default(),
         tool: tool_used,
         multimodal: is_multimodal,
+        request_bytes: request_str.len() as i64,
+        response_bytes: response_str.len() as i64,
+        prompt_bytes: req.prompt_bytes,
+        request_tail_bytes: req.request_tail_bytes,
+        answer_bytes: resp.answer_bytes,
+        message_count: req.message_count,
+        system_count: req.system_count,
+        tool_count: req.tool_count,
+        assistant_count: req.assistant_count,
+        tool_result_count: req.tool_result_count,
+        image_count: req.image_count,
+        prompt: req.prompt,
+        request_tail: req.request_tail,
+        answer: resp.answer,
+        tool_names: resp.tool_names,
         headers: headers_json,
-        request: serde_json::to_string(request_body).unwrap_or_default(),
-        response: serde_json::to_string(response_body).unwrap_or_default(),
+        request: request_str,
+        response: response_str,
     };
 
     if let Err(e) = log_request(app_state, record).await {

@@ -10,6 +10,7 @@ use crate::config::types::Config;
 use crate::state::app_state::AppState;
 use std::sync::Arc;
 
+pub mod extract;
 pub mod records;
 
 const SCHEMA_VERSION: i64 = 1;

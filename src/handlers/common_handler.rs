@@ -528,6 +528,10 @@ async fn process_non_streaming_response(
         let request_body_clone = request_body.clone();
         let response_body_clone = response_body.clone();
         let client_ip = get_client_ip(headers, addr);
+        let log_backend = backend.clone();
+        let log_endpoint = api_endpoint.to_string();
+        let log_status = status.as_u16() as i64;
+        let log_latency_ms = request_elapsed * 1000.0;
 
         tokio::spawn(async move {
             log_non_streaming_request(
@@ -537,6 +541,13 @@ async fn process_non_streaming_response(
                 &request_body_clone,
                 &response_body_clone,
                 client_ip,
+                crate::db::records::LogMeta {
+                    latency_ms: Some(log_latency_ms),
+                    status: Some(log_status),
+                    backend: Some(log_backend),
+                    endpoint: Some(log_endpoint),
+                    ..Default::default()
+                },
             )
             .await;
         });

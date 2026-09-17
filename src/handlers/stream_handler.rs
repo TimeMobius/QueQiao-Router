@@ -159,6 +159,7 @@ async fn stream_logger_task(
     let mut captured_usage: Option<Value> = None;
     let mut captured_finish_reason: Option<String> = None;
     let mut _ttft_recorded = false;
+    let mut ttft_secs: Option<f64> = None;
     let mut stream_failed = false;
 
     while let Some(chunk_str) = rx.recv().await {
@@ -186,6 +187,7 @@ async fn stream_logger_task(
                     // Record TTFT on first delta - whether content is empty or not
                     if is_chat && choice.get("delta").is_some() {
                         let ttft = start_time.elapsed().as_secs_f64();
+                        ttft_secs = Some(ttft);
                         TTFT.with_label_values(&[&model, &backend]).observe(ttft);
                         sliding_window::update_ttft_windows(ttft, &model, &backend);
                         TTFT_1M_MAX
@@ -200,6 +202,7 @@ async fn stream_logger_task(
                         _ttft_recorded = true;
                     } else if !is_chat && choice.get("text").is_some() {
                         let ttft = start_time.elapsed().as_secs_f64();
+                        ttft_secs = Some(ttft);
                         TTFT.with_label_values(&[&model, &backend]).observe(ttft);
                         sliding_window::update_ttft_windows(ttft, &model, &backend);
                         TTFT_1M_MAX
@@ -307,6 +310,7 @@ async fn stream_logger_task(
             }
         }
 
+        let log_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         log_non_streaming_request(
             &app_state,
             &headers,
@@ -314,6 +318,14 @@ async fn stream_logger_task(
             &request_body,
             &final_chunk,
             client_ip,
+            crate::db::records::LogMeta {
+                latency_ms: Some(log_latency_ms),
+                ttft_ms: ttft_secs.map(|s| s * 1000.0),
+                status: status.parse().ok(),
+                backend: Some(backend.clone()),
+                endpoint: Some(endpoint.clone()),
+                ..Default::default()
+            },
         )
         .await;
     }

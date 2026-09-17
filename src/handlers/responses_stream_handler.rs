@@ -41,11 +41,13 @@ async fn responses_stream_logger_task(
 ) {
     let mut final_response: Option<Value> = None;
     let mut _ttft_recorded = false;
+    let mut ttft_secs: Option<f64> = None;
 
     while let Some(chunk_str) = rx.recv().await {
         if !_ttft_recorded {
             _ttft_recorded = true;
             let ttft = start_time.elapsed().as_secs_f64();
+            ttft_secs = Some(ttft);
             TTFT.with_label_values(&[&model, &backend]).observe(ttft);
             sliding_window::update_ttft_windows(ttft, &model, &backend);
             TTFT_1M_MAX
@@ -96,6 +98,7 @@ async fn responses_stream_logger_task(
         .unwrap_or((None, None));
 
     // Log the final response (or a minimal fallback if truncated stream)
+    let log_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     if let Some(ref final_resp) = final_response {
         log_non_streaming_request(
             &app_state,
@@ -104,6 +107,14 @@ async fn responses_stream_logger_task(
             &request_body,
             final_resp,
             client_ip,
+            crate::db::records::LogMeta {
+                latency_ms: Some(log_latency_ms),
+                ttft_ms: ttft_secs.map(|s| s * 1000.0),
+                status: status.parse().ok(),
+                backend: Some(backend.clone()),
+                endpoint: Some(endpoint.clone()),
+                ..Default::default()
+            },
         )
         .await;
     } else {
@@ -124,6 +135,14 @@ async fn responses_stream_logger_task(
             &request_body,
             &fallback,
             client_ip,
+            crate::db::records::LogMeta {
+                latency_ms: Some(log_latency_ms),
+                ttft_ms: ttft_secs.map(|s| s * 1000.0),
+                status: status.parse().ok(),
+                backend: Some(backend.clone()),
+                endpoint: Some(endpoint.clone()),
+                ..Default::default()
+            },
         )
         .await;
     }
