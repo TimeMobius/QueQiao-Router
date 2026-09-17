@@ -1,12 +1,13 @@
 use axum::{
     body::Body,
     extract::Path,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
 use rust_embed::RustEmbed;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::handlers::{error_log_api, records_api};
@@ -29,19 +30,25 @@ pub fn dashboard_router() -> Router<Arc<AppState>> {
         .route("/*path", get(assets_handler))
 }
 
-async fn index_handler() -> Response {
-    serve_asset("index.html")
+async fn index_handler(headers: HeaderMap) -> Response {
+    serve_asset("index.html", &headers)
 }
 
-async fn records_page() -> Response {
-    serve_asset("records.html")
+async fn records_page(headers: HeaderMap) -> Response {
+    serve_asset("records.html", &headers)
 }
 
-async fn assets_handler(Path(path): Path<String>) -> Response {
-    serve_asset(&path)
+async fn assets_handler(Path(path): Path<String>, headers: HeaderMap) -> Response {
+    serve_asset(&path, &headers)
 }
 
-fn serve_asset(path: &str) -> Response {
+/// Assets are `no-cache` rather than `immutable` because filenames are not
+/// content-hashed; the ETag makes that revalidation a cheap 304.
+fn etag_for(bytes: &[u8]) -> String {
+    format!("\"{:x}\"", Sha256::digest(bytes))
+}
+
+fn serve_asset(path: &str, request_headers: &HeaderMap) -> Response {
     let path = path.trim_start_matches('/');
     match DashboardAssets::get(path) {
         Some(content) => {
@@ -51,15 +58,40 @@ fn serve_asset(path: &str) -> Response {
             } else {
                 "no-cache"
             };
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, mime_type),
-                    (header::CACHE_CONTROL, cache_control),
-                ],
-                Body::from(content.data.into_owned()),
-            )
-                .into_response()
+            let bytes = content.data.into_owned();
+            let etag = etag_for(&bytes);
+
+            let not_modified = request_headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|candidate| candidate.trim().trim_start_matches("W/") == etag)
+                });
+
+            if not_modified {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(cache_control),
+                );
+                if let Ok(value) = HeaderValue::from_str(&etag) {
+                    headers.insert(header::ETAG, value);
+                }
+                return (StatusCode::NOT_MODIFIED, headers).into_response();
+            }
+
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime_type));
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(cache_control),
+            );
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                headers.insert(header::ETAG, value);
+            }
+            (StatusCode::OK, headers, Body::from(bytes)).into_response()
         }
         None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
     }
