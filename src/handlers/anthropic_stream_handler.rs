@@ -145,6 +145,13 @@ impl Default for AnthropicStreamAccumulator {
     }
 }
 
+/// Anthropic opens every stream with `message_start` (and may interleave `ping`) before any
+/// model output. Counting those as the first token measured protocol latency rather than
+/// latency to the first token, so they are skipped when stamping TTFT.
+fn is_ttft_lifecycle_event(event_type: &str) -> bool {
+    matches!(event_type, "message_start" | "ping")
+}
+
 async fn anthropic_stream_logger_task(
     mut rx: mpsc::UnboundedReceiver<String>,
     app_state: Arc<AppState>,
@@ -163,7 +170,20 @@ async fn anthropic_stream_logger_task(
     let mut ttft_secs: Option<f64> = None;
 
     while let Some(chunk_str) = rx.recv().await {
-        if !_ttft_recorded {
+        let chunk: Value = match serde_json::from_str(&chunk_str) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(
+                    "Failed to deserialize chunk in anthropic stream logger task: {}",
+                    e
+                );
+                continue;
+            }
+        };
+
+        let event_type = chunk.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        if !_ttft_recorded && !is_ttft_lifecycle_event(event_type) {
             _ttft_recorded = true;
             let ttft = start_time.elapsed().as_secs_f64();
             ttft_secs = Some(ttft);
@@ -179,19 +199,6 @@ async fn anthropic_stream_logger_task(
                 .with_label_values(&[&model, &backend])
                 .set(sliding_window::get_ttft_1h_max(&model, &backend));
         }
-
-        let chunk: Value = match serde_json::from_str(&chunk_str) {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "Failed to deserialize chunk in anthropic stream logger task: {}",
-                    e
-                );
-                continue;
-            }
-        };
-
-        let event_type = chunk.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match event_type {
             "message_start" => accumulator.handle_message_start(&chunk),
@@ -433,6 +440,15 @@ pub async fn process_anthropic_streaming_response(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lifecycle_events_are_not_the_first_token() {
+        assert!(is_ttft_lifecycle_event("message_start"));
+        assert!(is_ttft_lifecycle_event("ping"));
+        assert!(!is_ttft_lifecycle_event("content_block_start"));
+        assert!(!is_ttft_lifecycle_event("content_block_delta"));
+        assert!(!is_ttft_lifecycle_event(""));
+    }
 
     #[test]
     fn test_accumulator_full_thinking_stream_sequence() {

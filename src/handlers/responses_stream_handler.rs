@@ -26,6 +26,17 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::error;
 
+/// Responses streams open with protocol lifecycle events emitted before the model produces
+/// anything, so stamping TTFT on the first event measured "time to first protocol event".
+/// Replaying a real request showed `response.created` at 25 ms while the first token arrived
+/// at 1378 ms, which is why these are skipped.
+fn is_ttft_lifecycle_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.created" | "response.in_progress" | "response.queued"
+    )
+}
+
 async fn responses_stream_logger_task(
     mut rx: mpsc::UnboundedReceiver<String>,
     app_state: Arc<AppState>,
@@ -44,23 +55,6 @@ async fn responses_stream_logger_task(
     let mut ttft_secs: Option<f64> = None;
 
     while let Some(chunk_str) = rx.recv().await {
-        if !_ttft_recorded {
-            _ttft_recorded = true;
-            let ttft = start_time.elapsed().as_secs_f64();
-            ttft_secs = Some(ttft);
-            TTFT.with_label_values(&[&model, &backend]).observe(ttft);
-            sliding_window::update_ttft_windows(ttft, &model, &backend);
-            TTFT_1M_MAX
-                .with_label_values(&[&model, &backend])
-                .set(sliding_window::get_ttft_1m_max(&model, &backend));
-            TTFT_10M_MAX
-                .with_label_values(&[&model, &backend])
-                .set(sliding_window::get_ttft_10m_max(&model, &backend));
-            TTFT_1H_MAX
-                .with_label_values(&[&model, &backend])
-                .set(sliding_window::get_ttft_1h_max(&model, &backend));
-        }
-
         // Try to parse the chunk
         let chunk: Value = match serde_json::from_str(&chunk_str) {
             Ok(v) => v,
@@ -72,6 +66,26 @@ async fn responses_stream_logger_task(
                 continue;
             }
         };
+
+        if !_ttft_recorded {
+            let kind = chunk.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if !is_ttft_lifecycle_event(kind) {
+                _ttft_recorded = true;
+                let ttft = start_time.elapsed().as_secs_f64();
+                ttft_secs = Some(ttft);
+                TTFT.with_label_values(&[&model, &backend]).observe(ttft);
+                sliding_window::update_ttft_windows(ttft, &model, &backend);
+                TTFT_1M_MAX
+                    .with_label_values(&[&model, &backend])
+                    .set(sliding_window::get_ttft_1m_max(&model, &backend));
+                TTFT_10M_MAX
+                    .with_label_values(&[&model, &backend])
+                    .set(sliding_window::get_ttft_10m_max(&model, &backend));
+                TTFT_1H_MAX
+                    .with_label_values(&[&model, &backend])
+                    .set(sliding_window::get_ttft_1h_max(&model, &backend));
+            }
+        }
 
         // Watch for response.completed event to capture final response
         if chunk.get("type").and_then(|t| t.as_str()) == Some("response.completed") {
@@ -286,4 +300,25 @@ pub async fn process_responses_streaming_response(
     });
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ttft_lifecycle_event;
+
+    #[test]
+    fn lifecycle_events_are_not_the_first_token() {
+        assert!(is_ttft_lifecycle_event("response.created"));
+        assert!(is_ttft_lifecycle_event("response.in_progress"));
+        assert!(is_ttft_lifecycle_event("response.queued"));
+    }
+
+    #[test]
+    fn output_events_are_the_first_token() {
+        assert!(!is_ttft_lifecycle_event("response.output_item.added"));
+        assert!(!is_ttft_lifecycle_event("response.reasoning_text.delta"));
+        assert!(!is_ttft_lifecycle_event("response.output_text.delta"));
+        assert!(!is_ttft_lifecycle_event("response.completed"));
+        assert!(!is_ttft_lifecycle_event(""));
+    }
 }
