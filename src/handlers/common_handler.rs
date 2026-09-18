@@ -594,8 +594,8 @@ async fn process_non_streaming_response(
     if let Some(msg) = error_msg {
         let log_body = serde_json::to_string(&truncate_json(request_body)).unwrap_or_default();
         resp.extensions_mut().insert(AccessLogMeta {
-            model: "-".to_string(),
-            backend: "unknown".to_string(), // Placeholder, will be updated by handle_request_logic
+            model: model.clone(),
+            backend: backend.clone(),
             error: Some(msg),
             request_body: Some(log_body),
         });

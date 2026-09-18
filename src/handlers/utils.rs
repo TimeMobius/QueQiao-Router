@@ -453,6 +453,13 @@ where
                 // 将 bytes 转换为 string (lossy) 以便记录日志
                 let body_str = String::from_utf8_lossy(&bytes).to_string();
 
+                // 反序列化失败不代表 body 不是合法 JSON（可能只是字段不匹配），
+                // 因此再尽力提取一次 model 用于失败归因；提取不到时保持 "-"。
+                let model = serde_json::from_str::<Value>(&body_str)
+                    .ok()
+                    .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| "-".to_string());
+
                 // 统一错误消息
                 let final_error_msg = format!("Request body validation failed: {}", error_message);
 
@@ -464,7 +471,7 @@ where
 
                 // 注入 AccessLogMeta 到 Response extensions
                 response.extensions_mut().insert(AccessLogMeta {
-                    model: "-".to_string(),
+                    model,
                     backend: "unknown".to_string(),
                     error: Some(final_error_msg),
                     request_body: Some(body_str),
