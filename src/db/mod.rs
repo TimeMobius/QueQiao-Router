@@ -19,6 +19,9 @@ pub mod rotation;
 
 const SCHEMA_VERSION: i64 = 7;
 
+/// 遗留归档 TimeMs 回填的分批大小；限制单条 SELECT 的内存占用。
+const LEGACY_BACKFILL_BATCH: i64 = 2000;
+
 /// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
 const NEW_COLUMNS: &[(&str, &str)] = &[
     ("TimeMs", "INTEGER"),
@@ -206,6 +209,106 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await?;
 
     info!("Database schema migrated to version {}", SCHEMA_VERSION);
+    Ok(())
+}
+
+/// 就地迁移一份遗留归档（`user_version=0`、缺少 `TimeMs` 等新列）。
+///
+/// 整个迁移在单个事务内完成：任何一步失败都会完整回滚，下次扫描可安全重试。
+/// `TimeMs` 由本地墙钟文本 `Time` 结合当时的历史 UTC 偏移（含夏令时）回填，
+/// 无法解析的行保持 NULL 隔离（不参与时间范围检索）。
+pub(crate) async fn migrate_legacy_archive(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let existing: Vec<String> = sqlx::query("PRAGMA table_info(records)")
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+
+    for (name, decl) in NEW_COLUMNS {
+        if !existing.iter().any(|c| c == name) {
+            sqlx::query(&format!("ALTER TABLE records ADD COLUMN {} {}", name, decl))
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    // 遗留库把正文存在 Request/Response 明文中；映射到现代展示/检索列。
+    sqlx::query(
+        "UPDATE records SET Prompt = Request \
+         WHERE (Prompt IS NULL OR Prompt = '') AND Request IS NOT NULL AND Request <> ''",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE records SET Answer = Response \
+         WHERE (Answer IS NULL OR Answer = '') AND Response IS NOT NULL AND Response <> ''",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    let mut last_id: i64 = 0;
+    let mut unparseable: u64 = 0;
+    loop {
+        let rows = sqlx::query("SELECT id, Time FROM records WHERE id > ? ORDER BY id LIMIT ?")
+            .bind(last_id)
+            .bind(LEGACY_BACKFILL_BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let id: i64 = row.get("id");
+            let time: Option<String> = row.try_get("Time").ok().flatten();
+            match time.as_deref().and_then(rotation::parse_local_time_ms) {
+                Some(ms) => {
+                    sqlx::query("UPDATE records SET TimeMs = ? WHERE id = ?")
+                        .bind(ms)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                None => unparseable += 1,
+            }
+            last_id = id;
+        }
+    }
+
+    let has_col =
+        |c: &str| existing.iter().any(|e| e == c) || NEW_COLUMNS.iter().any(|(n, _)| *n == c);
+
+    for (sql, required) in NEW_INDEXES {
+        if required.iter().all(|c| has_col(c)) {
+            sqlx::query(sql).execute(&mut *tx).await?;
+        }
+    }
+    sqlx::query(PAYLOADS_DDL).execute(&mut *tx).await?;
+    for sql in FTS_DDL {
+        sqlx::query(sql).execute(&mut *tx).await?;
+    }
+    // 正文映射之后重建外部内容索引，保证 FTS 与 Prompt/Answer 一致。
+    sqlx::query("INSERT INTO records_fts(records_fts) VALUES('rebuild')")
+        .execute(&mut *tx)
+        .await?;
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records")
+        .fetch_one(&mut *tx)
+        .await?;
+
+    // PRAGMA 不支持绑定参数；此处为编译期常量，无注入风险。
+    sqlx::query(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    info!(
+        "Legacy archive migrated to schema {}: {} rows, {} unparseable Time",
+        SCHEMA_VERSION, total, unparseable
+    );
     Ok(())
 }
 

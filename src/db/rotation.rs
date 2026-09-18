@@ -37,6 +37,17 @@ pub fn yyyymm_from_ms(ms: i64) -> Option<i32> {
     Local.timestamp_millis_opt(ms).single().map(yyyymm)
 }
 
+/// 解析本地时间文本（写入时 `%Y-%m-%d %H:%M:%S%.6f`）为真实 epoch 毫秒，
+/// 应用当时的历史 UTC 偏移（含夏令时）；无法解析返回 None。
+pub fn parse_local_time_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .ok()
+        .and_then(|naive| Local.from_local_datetime(&naive).earliest())
+        .map(|dt| dt.timestamp_millis())
+}
+
 /// 数据月落后于当前月时需要封存（严格大于，容忍时钟回拨）。
 pub fn should_rotate(active_yyyymm: i32, now: DateTime<Local>) -> bool {
     yyyymm(now) > active_yyyymm
@@ -102,5 +113,26 @@ mod tests {
     fn test_yyyymm_from_ms_roundtrip() {
         let dt = local(2026, 9, 18, 12, 0, 0);
         assert_eq!(yyyymm_from_ms(dt.timestamp_millis()), Some(202609));
+    }
+
+    #[test]
+    fn test_parse_local_time_ms_matches_local_construction() {
+        let expected = local(2026, 3, 15, 10, 0, 0).timestamp_millis();
+        assert_eq!(
+            parse_local_time_ms("2026-03-15 10:00:00.000000"),
+            Some(expected)
+        );
+        assert_eq!(parse_local_time_ms("2026-03-15 10:00:00"), Some(expected));
+        assert_eq!(
+            parse_local_time_ms("2026-03-15 10:00:00.123456"),
+            Some(expected + 123)
+        );
+    }
+
+    #[test]
+    fn test_parse_local_time_ms_invalid_is_none() {
+        assert_eq!(parse_local_time_ms(""), None);
+        assert_eq!(parse_local_time_ms("not-a-time"), None);
+        assert_eq!(parse_local_time_ms("2026-13-45 99:99:99"), None);
     }
 }

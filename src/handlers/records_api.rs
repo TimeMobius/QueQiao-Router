@@ -744,19 +744,13 @@ pub async fn record_facets(
     let models = distinct_text(&pool, "Model").await;
     let types = distinct_text(&pool, "Type").await;
     let backends = distinct_text(&pool, "Backend").await;
-
-    let statuses: Vec<i64> = sqlx::query_scalar::<_, i64>(
-        "SELECT DISTINCT Status FROM records WHERE Status IS NOT NULL ORDER BY Status LIMIT 200",
-    )
-    .fetch_all(&*pool)
-    .await
-    .unwrap_or_default();
+    let clients = distinct_text(&pool, "ClientName").await;
 
     Ok(Json(json!({
         "models": models,
         "types": types,
-        "statuses": statuses,
         "backends": backends,
+        "clients": clients,
     })))
 }
 

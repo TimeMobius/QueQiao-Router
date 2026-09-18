@@ -129,6 +129,8 @@
         $("searchInput").placeholder = labels[scope] || "请输入关键词";
         if (scope === "model") {
             $("searchInput").setAttribute("list", "modelOptions");
+        } else if (scope === "client") {
+            $("searchInput").setAttribute("list", "clientOptions");
         } else {
             $("searchInput").removeAttribute("list");
         }
@@ -394,6 +396,9 @@
         fetch(API + "/facets").then(function (r) { return r.json(); }).then(function (d) {
             $("modelOptions").innerHTML = (d.models || []).map(function (m) {
                 return '<option value="' + esc(m) + '"></option>';
+            }).join("");
+            $("clientOptions").innerHTML = (d.clients || []).map(function (c) {
+                return '<option value="' + esc(c) + '"></option>';
             }).join("");
         }).catch(function () {});
     }

@@ -123,6 +123,7 @@ docker run -d \
 | `DB_ROTATION_CHECK_INTERVAL_SEC` | `60` | 数据库轮转检查间隔（秒） |
 | `RUST_LOG` | `info` | 日志级别 (`error`, `warn`, `info`, `debug`, `trace`) |
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
+| `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时禁用遗留归档的一次性就地迁移，遗留归档被跳过 |
 
 ---
 
@@ -342,7 +343,7 @@ curl 'http://127.0.0.1:8000/dashboard/api/records?limit=20&cursor=1789639720742:
 
 ```json
 { "models": ["gpt-5.6-sol"], "types": ["chat.completions", "responses"],
-  "statuses": [200], "backends": ["alpha"] }
+  "backends": ["alpha"], "clients": ["python-httpx/0.27.0"] }
 ```
 
 ### `GET /dashboard/api/records/{id}` — 记录详情
@@ -354,7 +355,11 @@ curl 'http://127.0.0.1:8000/dashboard/api/records?limit=20&cursor=1789639720742:
 | `include=body` | 额外返回完整 `request` / `response` / `headers`（按需 zstd 解压，体积可能很大，建议用户展开时再请求） |
 | `shard` | 指定分片：`active` 为当前库，其余为归档分片 id（如 `record_202608`）。指定后只在该分片内查找，分片不存在返回 **404** |
 
-不指定 `shard` 时先查当前库；当前库未命中则跨所有归档按 `id` 查找：唯一命中返回记录，命中多个归档（`id` 在不同月份重复）返回 **409**，响应体为 `["ambiguous_record_id", "<shard>", …]`；均未命中返回 **404**。未知 `id` 返回 **404**；`hasPayload=false` 表示该记录无压缩正文。旧归档若缺少 `TimeMs` 列会被跳过，不参与检索。
+不指定 `shard` 时先查当前库；当前库未命中则跨所有归档按 `id` 查找：唯一命中返回记录，命中多个归档（`id` 在不同月份重复）返回 **409**，响应体为 `["ambiguous_record_id", "<shard>", …]`；均未命中返回 **404**。未知 `id` 返回 **404**；`hasPayload=false` 表示该记录无压缩正文。
+
+#### 遗留归档的一次性迁移
+
+扫描到不含 `TimeMs` 列的旧归档（`user_version=0` 的遗留库）时，网关会在首次扫描时**就地升级**该文件：补齐现代列与索引，`TimeMs` 依据本地墙钟文本 `Time` 结合当时的历史 UTC 偏移（含夏令时）回填为真实 epoch 毫秒，并把遗留明文 `Request`/`Response` 映射到 `Prompt`/`Answer` 以支持展示与检索。迁移在单个事务内完成，中断可安全重试且不会影响已现代归档。设置环境变量 `ARCHIVE_LEGACY_MIGRATION=skip` 可禁用迁移，此时遗留归档仍会被跳过、不参与检索；无法解析的时间戳保留为 NULL 隔离，并被时间范围查询排除。
 
 ### `GET /dashboard/api/error-log` — 错误日志（读文件，非数据库）
 

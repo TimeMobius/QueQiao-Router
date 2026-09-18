@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 /// active 分片在查询层使用的固定标识。
@@ -37,6 +37,8 @@ pub struct ArchiveRegistry {
     active_path: PathBuf,
     dir: PathBuf,
     shards: RwLock<HashMap<String, Arc<ArchiveShard>>>,
+    /// 串行化扫描；保证同一遗留归档不会被并发迁移两次。
+    scan_lock: Mutex<()>,
 }
 
 impl ArchiveRegistry {
@@ -51,6 +53,7 @@ impl ArchiveRegistry {
             active_path,
             dir,
             shards: RwLock::new(HashMap::new()),
+            scan_lock: Mutex::new(()),
         }
     }
 
@@ -58,6 +61,8 @@ impl ArchiveRegistry {
     ///
     /// 任何单个文件的错误都只会记录告警并继续，绝不影响整体检索。
     pub async fn ensure_scanned(&self) {
+        let _guard = self.scan_lock.lock().await;
+
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -92,24 +97,50 @@ impl ArchiveRegistry {
             }
 
             match open_archive_shard(&path, stem).await {
-                Ok(Some(shard)) => {
-                    info!(
-                        "Archive shard registered: {} (TimeMs {:?}..{:?})",
-                        shard.id, shard.min_ms, shard.max_ms
-                    );
-                    self.shards
-                        .write()
-                        .await
-                        .insert(stem.to_string(), Arc::new(shard));
-                }
+                Ok(Some(shard)) => self.register_shard(stem, shard).await,
                 Ok(None) => {
-                    // 遗留归档（缺少 TimeMs），open_archive_shard 内已告警。
+                    // 遗留归档（缺少 TimeMs）：open_archive_shard 已告警。
+                    if legacy_migration_disabled() {
+                        continue;
+                    }
+                    if let Err(e) = migrate_legacy_in_place(&path).await {
+                        warn!(
+                            "Legacy archive migration failed for '{}': {}",
+                            path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                    match open_archive_shard(&path, stem).await {
+                        Ok(Some(shard)) => self.register_shard(stem, shard).await,
+                        Ok(None) => {
+                            warn!(
+                                "Archive '{}' still lacks TimeMs after migration; skipping",
+                                path.display()
+                            );
+                        }
+                        Err(e) => {
+                            warn!("archive shard '{}' open failed: {}", path.display(), e);
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("archive shard '{}' open failed: {}", path.display(), e);
                 }
             }
         }
+    }
+
+    /// 登记一个已打开的分片（调用方不得持有 `shards` 锁）。
+    async fn register_shard(&self, stem: &str, shard: ArchiveShard) {
+        info!(
+            "Archive shard registered: {} (TimeMs {:?}..{:?})",
+            shard.id, shard.min_ms, shard.max_ms
+        );
+        self.shards
+            .write()
+            .await
+            .insert(stem.to_string(), Arc::new(shard));
     }
 
     /// 返回时间范围与 `[from_ms, to_ms]` 相交的归档分片。
@@ -201,9 +232,10 @@ async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard
         .any(|row| row.get::<String, _>("name") == "TimeMs");
     if !has_time_ms {
         warn!(
-            "Skipping legacy archive without TimeMs column: {}",
+            "Legacy archive without TimeMs column detected: {}",
             path.display()
         );
+        pool.close().await;
         return Ok(None);
     }
 
@@ -221,9 +253,35 @@ async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard
     }))
 }
 
+/// 是否通过 `ARCHIVE_LEGACY_MIGRATION=skip` 禁用遗留归档就地迁移。
+fn legacy_migration_disabled() -> bool {
+    std::env::var("ARCHIVE_LEGACY_MIGRATION")
+        .map(|v| v.eq_ignore_ascii_case("skip"))
+        .unwrap_or(false)
+}
+
+/// 以读写单连接池就地迁移遗留归档，完成后立即关闭连接池。
+async fn migrate_legacy_in_place(path: &Path) -> Result<(), sqlx::Error> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(false)
+        .create_if_missing(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(options)
+        .await?;
+
+    let result = crate::db::migrate_legacy_archive(&pool).await;
+    pool.close().await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_archive_stem;
+    use super::{parse_archive_stem, ArchiveRegistry};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+    use std::str::FromStr;
 
     #[test]
     fn parses_valid_archive_stems() {
@@ -242,5 +300,102 @@ mod tests {
         assert_eq!(parse_archive_stem("record_202608_x"), None);
         assert_eq!(parse_archive_stem("record_20260a"), None);
         assert_eq!(parse_archive_stem("record_"), None);
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "qq_archive_{}_{}_{}",
+            std::process::id(),
+            tag,
+            nanos
+        ))
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_archive_and_registers_shard() {
+        let dir = temp_dir("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("record_202603.db");
+        let url = format!("sqlite:{}", archive_path.display());
+
+        // 建立 12 列、user_version=0 的遗留库并写入一行明文正文。
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let rw = SqlitePool::connect_with(options).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE records (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, Time TEXT, IP TEXT, Model TEXT, Type TEXT, \
+                CompletionTokens INTEGER, PromptTokens INTEGER, TotalTokens INTEGER, Tool BOOLEAN, \
+                Multimodal BOOLEAN, Headers TEXT, Request TEXT, Response TEXT)",
+        )
+        .execute(&rw)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO records (Time, IP, Model, Type, Request, Response) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("2026-03-15 10:00:00.000000")
+        .bind("127.0.0.1")
+        .bind("test-model")
+        .bind("chat.completions")
+        .bind("{\"messages\":[]}")
+        .bind("hi")
+        .execute(&rw)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA user_version = 0")
+            .execute(&rw)
+            .await
+            .unwrap();
+
+        crate::db::migrate_legacy_archive(&rw).await.unwrap();
+        crate::db::migrate_legacy_archive(&rw).await.unwrap();
+        rw.close().await;
+
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(false);
+        let rw = SqlitePool::connect_with(options).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&rw)
+            .await
+            .unwrap();
+        assert_eq!(version, 7);
+
+        let expected =
+            crate::db::rotation::parse_local_time_ms("2026-03-15 10:00:00.000000").unwrap();
+        let (time_ms, prompt, answer): (Option<i64>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT TimeMs, Prompt, Answer FROM records WHERE id = 1")
+                .fetch_one(&rw)
+                .await
+                .unwrap();
+        assert_eq!(time_ms, Some(expected));
+        assert_eq!(prompt.as_deref(), Some("{\"messages\":[]}"));
+        assert_eq!(answer.as_deref(), Some("hi"));
+
+        let bounds: (Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT MIN(TimeMs), MAX(TimeMs) FROM records")
+                .fetch_one(&rw)
+                .await
+                .unwrap();
+        assert_eq!(bounds, (Some(expected), Some(expected)));
+        rw.close().await;
+
+        // 注册表扫描后应能取到带时间边界的现代分片。
+        let registry = ArchiveRegistry::new(dir.join("record.db"));
+        registry.ensure_scanned().await;
+        let shard = registry
+            .get("record_202603")
+            .await
+            .expect("shard registered");
+        assert_eq!(shard.min_ms, Some(expected));
+        assert_eq!(shard.max_ms, Some(expected));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
