@@ -35,6 +35,13 @@
         if (n >= 1000) return (n / 1000).toFixed(1) + "k";
         return String(n);
     };
+    var fmtBytes = function (v) {
+        var n = Number(v);
+        if (!isFinite(n) || n <= 0) return null;
+        if (n >= 1048576) return (n / 1048576).toFixed(2) + " MB";
+        if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+        return n + " B";
+    };
     var clientText = function (it) {
         if (it.clientName) return it.clientName + (it.clientVersion ? " " + it.clientVersion : "");
         return it.userAgent || null;
@@ -286,6 +293,21 @@
             s.match(/(\d{2}:\d{2}:\d{2})\s+[+-]\d{4}/);
         return m ? m[1] : s;
     }
+    var LOG_ERROR_PREVIEW_CHARS = 600;
+    function errorBlock(e) {
+        var s = String(e.error || "");
+        if (!s) return "";
+        var sizeNote = e.error_truncated
+            ? "（服务端已截断：原始 " + (fmtBytes(e.error_bytes) || e.error_bytes) + "，完整内容见「原始行」）"
+            : "";
+        if (s.length <= LOG_ERROR_PREVIEW_CHARS && !sizeNote) {
+            return '<div class="log-err">' + esc(s) + "</div>";
+        }
+        var summary = "展开完整错误信息" + (sizeNote || "（" + s.length + " 字符）");
+        return '<div class="log-err">' + esc(s.slice(0, LOG_ERROR_PREVIEW_CHARS)) + "…</div>" +
+            '<details class="log-detail log-detail-err"><summary>' + esc(summary) + "</summary>" +
+            '<pre class="log-raw">' + esc(s) + "</pre></details>";
+    }
     function logEntryHtml(e) {
         if (e.kind === "unparsed") {
             return '<div class="log-entry"><pre class="log-raw">' + esc(e.raw) + "</pre></div>";
@@ -312,7 +334,7 @@
                 '<span class="log-time" title="' + esc(e.time || "") + '">' + esc(logTime(e)) + "</span>" +
                 '<span class="log-path">' + esc(path) + "</span>" +
             "</div>" +
-            (e.error ? '<div class="log-err">' + esc(e.error) + "</div>" : "") +
+            errorBlock(e) +
             (meta.length ? '<div class="log-meta-line">' + esc(meta.join(" · ")) + "</div>" : "") +
             details +
         "</div>";

@@ -377,11 +377,13 @@ curl 'http://127.0.0.1:8000/dashboard/api/records?limit=20&cursor=1789639720742:
   "entries": [
     { "kind": "http_error", "time": "17/Sep/2026:07:28:00 +0000", "ip": "10.0.0.5",
       "method": "POST", "path": "/v1/messages", "status": 500, "model": "claude-x",
-      "userAgent": "python-httpx/0.27.0", "latency": "1.250s",
-      "error": "upstream boom", "requestBody": "{\"model\":\"claude-x\"}" },
+      "user_agent": "python-httpx/0.27.0", "latency": "1.250s",
+      "error": "upstream boom", "error_truncated": false, "error_bytes": null,
+      "request_body": "{\"model\":\"claude-x\"}" },
     { "kind": "stream_interrupted", "time": "17/Sep/2026:08:00:00 +0000", "ip": "10.0.0.9",
       "path": "/v1/chat/completions", "model": "gpt-5", "backend": "alpha",
-      "error": "upstream stream interrupted: connection reset" }
+      "error": "upstream stream interrupted: connection reset",
+      "error_truncated": false, "error_bytes": null }
   ],
   "nextBefore": 4480,
   "hasMore": true
@@ -389,6 +391,8 @@ curl 'http://127.0.0.1:8000/dashboard/api/records?limit=20&cursor=1789639720742:
 ```
 
 `kind` 取值 `http_error` / `stream_interrupted` / `unparsed`（无法解析时仅保留 `raw`）。某字段为 `null` 表示该行不含此信息，不是错误。`nextBefore` 为 `null` 表示已到文件开头。
+
+**`error` 有 16 KB 上限**：上游可能把整个请求体重复塞进错误消息（例如 pydantic 的校验错误会为每个失败项附带 `input`，实测一条 400 的错误字段达 592 KB）。超过上限时 `error` 按字符边界安全截断并附加提示，同时给出 `error_truncated: true` 与 `error_bytes`（原始字节数，未截断时为 `null`）。`raw` 与 `request_body` **不截断**，完整原文始终可从 `raw` 获取。实测同一页 20 条：`error` 合计由 1.19 MB 降至 22 KB，整份响应由 3.1 MB 降至 1.9 MB。
 
 ### 检索性能备注
 

@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 const CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
+/// 单条错误信息的上限（字节，按字符边界安全截断）。
+/// 上游（尤其是 pydantic 校验错误）可能把整个请求体重复塞进错误消息，实测一条
+/// 400 的错误字段达 592 KB，不设上限时单页响应会被一条记录撑到数百 KB。
+/// `raw` 与 `request_body` 不设上限，完整原文仍可从它们获取。
+const MAX_ERROR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ErrorLogParams {
@@ -30,6 +35,8 @@ pub struct LogEntry {
     pub api_key: Option<String>,
     pub backend: Option<String>,
     pub error: Option<String>,
+    pub error_truncated: bool,
+    pub error_bytes: Option<usize>,
     pub request_body: Option<String>,
 }
 
@@ -41,6 +48,34 @@ impl LogEntry {
             ..Default::default()
         }
     }
+
+    fn cap_error(&mut self) {
+        if let Some(msg) = self.error.take() {
+            let (capped, truncated, total) = truncate_error(msg);
+            self.error = Some(capped);
+            self.error_truncated = truncated;
+            self.error_bytes = truncated.then_some(total);
+        }
+    }
+}
+
+/// 按字符边界安全地把错误信息截断到 `MAX_ERROR_BYTES`。
+/// 返回（截断后的文本, 是否发生截断, 原始字节数）。
+fn truncate_error(msg: String) -> (String, bool, usize) {
+    let total = msg.len();
+    if total <= MAX_ERROR_BYTES {
+        return (msg, false, total);
+    }
+    let mut end = MAX_ERROR_BYTES;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = msg[..end].to_string();
+    capped.push_str(&format!(
+        "\n…[已截断：原始 {} 字节，完整内容见「原始行」]",
+        total
+    ));
+    (capped, true, total)
 }
 
 /// Parses a Rust `{:?}`-style quoted string, returning the unescaped value and the
@@ -154,6 +189,7 @@ fn parse_stream_interrupted(line: &str, time: &str) -> LogEntry {
             _ => {}
         }
     }
+    entry.cap_error();
     entry
 }
 
@@ -184,7 +220,7 @@ fn parse_access_line(line: &str) -> Option<LogEntry> {
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
 
-    Some(LogEntry {
+    let mut entry = LogEntry {
         kind: "http_error".to_string(),
         raw: line.to_string(),
         time: Some(time.to_string()),
@@ -199,7 +235,10 @@ fn parse_access_line(line: &str) -> Option<LogEntry> {
         backend: None,
         error: Some(error),
         request_body,
-    })
+        ..Default::default()
+    };
+    entry.cap_error();
+    Some(entry)
 }
 
 pub(crate) fn parse_line(raw: &str) -> LogEntry {
@@ -352,7 +391,7 @@ pub async fn error_log_tail(
 
 #[cfg(test)]
 mod tests {
-    use super::{newest_error_log, parse_line, read_tail_lines};
+    use super::{newest_error_log, parse_line, read_tail_lines, truncate_error, MAX_ERROR_BYTES};
     use std::fs;
     use std::path::PathBuf;
 
@@ -460,6 +499,44 @@ mod tests {
             Some("The model `no-such-model` does not exist")
         );
         assert_eq!(e.request_body, None);
+    }
+
+    #[test]
+    fn caps_oversized_error_and_keeps_raw_intact() {
+        let huge = "x".repeat(MAX_ERROR_BYTES + 5000);
+        let line = format!(
+            r#"10.0.0.5 - - [17/Sep/2026:07:28:00 +0000] "POST /v1/responses HTTP/1.1" 400 - "-" "curl/8.9.1" 0.064s "-" "1" "{}" "{{}}""#,
+            huge
+        );
+        let e = parse_line(&line);
+        let err = e.error.expect("error should be present");
+        assert!(e.error_truncated);
+        assert_eq!(e.error_bytes, Some(huge.len()));
+        assert!(err.len() < huge.len());
+        assert!(err.contains("已截断"));
+        assert!(e.raw.len() > huge.len(), "raw keeps the untruncated line");
+        assert_eq!(e.request_body.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn leaves_short_error_untouched() {
+        let e = parse_line(
+            r#"127.0.0.1 - - [17/Sep/2026:07:27:02 +0000] "POST /v1/responses HTTP/1.1" 400 - "-" "curl/8.9.1" 0.002s "-" "-" "boom""#,
+        );
+        assert_eq!(e.error.as_deref(), Some("boom"));
+        assert!(!e.error_truncated);
+        assert_eq!(e.error_bytes, None);
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let ascii_bytes_ending_one_byte_before_limit = MAX_ERROR_BYTES - 1;
+        let msg = "a".repeat(ascii_bytes_ending_one_byte_before_limit) + &"中".repeat(10);
+        let (capped, truncated, total) = truncate_error(msg);
+        assert!(truncated);
+        assert_eq!(total, ascii_bytes_ending_one_byte_before_limit + 10 * 3);
+        assert!(capped.starts_with(&"a".repeat(ascii_bytes_ending_one_byte_before_limit)));
+        assert!(capped.contains("已截断"));
     }
 
     #[test]
