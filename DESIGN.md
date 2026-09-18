@@ -125,8 +125,9 @@ Index-specific (kept in `index.html`): stats grid, charts grid, `.chart-select`,
 - Records table (Phase 2, refined): `table-layout: fixed`, 9 columns — 请求时间 178 / 模型 215 /
   状态 70 / 客户端 112 / 会话·请求 112 / 用量 140 / 时延 160 / 提问预览 auto / 操作 78.
   No `#` column (id lives in the drawer); list timestamps are second-precision with the full
-  value in `title` and in the drawer. 用量 shows message rounds, total tokens, and tool count;
-  时延/用量 wrap internally rather than ellipsize numeric values. 会话·请求 hidden ≤1279px;
+  value in `title` and in the drawer. 用量 stacks message rounds + tool count on the first row
+  and total tokens on the second, reusing the row's existing two-line height instead of
+  wrapping unpredictably; 时延/用量 never ellipsize numeric values. 会话·请求 hidden ≤1279px;
   客户端 + 用量 hidden ≤900px; 提问预览 gets a fixed
   170/180px at those breakpoints; 状态 stays third in source order so it is reachable with a
   short scroll at 375px. `.table-wrap` fade/shadow is the scroll affordance whenever

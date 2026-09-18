@@ -69,6 +69,10 @@
         if (value === null || value === undefined) return "";
         return '<span class="metric ' + cls + '" title="' + esc(title) + '">' + icon + "<span>" + esc(value) + "</span></span>";
     }
+    function metricRow(parts) {
+        var body = parts.filter(Boolean).join("");
+        return body ? '<span class="metric-row">' + body + "</span>" : "";
+    }
     function sub(line) {
         return line ? '<span class="cell-sub">' + esc(line) + "</span>" : "";
     }
@@ -198,10 +202,14 @@
         var html = items.map(function (it) {
             var type = shortType(it.type);
             var usage =
-                metric("rounds", ICON.rounds, it.messageCount, "消息轮数") +
-                metric("tokens", ICON.tokens, fmtTokens(it.totalTokens),
-                    "总 Token（" + dash(it.promptTokens) + " 提问 / " + dash(it.completionTokens) + " 回复）") +
-                metric("tools", ICON.tools, it.toolCount, "工具调用数");
+                metricRow([
+                    metric("rounds", ICON.rounds, it.messageCount, "消息轮数"),
+                    metric("tools", ICON.tools, it.toolCount, "工具调用数")
+                ]) +
+                metricRow([
+                    metric("tokens", ICON.tokens, fmtTokens(it.totalTokens),
+                        "总 Token（" + dash(it.promptTokens) + " 提问 / " + dash(it.completionTokens) + " 回复）")
+                ]);
             var timing =
                 metric("latency", ICON.latency, fmtMs(it.latencyMs), "总时延") +
                 metric("ttft", ICON.ttft, fmtMs(it.ttftMs), "首字时延 TTFT");
