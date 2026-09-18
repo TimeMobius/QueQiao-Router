@@ -1,9 +1,10 @@
-use chrono::{DateTime, Datelike, Local};
+use chrono::Local;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use sqlx::Row;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
 use crate::config::types::Config;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 pub mod extract;
 pub mod payload;
 pub mod records;
+pub mod rotation;
 
 const SCHEMA_VERSION: i64 = 7;
 
@@ -248,108 +250,129 @@ pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
-/// 检查并轮换数据库
-pub async fn check_and_rotate(app_state: &Arc<AppState>) {
-    let _lock = app_state.db_rotation_lock.lock().await;
+/// 解析 `RECD_PATH` 得到数据库文件路径（去掉 `sqlite:` 前缀）。
+fn resolve_db_path() -> std::path::PathBuf {
+    let url = std::env::var("RECD_PATH").unwrap_or_else(|_| "sqlite:./record.db".to_string());
+    std::path::PathBuf::from(url.strip_prefix("sqlite:").unwrap_or(&url))
+}
 
-    let db_path_with_prefix =
-        std::env::var("RECD_PATH").unwrap_or_else(|_| "sqlite:./record.db".to_string());
+/// 当前 record.db 中 MAX(TimeMs) 所属的本地月份；空表/无值返回 None。
+async fn current_data_yyyymm(app_state: &Arc<AppState>) -> Option<i32> {
+    let pool = app_state.db_pool.read().await;
+    let max: Option<i64> = sqlx::query_scalar("SELECT MAX(TimeMs) FROM records")
+        .fetch_one(&*pool)
+        .await
+        .ok()
+        .flatten();
+    max.and_then(rotation::yyyymm_from_ms)
+}
 
-    // Strip the "sqlite:" prefix to get the actual file path
-    let db_path_str = db_path_with_prefix
-        .strip_prefix("sqlite:")
-        .unwrap_or(&db_path_with_prefix);
+/// 启动时确定内存中的 active 月份与边界（数据驱动，不 stat 文件）。
+pub async fn init_rotation_state(app_state: &Arc<AppState>) {
+    let now_month = rotation::yyyymm(Local::now());
+    let active = current_data_yyyymm(app_state).await.unwrap_or(now_month);
+    app_state.active_yyyymm.store(active, Ordering::Release);
+    app_state
+        .next_month_boundary_ms
+        .store(rotation::next_month_boundary_ms(active), Ordering::Release);
+}
 
-    let db_path = Path::new(db_path_str);
-
+/// 轮转动作；调用方必须已持有 db_rotation_lock。
+async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
+    let db_path = resolve_db_path();
     if !db_path.exists() {
         return;
     }
 
-    let metadata = match fs::metadata(db_path) {
-        Ok(meta) => meta,
-        Err(e) => {
-            error!("Failed to get metadata for database file: {}", e);
-            return;
-        }
-    };
+    let archive_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut archive_path = archive_dir.join(format!("record_{:06}.db", seal_yyyymm));
 
-    // 同时获取修改时间和创建时间，取最早的值
-    // 这样既能保证测试通过（测试设置mtime，ctime会被系统更新）
-    // 也能在实际场景中正确处理（如果created时间更早的话）
-    let mtime = metadata.modified().ok();
-    let ctime = metadata.created().ok();
+    info!(
+        "Database rotation needed. Archiving {} to {}",
+        db_path.display(),
+        archive_path.display()
+    );
 
-    let earliest_time = match (mtime, ctime) {
-        (Some(mt), Some(ct)) => {
-            if mt < ct {
-                mt
-            } else {
-                ct
-            }
-        }
-        (Some(mt), None) => mt,
-        (None, Some(ct)) => ct,
-        (None, None) => {
-            error!("无法获取文件的时间信息");
-            return;
-        }
-    };
-
-    let mod_datetime: DateTime<Local> = earliest_time.into();
-    let now = Local::now();
-
-    if mod_datetime.year() != now.year() || mod_datetime.month() != now.month() {
-        let archive_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-        let archive_filename = format!("record_{}.db", mod_datetime.format("%Y%m"));
-        let mut archive_path = archive_dir.join(&archive_filename);
-
-        info!(
-            "Database rotation needed. Archiving {} to {}",
-            db_path.display(),
+    // 同名归档已存在时追加 unix 秒后缀，避免覆盖历史归档。
+    if archive_path.exists() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        archive_path = archive_dir.join(format!("record_{:06}_{}.db", seal_yyyymm, timestamp));
+        warn!(
+            "Archive file already exists. Renaming to {}",
             archive_path.display()
         );
+    }
 
-        if archive_path.exists() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let new_archive_filename =
-                format!("record_{}_{}.db", mod_datetime.format("%Y%m"), timestamp);
-            archive_path = archive_dir.join(new_archive_filename);
-            warn!(
-                "Archive file already exists. Renaming to {}",
-                archive_path.display()
-            );
-        }
+    // 获取写锁以阻塞新的请求写入，安全完成轮转。
+    let mut pool_guard = app_state.db_pool.write().await;
 
-        // Acquire write lock to block new requests and safely rotate
-        let mut pool_guard = app_state.db_pool.write().await;
+    // 关闭当前连接池以释放文件锁。
+    pool_guard.close().await;
 
-        // Close the current connection pool to release file locks
-        pool_guard.close().await;
-
-        match fs::rename(db_path, &archive_path) {
-            Ok(_) => info!("Database archived successfully."),
-            Err(e) => {
-                error!("Failed to archive database: {}", e);
-            }
-        }
-
-        info!("Re-initializing database pool after rotation.");
-        let config = app_state.config_manager.get_config().await;
-        match init_db_pool(&config).await {
-            Ok(new_pool) => {
-                *pool_guard = new_pool;
-                info!("Database pool re-initialized successfully.");
-            }
-            Err(e) => {
-                error!(
-                    "Failed to re-initialize database pool after rotation: {}",
-                    e
-                );
-            }
+    match fs::rename(&db_path, &archive_path) {
+        Ok(_) => info!("Database archived successfully."),
+        Err(e) => {
+            error!("Failed to archive database: {}", e);
         }
     }
+
+    info!("Re-initializing database pool after rotation.");
+    let config = app_state.config_manager.get_config().await;
+    match init_db_pool(&config).await {
+        Ok(new_pool) => {
+            *pool_guard = new_pool;
+            let now_month = rotation::yyyymm(Local::now());
+            app_state.active_yyyymm.store(now_month, Ordering::Release);
+            app_state.next_month_boundary_ms.store(
+                rotation::next_month_boundary_ms(now_month),
+                Ordering::Release,
+            );
+            info!("Database pool re-initialized successfully.");
+        }
+        Err(e) => {
+            error!(
+                "Failed to re-initialize database pool after rotation: {}",
+                e
+            );
+        }
+    }
+}
+
+/// 后台数据驱动检查。
+pub async fn check_and_rotate(app_state: &Arc<AppState>) {
+    let _lock = app_state.db_rotation_lock.lock().await;
+    let now_month = rotation::yyyymm(Local::now());
+    if let Some(data_month) = current_data_yyyymm(app_state).await {
+        if data_month < now_month {
+            rotate_locked(app_state, data_month).await;
+            return;
+        }
+        if data_month != app_state.active_yyyymm.load(Ordering::Acquire) {
+            app_state.active_yyyymm.store(data_month, Ordering::Release);
+            app_state.next_month_boundary_ms.store(
+                rotation::next_month_boundary_ms(data_month),
+                Ordering::Release,
+            );
+        }
+    }
+}
+
+/// 写路径零成本边界检查；仅在跨月那一刻才做一次 DB 查询与轮转。
+pub async fn rotate_if_needed(app_state: &Arc<AppState>, time_ms: i64) {
+    if time_ms < app_state.next_month_boundary_ms.load(Ordering::Acquire) {
+        return; // 快路径：一次原子加载 + 比较
+    }
+    let _lock = app_state.db_rotation_lock.lock().await;
+    if time_ms < app_state.next_month_boundary_ms.load(Ordering::Acquire) {
+        return; // 获取锁后二次检查，避免重复轮转
+    }
+    let now_month = rotation::yyyymm(Local::now());
+    let seal = match current_data_yyyymm(app_state).await {
+        Some(d) if d < now_month => d,
+        _ => app_state.active_yyyymm.load(Ordering::Acquire),
+    };
+    rotate_locked(app_state, seal).await;
 }

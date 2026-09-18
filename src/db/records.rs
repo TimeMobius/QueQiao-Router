@@ -90,6 +90,7 @@ pub struct Record {
 
 /// 记录请求到数据库
 pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<(), sqlx::Error> {
+    crate::db::rotate_if_needed(app_state, record.time_ms).await;
     let pool = app_state.db_pool.read().await;
     let req = crate::db::payload::compress(record.request.as_bytes());
     let resp = crate::db::payload::compress(record.response.as_bytes());

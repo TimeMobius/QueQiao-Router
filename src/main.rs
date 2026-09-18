@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use queqiao_router::{client, config, db, middleware, routes, state};
 
 use client::client_manager::ClientManager;
-use db::{check_and_rotate, init_db_pool};
+use db::{check_and_rotate, init_db_pool, init_rotation_state};
 use state::app_state::AppState;
 
 #[cfg(feature = "check-api-auth")]
@@ -63,6 +63,8 @@ fn main() {
 
         let app_state = Arc::new(AppState::new(config_manager, client_manager, db_pool));
         println!("Application state constructed.");
+
+        init_rotation_state(&app_state).await;
 
         // ============================================================================
         // 启动独立 Metrics Worker 线程
