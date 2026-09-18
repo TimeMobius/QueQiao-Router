@@ -278,9 +278,13 @@
         $("nextBtn").disabled = !state.logNext;
     }
 
+    // 日志文件按天轮转，行内只显示时分秒，日期在标题栏的文件名里。
+    // 正则必须锚定日期前缀，否则 "…/2026:14:49" 中的 "26:14:49" 会先被匹配到。
     function logTime(e) {
-        var m = String(e.time || "").match(/(\d{2}:\d{2}:\d{2})/);
-        return m ? m[1] : (e.time || "");
+        var s = String(e.time || "");
+        var m = s.match(/^\d{2}\/[A-Za-z]{3}\/\d{4}:(\d{2}:\d{2}:\d{2})/) ||
+            s.match(/(\d{2}:\d{2}:\d{2})\s+[+-]\d{4}/);
+        return m ? m[1] : s;
     }
     function logEntryHtml(e) {
         if (e.kind === "unparsed") {
@@ -305,7 +309,7 @@
         details += '<details class="log-detail"><summary>原始行</summary><pre>' + esc(e.raw) + "</pre></details>";
         return '<div class="log-entry">' +
             '<div class="log-head">' + badge +
-                '<span class="log-time">' + esc(logTime(e)) + "</span>" +
+                '<span class="log-time" title="' + esc(e.time || "") + '">' + esc(logTime(e)) + "</span>" +
                 '<span class="log-path">' + esc(path) + "</span>" +
             "</div>" +
             (e.error ? '<div class="log-err">' + esc(e.error) + "</div>" : "") +
