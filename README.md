@@ -288,7 +288,7 @@ cargo test
 
 | 参数 | 类型 | 匹配方式 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `from` / `to` | i64 | — | 起止时间（**epoch 毫秒**，含） |
+| `from` / `to` | i64 | — | 起止时间（**epoch 毫秒**，含）。提供后（与任一月份归档的 `TimeMs` 范围相交时）启用跨月检索：同时查询当前库与命中的月度归档 |
 | `model` | string | 前缀，大小写不敏感 | `gpt` 命中 `gpt-4o-mini`、`GPT-5.6-Sol` |
 | `ip` | string | 前缀，大小写不敏感 | `192.168.10` 命中 `192.168.10.32` |
 | `apikey` | string | 精确 | 需填完整 Key |
@@ -299,7 +299,7 @@ cargo test
 | `session_id` / `parent_session_id` / `request_id` | string | 子串 | |
 | `q` | string | 见下 | 关键词检索 |
 | `errors` | `1` | — | 仅返回 `Status >= 400` |
-| `cursor` | string | — | 翻页游标 `"<TimeMs>:<id>"` |
+| `cursor` | string | — | 翻页游标，对客户端**不透明**：单月为 `"<TimeMs>:<id>"`，跨月为 `"<TimeMs>:<id>:<shard>"` |
 | `limit` | i64 | — | 每页条数，默认 50，范围 1–500 |
 
 `q` 按长度分支：**≥3 字符** 走 FTS5 trigram 子串索引（快）；**<3 字符** 退化为三列 `LIKE '%x%'` 全表扫描，建议前端限制最少 3 字符，或同时附带 `from`/`to` 收窄范围。
@@ -312,17 +312,20 @@ cargo test
     "id": 273, "time": "2026-09-17 18:08:40.742568", "timeMs": 1789639720742,
     "type": "responses", "model": "gpt-5.6-sol", "status": 200, "ip": "192.168.10.32",
     "sessionId": "…", "requestId": "…", "toolCount": 34,
-    "promptTokens": 1234, "totalTokens": 5678, "latencyMs": 20484.2, "promptPreview": "……"
+    "promptTokens": 1234, "totalTokens": 5678, "latencyMs": 20484.2, "promptPreview": "……",
+    "shard": "record_202608"
   }],
-  "nextCursor": "1789639720742:273",
+  "nextCursor": "1789639720742:273:record_202608",
   "total": 273,
   "totalExact": true
 }
 ```
 
-- `items` 已按时间倒序（最新在前），同毫秒再按 `id` 倒序。
-- `total` **最多统计 10000 条**；`totalExact` 为 `false` 时表示 `total` 语义是「**≥ 10000**」。
-- 翻页只支持顺序前后翻：把上一页的 `nextCursor` 原样回传，`null` 表示已是最后一页。翻页时筛选条件必须保持一致。
+- `items` 已按时间倒序（最新在前），同毫秒再按 `id` 倒序；跨月检索时以 `shard` 作为最终并列次序（`TimeMs DESC, id DESC, shard DESC`）。
+- `shard` 字段仅跨月检索时出现：`"active"` 表示当前库，其余为归档分片 id（文件名去扩展名，如 `record_202608`）。
+- `total` **最多统计 10000 条**；`totalExact` 为 `false` 时表示 `total` 语义是「**≥ 10000**」。跨月时 `total` 为各分片计数之和的上限值。
+- 翻页只支持顺序前后翻：把上一页的 `nextCursor` 原样回传，`null` 表示已是最后一页。游标格式对客户端不透明，请勿自行拼接。翻页时筛选条件必须保持一致。
+- 不提供 `from`/`to` 时行为与历史版本完全一致：只查询当前月数据库，游标为两段式。
 
 ```bash
 curl 'http://127.0.0.1:8000/dashboard/api/records?model=gpt&limit=20'
@@ -344,13 +347,14 @@ curl 'http://127.0.0.1:8000/dashboard/api/records?limit=20&cursor=1789639720742:
 
 ### `GET /dashboard/api/records/{id}` — 记录详情
 
-返回列表字段外加 `prompt`、`requestTail`、`answer`、`toolNames`、`apiKey`、`hasPayload`。
+返回列表字段外加 `prompt`、`requestTail`、`answer`、`toolNames`、`apiKey`、`hasPayload`。命中归档时会额外返回 `"shard"` 字段标识来源分片。
 
 | 参数 | 说明 |
 | :--- | :--- |
 | `include=body` | 额外返回完整 `request` / `response` / `headers`（按需 zstd 解压，体积可能很大，建议用户展开时再请求） |
+| `shard` | 指定分片：`active` 为当前库，其余为归档分片 id（如 `record_202608`）。指定后只在该分片内查找，分片不存在返回 **404** |
 
-未知 `id` 返回 **404**；`hasPayload=false` 表示该记录无压缩正文。
+不指定 `shard` 时先查当前库；当前库未命中则跨所有归档按 `id` 查找：唯一命中返回记录，命中多个归档（`id` 在不同月份重复）返回 **409**，响应体为 `["ambiguous_record_id", "<shard>", …]`；均未命中返回 **404**。未知 `id` 返回 **404**；`hasPayload=false` 表示该记录无压缩正文。旧归档若缺少 `TimeMs` 列会被跳过，不参与检索。
 
 ### `GET /dashboard/api/error-log` — 错误日志（读文件，非数据库）
 

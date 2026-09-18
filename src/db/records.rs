@@ -207,11 +207,16 @@ pub struct StoredPayload {
 
 pub async fn load_payload(app_state: &Arc<AppState>, record_id: i64) -> Option<StoredPayload> {
     let pool = app_state.db_pool.read().await;
+    load_payload_from(&pool, record_id).await
+}
+
+/// 在指定连接池上加载并解压记录正文（供跨月归档详情复用）。
+pub async fn load_payload_from(pool: &sqlx::SqlitePool, record_id: i64) -> Option<StoredPayload> {
     let row = sqlx::query(
         "SELECT codec, dict_id, request, response, headers FROM payloads WHERE record_id = ?",
     )
     .bind(record_id)
-    .fetch_optional(&*pool)
+    .fetch_optional(pool)
     .await
     .ok()??;
 

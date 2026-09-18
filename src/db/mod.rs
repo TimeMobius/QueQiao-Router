@@ -11,6 +11,7 @@ use crate::config::types::Config;
 use crate::state::app_state::AppState;
 use std::sync::Arc;
 
+pub mod archive;
 pub mod extract;
 pub mod payload;
 pub mod records;
@@ -251,7 +252,7 @@ pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
 }
 
 /// 解析 `RECD_PATH` 得到数据库文件路径（去掉 `sqlite:` 前缀）。
-fn resolve_db_path() -> std::path::PathBuf {
+pub(crate) fn resolve_db_path() -> std::path::PathBuf {
     let url = std::env::var("RECD_PATH").unwrap_or_else(|_| "sqlite:./record.db".to_string());
     std::path::PathBuf::from(url.strip_prefix("sqlite:").unwrap_or(&url))
 }
