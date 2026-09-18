@@ -193,9 +193,10 @@
     .status-5xx { color: var(--danger); }
     .status-5xx .dot { background: var(--danger); }
 
-    .metrics { display: inline-flex; align-items: center; gap: 11px; }
+    .metrics { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; max-width: 100%; }
     .metric { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); font-size: 12.5px; font-variant-numeric: tabular-nums; }
     .metric svg { width: 14px; height: 14px; color: var(--text-muted); flex-shrink: 0; }
+    .metric.rounds svg { color: var(--primary); }
     .metric.tokens svg { color: #7C5CD6; }
     .metric.tools svg { color: #D98219; }
     .metric.latency svg { color: #12A05C; }

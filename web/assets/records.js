@@ -5,6 +5,7 @@
 
     var ICON = {
         tokens: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M4 7l3-3 3 3M17 20V4M14 17l3 3 3-3"></path></svg>',
+        rounds: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-3.8-.9L3 21l1.9-5A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4z"></path></svg>',
         tools: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>',
         latency: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3.2 1.9"></path></svg>',
         ttft: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13.5H11l-1 8.5 9.5-11.5H13l1-8.5z"></path></svg>',
@@ -197,6 +198,7 @@
         var html = items.map(function (it) {
             var type = shortType(it.type);
             var usage =
+                metric("rounds", ICON.rounds, it.messageCount, "消息轮数") +
                 metric("tokens", ICON.tokens, fmtTokens(it.totalTokens),
                     "总 Token（" + dash(it.promptTokens) + " 提问 / " + dash(it.completionTokens) + " 回复）") +
                 metric("tools", ICON.tools, it.toolCount, "工具调用数");
@@ -213,7 +215,7 @@
                 '<td class="col-status"><span class="status ' + statusClass(it.status, it.error) + '"><span class="dot"></span>' + esc(dash(it.status)) + "</span></td>" +
                 '<td class="col-client"><span class="cell-main" title="' + esc(dash(clientText(it))) + '">' + esc(dash(clientText(it))) + "</span>" + sub(it.ip) + "</td>" +
                 '<td class="col-session"><span class="cell-main" title="' + esc(dash(it.sessionId)) + '">' + esc(dash(it.sessionId)) + "</span>" + sub(it.requestId) + "</td>" +
-                '<td class="col-usage">' + (usage || '<span class="empty-cell">-</span>') + "</td>" +
+                '<td class="col-usage">' + (usage ? '<span class="metrics">' + usage + "</span>" : '<span class="empty-cell">-</span>') + "</td>" +
                 '<td class="col-latency">' + (timing || '<span class="empty-cell">-</span>') + "</td>" +
                 '<td class="preview col-preview">' + preview + "</td>" +
                 '<td class="col-actions"><button type="button" class="link" data-open="' + esc(it.id) + '">查看详情</button></td>' +
