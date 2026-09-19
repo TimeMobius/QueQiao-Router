@@ -103,7 +103,7 @@ struct ShardInput {
 }
 
 #[derive(Debug, Clone)]
-enum Bind {
+pub(crate) enum Bind {
     Int(i64),
     Text(String),
 }
@@ -153,7 +153,7 @@ fn push_opt_text(sql: &mut String, binds: &mut Vec<Bind>, column: &str, value: O
     }
 }
 
-fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
+pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
     let mut sql = String::from(" WHERE 1=1");
     let mut binds: Vec<Bind> = Vec::new();
 
@@ -244,7 +244,7 @@ fn with_cursor(sql: &mut String, binds: &mut Vec<Bind>, cursor: Option<&String>)
     true
 }
 
-fn bind_all<'q>(
+pub(crate) fn bind_all<'q>(
     mut query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     binds: &'q [Bind],
 ) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
@@ -762,11 +762,11 @@ mod tests {
     #[test]
     fn prefix_upper_sorts_after_every_matching_string() {
         let bound = prefix_upper("gpt");
-        assert!("gpt".to_string() < bound);
-        assert!("gpt-5.6-sol".to_string() < bound);
-        assert!("gptzzz".to_string() < bound);
-        assert!("gp".to_string() < bound);
-        assert!("gpu".to_string() > bound);
+        assert!("gpt" < bound.as_str());
+        assert!("gpt-5.6-sol" < bound.as_str());
+        assert!("gptzzz" < bound.as_str());
+        assert!("gp" < bound.as_str());
+        assert!("gpu" > bound.as_str());
     }
 
     #[test]

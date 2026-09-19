@@ -155,6 +155,7 @@ a { color: inherit; }
     padding: 5px 0;
     border-bottom: 2px solid transparent;
     transition: color .15s ease, border-color .15s ease;
+    white-space: nowrap;
 }
 .app-nav a:hover { color: #fff; }
 .app-nav a[aria-current="page"] {
@@ -362,6 +363,12 @@ input:focus, select:focus, textarea:focus {
 }
 
 /* ---------- Responsive shell ---------- */
+@media (max-width: 900px) {
+    .app-header { gap: 16px; }
+    .app-nav { gap: 16px; }
+    .app-updated { display: none; }
+}
+
 @media (max-width: 720px) {
     .app-header { gap: 12px; padding: 0 14px; }
     .app-brand-sub { display: none; }
@@ -373,8 +380,15 @@ input:focus, select:focus, textarea:focus {
 @media (max-width: 560px) {
     .app-header { gap: 10px; padding: 0 12px; }
     .app-brand-text { display: none; }
-    .app-nav { gap: 12px; }
-    .app-actions { gap: 10px; }
+    .app-nav { gap: 8px; }
+    .app-nav a { font-size: 12px; }
+    .app-actions { gap: 6px; }
+    .theme-select {
+        width: 34px;
+        padding: 0;
+        background-position: center;
+        color: transparent;
+    }
     .app-status { padding: 6px 9px; }
     .app-status #appStatusText {
         position: absolute;

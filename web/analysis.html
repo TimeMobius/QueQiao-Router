@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>日志分析 - QueQiao Router</title>
+<link rel="icon" type="image/svg+xml" href="/dashboard/favicon.svg">
+<script src="/dashboard/vendor/echarts.min.js"></script>
+<link href="/dashboard/vendor/fonts/inter.css" rel="stylesheet">
+<link href="/dashboard/assets/shell.css" rel="stylesheet">
+<script>
+    (function () {
+        try {
+            var mode = localStorage.getItem('queqiao_dashboard_theme') || 'system';
+            var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+            document.documentElement.setAttribute('data-theme', mode === 'system' ? (dark ? 'dark' : 'light') : mode);
+        } catch (e) { document.documentElement.setAttribute('data-theme', 'light'); }
+    })();
+</script>
+<script src="/dashboard/assets/shell.js" defer></script>
+<style>
+    .analysis-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 20px 22px 32px; }
+    .analysis-page { max-width: 1440px; margin: 0 auto; }
+    .analysis-toolbar, .analysis-card {
+        background: var(--bg-secondary); border: 1px solid var(--border-color);
+        border-radius: var(--radius-md); box-shadow: var(--shadow-sm);
+    }
+    .analysis-toolbar { padding: 14px; }
+    .filter-row { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+    .filter-row + .filter-row { margin-top: 10px; }
+    .filter-field { display: flex; flex-direction: column; gap: 5px; min-width: 124px; }
+    .filter-field.wide { min-width: 174px; }
+    .filter-field label { color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+    .filter-field input, .filter-field select { width: 100%; }
+    .filter-actions { display: flex; gap: 8px; margin-left: auto; }
+    .segmented { display: inline-flex; padding: 3px; gap: 2px; border-radius: var(--radius-sm); background: var(--bg-tertiary); }
+    .segmented button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: var(--text-secondary); font: inherit; font-size: 12px; cursor: pointer; }
+    .segmented button.active { background: var(--bg-secondary); color: var(--primary-strong); font-weight: 600; box-shadow: var(--shadow-sm); }
+    .analysis-meta { display: flex; justify-content: space-between; gap: 12px; margin-top: 10px; color: var(--text-muted); font-size: 11.5px; }
+    .notice { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--warning-bg); border-radius: var(--radius-sm); background: var(--warning-bg); color: var(--warning-text); font-size: 12px; }
+    .notice[hidden] { display: none; }
+    .stats-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+    .stat { padding: 14px; min-width: 0; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); }
+    .stat-label { color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stat-value { margin-top: 7px; color: var(--text-primary); font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .stat.success .stat-value { color: var(--success); }
+    .stat.danger .stat-value { color: var(--danger); }
+    .analysis-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 14px; margin-top: 14px; align-items: stretch; }
+    .analysis-card { min-width: 0; overflow: hidden; }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border-light); }
+    .card-title { color: var(--text-primary); font-size: 15px; font-weight: 600; }
+    .card-subtitle { margin-top: 3px; color: var(--text-muted); font-size: 11.5px; }
+    .chart { height: 300px; padding: 4px 8px 8px; }
+    .chart.small { height: 300px; }
+    .table-scroll { overflow-x: auto; }
+    .analysis-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12.5px; }
+    .analysis-table th { padding: 10px 12px; background: var(--bg-tertiary); color: var(--text-muted); font-size: 11.5px; font-weight: 600; text-align: left; white-space: nowrap; }
+    .analysis-table td { padding: 10px 12px; border-top: 1px solid var(--border-light); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .analysis-table td:first-child { color: var(--text-primary); font-weight: 500; }
+    .analysis-table .number { text-align: right; font-variant-numeric: tabular-nums; }
+    .error-table { min-width: 0; }
+    .error-table .col-error-status { width: 62px; }
+    .error-table .col-error-model { width: 118px; }
+    .error-table .col-error-backend { width: 82px; }
+    .error-table .col-error-count { width: 78px; }
+    .dimension-table { min-width: 760px; }
+    .error-status { color: var(--danger-text); font-variant-numeric: tabular-nums; font-weight: 600; }
+    .empty-row td { padding: 42px 12px; color: var(--text-muted); text-align: center; }
+    .table-pager { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 10px 14px; color: var(--text-muted); font-size: 12px; }
+    .table-pager button { height: 28px; padding: 0 10px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-secondary); color: var(--text-secondary); font: inherit; cursor: pointer; }
+    .table-pager button:hover:not(:disabled) { border-color: var(--primary); color: var(--primary-strong); }
+    .table-pager button:disabled { cursor: default; opacity: .5; }
+    .distribution { padding: 16px; }
+    .distribution-row { display: grid; grid-template-columns: minmax(92px, 1fr) minmax(100px, 2fr) 54px; align-items: center; gap: 8px; margin: 13px 0; font-size: 12px; }
+    .distribution-name { overflow: hidden; color: var(--text-secondary); text-overflow: ellipsis; white-space: nowrap; }
+    .distribution-track { height: 8px; overflow: hidden; border-radius: var(--radius-pill); background: var(--bg-tertiary); }
+    .distribution-fill { height: 100%; border-radius: inherit; background: var(--primary); }
+    .distribution-value { color: var(--text-primary); text-align: right; font-variant-numeric: tabular-nums; }
+    @media (max-width: 1180px) { .stats-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    @media (max-width: 900px) {
+        .analysis-grid { grid-template-columns: 1fr; }
+        .filter-actions { margin-left: 0; }
+        .dimension-table { min-width: 0; }
+        .dimension-table th:nth-child(5), .dimension-table td:nth-child(5),
+        .dimension-table th:nth-child(6), .dimension-table td:nth-child(6) { display: none; }
+    }
+    @media (max-width: 640px) {
+        .analysis-scroll { padding: 12px 14px 24px; }
+        .filter-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+        .filter-field, .filter-field.wide { min-width: 0; }
+        .filter-actions { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; }
+        .filter-actions button { width: 100%; }
+        .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .stat-value { font-size: 20px; }
+        .analysis-meta { align-items: flex-start; flex-direction: column; gap: 4px; }
+        .card-head { align-items: flex-start; flex-direction: column; }
+        .chart, .chart.small { height: 250px; }
+    }
+    @media (max-width: 480px) {
+        .filter-field.wide { grid-column: 1 / -1; }
+        .error-table { min-width: 0; }
+        .error-table .col-error-backend,
+        .error-table th:nth-child(3), .error-table td:nth-child(3) { display: none; }
+        .error-table td:nth-child(4) { text-overflow: ellipsis; white-space: nowrap; }
+        .dimension-table th:nth-child(3), .dimension-table td:nth-child(3) { display: none; }
+    }
+</style>
+</head>
+<body>
+<header class="app-header">
+  <a class="app-brand" href="/dashboard">
+    <span class="app-brand-mark">Q</span>
+    <span class="app-brand-text"><span class="app-brand-name">QueQiao Router</span><span class="app-brand-sub">大模型路由网关</span></span>
+  </a>
+  <nav class="app-nav" aria-label="主导航">
+    <a href="/dashboard">实时监控</a>
+    <a href="/dashboard/records">日志记录</a>
+    <a href="/dashboard/analysis">日志分析</a>
+  </nav>
+  <div class="app-actions">
+    <select id="themeSelect" class="theme-select" aria-label="主题"><option value="system">跟随系统</option><option value="light">浅色模式</option><option value="dark">深色模式</option></select>
+    <span class="app-status" id="appStatus" role="status" data-state="unknown"><span class="app-status-dot" aria-hidden="true"></span><span id="appStatusText">检测中</span></span>
+    <time class="app-updated" id="appUpdated">最后更新 --:--:--</time>
+  </div>
+</header>
+<main class="app-main">
+<div class="analysis-scroll"><div class="analysis-page">
+  <section class="analysis-toolbar" aria-label="分析筛选">
+    <div class="filter-row">
+      <div class="filter-field wide"><label for="fromInput">开始时间</label><input type="datetime-local" id="fromInput" step="1"></div>
+      <div class="filter-field wide"><label for="toInput">结束时间</label><input type="datetime-local" id="toInput" step="1"></div>
+      <div class="filter-field"><label for="intervalSelect">趋势粒度</label><select id="intervalSelect"><option value="">自动</option><option value="hour">小时</option><option value="day">天</option><option value="month">月</option></select></div>
+      <div class="filter-field wide"><label for="dimensionSelect">分页维度</label><select id="dimensionSelect"><option value="model">模型</option><option value="apikey">APIKey</option><option value="ip">IP</option><option value="type">请求类型</option><option value="status">状态码</option><option value="backend">后端</option><option value="client">客户端</option><option value="hour">小时段</option></select></div>
+      <div class="filter-actions"><button type="button" class="btn btn-primary" id="queryBtn">查询</button><button type="button" class="btn btn-ghost" id="resetBtn">重置</button></div>
+    </div>
+    <div class="filter-row">
+      <div class="filter-field"><label for="modelInput">模型</label><input type="text" id="modelInput" placeholder="模型前缀"></div>
+      <div class="filter-field"><label for="apikeyInput">APIKey</label><input type="text" id="apikeyInput" placeholder="精确匹配"></div>
+      <div class="filter-field"><label for="ipInput">IP</label><input type="text" id="ipInput" placeholder="IP 前缀"></div>
+      <div class="filter-field"><label for="typeInput">请求类型</label><input type="text" id="typeInput" placeholder="如 chat.completions"></div>
+      <div class="filter-field"><label for="backendInput">后端</label><input type="text" id="backendInput" placeholder="后端名称"></div>
+      <div class="filter-field"><label for="statusInput">状态</label><input type="number" id="statusInput" placeholder="如 500" min="100" max="599"></div>
+      <div class="filter-field"><label for="clientInput">客户端</label><input type="text" id="clientInput" placeholder="客户端子串"></div>
+    </div>
+    <div class="analysis-meta"><span id="queryMeta">最近 7 天</span><span id="shardMeta">数据分片：--</span></div>
+    <div class="notice" id="warnings" hidden></div>
+  </section>
+
+  <section class="stats-grid" aria-label="统计摘要">
+    <div class="stat"><div class="stat-label">请求总量</div><div class="stat-value" id="statRequests">0</div></div>
+    <div class="stat success"><div class="stat-label">成功请求</div><div class="stat-value" id="statSuccess">0</div></div>
+    <div class="stat danger"><div class="stat-label">错误请求</div><div class="stat-value" id="statErrors">0</div></div>
+    <div class="stat"><div class="stat-label">请求Token</div><div class="stat-value" id="statPrompt">0</div></div>
+    <div class="stat"><div class="stat-label">返回Token</div><div class="stat-value" id="statCompletion">0</div></div>
+    <div class="stat"><div class="stat-label">总Token</div><div class="stat-value" id="statTotal">0</div></div>
+    <div class="stat"><div class="stat-label">模型数</div><div class="stat-value" id="statModels">0</div></div>
+    <div class="stat"><div class="stat-label">IP数</div><div class="stat-value" id="statIps">0</div></div>
+  </section>
+
+  <div class="analysis-grid">
+    <section class="analysis-card"><div class="card-head"><div><div class="card-title">请求趋势</div><div class="card-subtitle" id="trendSubtitle">按时间聚合的成功与错误请求</div></div><div class="segmented" id="trendMode" role="group" aria-label="趋势指标"><button type="button" class="active" data-mode="requests">请求</button><button type="button" data-mode="tokens">Token</button></div></div><div class="chart" id="trendChart"></div></section>
+    <section class="analysis-card"><div class="card-head"><div><div class="card-title">错误排行</div><div class="card-subtitle">错误来源与状态分布</div></div><div class="segmented" id="errorSource" role="group" aria-label="错误来源"><button type="button" class="active" data-source="db">数据库</button><button type="button" data-source="log">日志</button></div></div><div class="table-scroll"><table class="analysis-table error-table"><colgroup><col class="col-error-status"><col class="col-error-model"><col class="col-error-backend"><col><col class="col-error-count"></colgroup><thead><tr><th>状态</th><th>模型</th><th>后端</th><th>错误</th><th class="number">次数</th></tr></thead><tbody id="errorsBody"><tr class="empty-row"><td colspan="5">加载中…</td></tr></tbody></table></div></section>
+  </div>
+  <div class="analysis-grid">
+    <section class="analysis-card"><div class="card-head"><div><div class="card-title">维度分页</div><div class="card-subtitle" id="dimensionSubtitle">按模型统计</div></div><select id="orderSelect" aria-label="排序字段"><option value="requests">按请求量</option><option value="errors">按错误量</option><option value="tokens">按 Token</option></select></div><div class="table-scroll"><table class="analysis-table dimension-table"><thead><tr><th>名称</th><th class="number">请求</th><th class="number">成功</th><th class="number">错误</th><th class="number">请求Token</th><th class="number">返回Token</th><th class="number">总Token</th></tr></thead><tbody id="dimensionsBody"><tr class="empty-row"><td colspan="7">加载中…</td></tr></tbody></table></div><div class="table-pager"><span id="dimensionPagerText">共 0 条</span><button type="button" id="prevPage" disabled>上一页</button><span id="pageText">第 1 页</span><button type="button" id="nextPage" disabled>下一页</button></div></section>
+    <section class="analysis-card"><div class="card-head"><div><div class="card-title">Top 分布</div><div class="card-subtitle">当前筛选下的主要维度</div></div><select id="topDimension" aria-label="Top 分布维度"><option value="model">模型</option><option value="apikey">APIKey</option><option value="ip">IP</option><option value="backend">后端</option><option value="type">请求类型</option></select></div><div class="distribution" id="topDistribution"><div class="empty-row">加载中…</div></div></section>
+  </div>
+</div></div>
+</main>
+<script src="/dashboard/assets/analysis.js" defer></script>
+</body>
+</html>

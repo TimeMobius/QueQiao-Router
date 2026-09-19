@@ -1,7 +1,7 @@
 # Design System — QueQiao Router Monitoring UI
 
 Implementation contract for the framework-free dashboard (`web/index.html`,
-`web/records.html`) served under `/dashboard`. Every color, size, and spacing value in the
+`web/records.html`, `web/analysis.html`) served under `/dashboard`. Every color, size, and spacing value in the
 pages must trace to a token here. Framework: vanilla HTML/CSS/JS embedded with `rust-embed`.
 
 ## 0. Research Log
@@ -26,6 +26,10 @@ A calm, information-dense operations console: a single stable navy brand bar ove
 light/dark content plane, slate neutrals, and blue as the only interaction accent. Materials
 are borders + a single soft shadow (no glass, no gradients); density and legibility carry the
 surface. Every interactive element states its affordance through hover/focus/busy states.
+
+The shell uses three exact-path tabs on every page: `实时监控` (`/dashboard`), `日志记录`
+(`/dashboard/records`), and `日志分析` (`/dashboard/analysis`). `shell.js` owns the active
+state by matching each link's normalized `href` to `location.pathname`.
 
 ## 2. Color tokens
 
@@ -87,6 +91,13 @@ Single source: `web/assets/shell.css`. Pages must not declare their own `:root`.
 Records-specific (kept in `records.html`): segmented mode toggle, `.rounded` range, table,
 preview clamp, status text colors, log entries, drawer, pager size overrides.
 Index-specific (kept in `index.html`): stats grid, charts grid, `.chart-select`, model table.
+Analysis-specific (kept in `analysis.html` / `assets/analysis.js`): two-row filter cluster,
+eight summary metrics, ECharts trend, error ranking table, dimension pagination table, and
+top-distribution bars. The page consumes `GET /dashboard/api/analysis` with explicit `from`
+and `to` epoch milliseconds plus `interval`, `dimension`, `orderBy`, `page`, `pageSize`,
+`topLimit`, and the shared `model`, `ip`, `apikey`, `type`, `backend`, `status`, `client`,
+and `errors` filters. Error ranking consumes `GET /dashboard/api/analysis/errors` with the
+same shared filters plus `source=db|log` and `limit`.
 
 ## 6. Layout & scroll ownership
 
@@ -95,6 +106,8 @@ Index-specific (kept in `index.html`): stats grid, charts grid, `.chart-select`,
 - **One scroll owner per region.** Index: `.main-content` (`overflow:auto`) inside
   `.app-main`. Records: `.card.page-fill` owns no scroll; `.table-scroll` / `.log-list` are
   the scroll owners each with `min-height:0`. The drawer body owns its own scroll.
+- Analysis: `.analysis-scroll` is the single page scroll owner below the fixed shell header;
+  chart and table regions remain intrinsic and the two-column rows stack below 900px.
 - The 375px reflow turns filters into a single column with no horizontal scrollbar; the time
   range stacks vertically and its inputs are `width:100%`.
 
