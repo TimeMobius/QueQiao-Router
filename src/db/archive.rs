@@ -14,11 +14,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 
 /// active 分片在查询层使用的固定标识。
 pub const ACTIVE_SHARD: &str = "active";
+
+/// 归档扫描/迁移的并发上限。各归档是独立文件与独立事务，可并行；但在 NFS 上
+/// 并发过高会争抢 I/O，故取较小值。
+const ARCHIVE_SCAN_CONCURRENCY: usize = 3;
 
 /// 单个归档分片及其只读连接池。
 pub struct ArchiveShard {
@@ -59,7 +63,9 @@ impl ArchiveRegistry {
 
     /// 扫描归档目录，把尚未缓存的合法分片登记进来。
     ///
-    /// 任何单个文件的错误都只会记录告警并继续，绝不影响整体检索。
+    /// 各归档是独立文件与独立事务，因此并行处理（并发受限）；任何单个文件的错误
+    /// 都只会记录告警并继续，绝不影响整体检索。`scan_lock` 仍串行化扫描本身，
+    /// 防止并发扫描导致同一遗留归档被迁移两次。
     pub async fn ensure_scanned(&self) {
         let _guard = self.scan_lock.lock().await;
 
@@ -75,6 +81,7 @@ impl ArchiveRegistry {
             }
         };
 
+        let mut pending: Vec<(String, PathBuf)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -89,44 +96,99 @@ impl ArchiveRegistry {
             if parse_archive_stem(stem).is_none() {
                 continue;
             }
-            {
-                let shards = self.shards.read().await;
-                if shards.contains_key(stem) {
-                    continue;
-                }
+            if self.shards.read().await.contains_key(stem) {
+                continue;
             }
+            pending.push((stem.to_string(), path));
+        }
+        if pending.is_empty() {
+            return;
+        }
 
-            match open_archive_shard(&path, stem).await {
-                Ok(Some(shard)) => self.register_shard(stem, shard).await,
-                Ok(None) => {
-                    // 遗留归档（缺少 TimeMs）：open_archive_shard 已告警。
-                    if legacy_migration_disabled() {
-                        continue;
+        let sem = Arc::new(Semaphore::new(ARCHIVE_SCAN_CONCURRENCY));
+        let migration_disabled = legacy_migration_disabled();
+        let mut tasks = Vec::with_capacity(pending.len());
+        for (stem, path) in pending {
+            let sem = sem.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                let mut notices: Vec<String> = Vec::new();
+                let opened = match open_archive_shard(&path, &stem).await {
+                    Ok(Some(shard)) => Some(shard),
+                    Ok(None) => {
+                        notices.push(format!(
+                            "Legacy archive without TimeMs column detected: {}",
+                            path.display()
+                        ));
+                        if migration_disabled {
+                            None
+                        } else {
+                            Self::migrate_and_reopen(&path, &stem, &mut notices).await
+                        }
                     }
-                    if let Err(e) = migrate_legacy_in_place(&path).await {
-                        warn!(
-                            "Legacy archive migration failed for '{}': {}",
+                    Err(e) => {
+                        notices.push(format!(
+                            "archive shard '{}' open failed: {}",
                             path.display(),
                             e
-                        );
-                        continue;
+                        ));
+                        None
                     }
-                    match open_archive_shard(&path, stem).await {
-                        Ok(Some(shard)) => self.register_shard(stem, shard).await,
-                        Ok(None) => {
-                            warn!(
-                                "Archive '{}' still lacks TimeMs after migration; skipping",
-                                path.display()
-                            );
-                        }
-                        Err(e) => {
-                            warn!("archive shard '{}' open failed: {}", path.display(), e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("archive shard '{}' open failed: {}", path.display(), e);
-                }
+                };
+                (stem, opened, notices)
+            }));
+        }
+
+        let results = futures::future::join_all(tasks).await;
+        let mut completed: Vec<(String, Option<ArchiveShard>, Vec<String>)> = Vec::new();
+        for result in results {
+            match result {
+                Ok(item) => completed.push(item),
+                Err(e) => warn!("archive scan task failed: {}", e),
+            }
+        }
+        // 按文件名排序后统一登记，保证日志与登记顺序稳定（不受目录遍历顺序影响）。
+        completed.sort_by(|a, b| a.0.cmp(&b.0));
+        for (stem, shard, notices) in completed {
+            for notice in notices {
+                warn!("{}", notice);
+            }
+            if let Some(shard) = shard {
+                self.register_shard(&stem, shard).await;
+            }
+        }
+    }
+
+    /// 迁移一个遗留归档后重新打开；失败或仍缺 `TimeMs` 时返回 `None` 并追加告警。
+    async fn migrate_and_reopen(
+        path: &Path,
+        stem: &str,
+        notices: &mut Vec<String>,
+    ) -> Option<ArchiveShard> {
+        if let Err(e) = migrate_legacy_in_place(path).await {
+            notices.push(format!(
+                "Legacy archive migration failed for '{}': {}",
+                path.display(),
+                e
+            ));
+            return None;
+        }
+        match open_archive_shard(path, stem).await {
+            Ok(Some(shard)) => Some(shard),
+            Ok(None) => {
+                notices.push(format!(
+                    "Archive '{}' still lacks TimeMs after migration; skipping",
+                    path.display()
+                ));
+                None
+            }
+            Err(e) => {
+                notices.push(format!(
+                    "archive shard '{}' open failed: {}",
+                    path.display(),
+                    e
+                ));
+                None
             }
         }
     }
