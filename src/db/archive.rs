@@ -116,10 +116,6 @@ impl ArchiveRegistry {
                 let opened = match open_archive_shard(&path, &stem).await {
                     Ok(Some(shard)) => Some(shard),
                     Ok(None) => {
-                        notices.push(format!(
-                            "Legacy archive without TimeMs column detected: {}",
-                            path.display()
-                        ));
                         if migration_disabled {
                             None
                         } else {

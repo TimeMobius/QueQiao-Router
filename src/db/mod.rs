@@ -23,6 +23,10 @@ const SCHEMA_VERSION: i64 = 7;
 /// 遗留归档 TimeMs 回填的分批大小；限制单条 SELECT 的内存占用。
 const LEGACY_BACKFILL_BATCH: i64 = 2000;
 
+/// 遗留库的明文正文列。迁移把正文映射到 `Prompt`/`Answer` 后这三列即成为死列
+/// （读路径不再引用），删除并 `VACUUM` 可回收约三成空间。
+const LEGACY_PLAINTEXT_COLUMNS: &[&str] = &["Request", "Response", "Headers"];
+
 /// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
 const NEW_COLUMNS: &[(&str, &str)] = &[
     ("TimeMs", "INTEGER"),
@@ -237,18 +241,23 @@ pub(crate) async fn migrate_legacy_archive(pool: &SqlitePool) -> Result<(), sqlx
     }
 
     // 遗留库把正文存在 Request/Response 明文中；映射到现代展示/检索列。
-    sqlx::query(
-        "UPDATE records SET Prompt = Request \
-         WHERE (Prompt IS NULL OR Prompt = '') AND Request IS NOT NULL AND Request <> ''",
-    )
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE records SET Answer = Response \
-         WHERE (Answer IS NULL OR Answer = '') AND Response IS NOT NULL AND Response <> ''",
-    )
-    .execute(&mut *tx)
-    .await?;
+    // 列存在性守卫保证重复迁移（或已瘦身库）不会因引用已删除的列而失败。
+    if existing.iter().any(|c| c == "Request") {
+        sqlx::query(
+            "UPDATE records SET Prompt = Request \
+             WHERE (Prompt IS NULL OR Prompt = '') AND Request IS NOT NULL AND Request <> ''",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    if existing.iter().any(|c| c == "Response") {
+        sqlx::query(
+            "UPDATE records SET Answer = Response \
+             WHERE (Answer IS NULL OR Answer = '') AND Response IS NOT NULL AND Response <> ''",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
 
     let mut last_id: i64 = 0;
     let mut unparseable: u64 = 0;
@@ -295,6 +304,18 @@ pub(crate) async fn migrate_legacy_archive(pool: &SqlitePool) -> Result<(), sqlx
         .execute(&mut *tx)
         .await?;
 
+    // 正文已映射到 Prompt/Answer、且已写入 payloads，遗留明文列不再被任何查询引用，
+    // 删除它们再由事务提交后的 VACUUM 回收空间。DDL 无法绑定标识符，列名为编译期常量。
+    let mut slimmed = 0usize;
+    for col in LEGACY_PLAINTEXT_COLUMNS {
+        if existing.iter().any(|c| c == col) {
+            sqlx::query(&format!("ALTER TABLE records DROP COLUMN {}", col))
+                .execute(&mut *tx)
+                .await?;
+            slimmed += 1;
+        }
+    }
+
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records")
         .fetch_one(&mut *tx)
         .await?;
@@ -306,9 +327,19 @@ pub(crate) async fn migrate_legacy_archive(pool: &SqlitePool) -> Result<(), sqlx
 
     tx.commit().await?;
 
+    // VACUUM 不能在事务内执行，且失败不应影响已完成并提交的迁移结果。
+    if slimmed > 0 {
+        if let Err(e) = sqlx::query("VACUUM").execute(pool).await {
+            warn!(
+                "Legacy archive VACUUM failed (data already migrated): {}",
+                e
+            );
+        }
+    }
+
     info!(
-        "Legacy archive migrated to schema {}: {} rows, {} unparseable Time",
-        SCHEMA_VERSION, total, unparseable
+        "Legacy archive migrated to schema {}: {} rows, {} unparseable Time, {} legacy plaintext columns dropped",
+        SCHEMA_VERSION, total, unparseable, slimmed
     );
     Ok(())
 }
