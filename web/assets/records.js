@@ -528,8 +528,8 @@
                 metaRow("TTFT", fmtMs(d.ttftMs)) +
                 metaRow("上游耗时", fmtMs(d.upstreamMs)) +
                 metaRow("流式耗时", fmtMs(d.streamMs)) +
-                metaRow("请求体积", d.requestBytes) +
-                metaRow("响应体积", d.responseBytes) +
+                metaRow("请求体积", fmtBytes(d.requestBytes)) +
+                metaRow("响应体积", fmtBytes(d.responseBytes)) +
             "</dl>");
         html += section("Prompt", ICON.text, d.prompt, true);
         html += section("RequestTail", ICON.body, d.requestTail);
