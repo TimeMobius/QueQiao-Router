@@ -84,6 +84,7 @@ Single source: `web/assets/shell.css`. Pages must not declare their own `:root`.
 | `.app-updated` | `<time>` set by `QQShell.setUpdated()` |
 | `.btn` / `.btn-primary` / `.btn-ghost` | default, `:hover:not(:disabled)`, `:focus-visible`, `:disabled` |
 | `.field` | icon-prefixed inputs; `input.has-counter` adds right padding |
+| `.input-wrap` / `.input-clear` | clear button inside a text/number field; default, `:hover`, `:focus-visible`, `[hidden]`; clears text without querying |
 | `input` / `select` / `textarea` | default, `:focus` (primary border + `--focus-ring`), `:disabled` |
 | `.banner` / `.banner-error` | hidden; `.show` reveals |
 | `.page-fill` | fills remaining `app-main` height, `min-height:0`, column flex |
@@ -92,12 +93,17 @@ Records-specific (kept in `records.html`): segmented mode toggle, `.rounded` ran
 preview clamp, status text colors, log entries, drawer, pager size overrides.
 Index-specific (kept in `index.html`): stats grid, charts grid, `.chart-select`, model table.
 Analysis-specific (kept in `analysis.html` / `assets/analysis.js`): two-row filter cluster,
-eight summary metrics, ECharts trend, error ranking table, dimension pagination table, and
-top-distribution bars. The page consumes `GET /dashboard/api/analysis` with explicit `from`
-and `to` epoch milliseconds plus `interval`, `dimension`, `orderBy`, `page`, `pageSize`,
-`topLimit`, and the shared `model`, `ip`, `apikey`, `type`, `backend`, `status`, `client`,
-and `errors` filters. Error ranking consumes `GET /dashboard/api/analysis/errors` with the
-same shared filters plus `source=db|log` and `limit`.
+ten summary metrics (including 成功率/错误率), ECharts trend with requests / token / error-rate /
+latency modes, error ranking table, dimension pagination table, top-distribution bars, a
+latency-percentile card, and a backend-health panel. The page consumes
+`GET /dashboard/api/analysis` with explicit `from` and `to` epoch milliseconds plus `interval`,
+`dimension`, `orderBy`, `page`, `pageSize`, `topLimit`, and the shared `model`, `ip`, `apikey`,
+`type`, `backend`, `status`, `client`, and `errors` filters. The response `summary` carries a
+`latency` object (`avgMs`/`maxMs`/`p50Ms`/`p95Ms`/`p99Ms`/`avgTtftMs`/`p95TtftMs`; percentiles are
+50ms-bucket approximations) plus `dbErrors`/`logOnlyErrors` (headline `errors` is their sum, so
+log-only `STREAM_INTERRUPTED` entries are counted without double-counting HTTP errors already in
+the DB); dimension and trend buckets include `avgLatencyMs`. Error ranking consumes
+`GET /dashboard/api/analysis/errors` with the same shared filters plus `source=db|log` and `limit`.
 
 ## 6. Layout & scroll ownership
 
@@ -129,8 +135,10 @@ same shared filters plus `source=db|log` and `limit`.
 
 ## 9. Accepted debt
 
-- Records metric-icon accents (`.metric.tokens` violet) are the only page-local accents; the
-  rest are tokenized. Full records dark-mode polish of the drawer/table is deferred.
+- Records metric-icon accents are now tokenized (`--accent-violet` / `--warning` /
+  `--success` / `--danger`); the light-only `#FAFBFC` / `#EEF2F6` / `#475467` hardcodes and the
+  dark segmented-active contrast were fixed. Full records drawer/table dark-mode polish of the
+  drawer internals is deferred.
 - The `index.html` chart series palette is generated in JS (ECharts), not token-derived;
   chart theming reads the effective theme via `QQShell.onThemeChange`.
 - Table redesign (cards vs table, column priority, empty/long/unbroken stress states) is a
@@ -147,8 +155,10 @@ same shared filters plus `source=db|log` and `limit`.
   `scrollWidth > clientWidth`. The table still scrolls horizontally on narrow screens rather
   than reflowing to cards (deferred).
 - Filter regroup (Phase 2): `.range-preset` quick ranges, `<details class="advanced-filters">`
-  for exact from/to, 300ms search debounce with a short-keyword hint, and URL state via
-  `history.replaceState` (no cursor in the URL, so paging stays in-memory).
+  for exact from/to, explicit search trigger (Enter or 查询 button, with an IME-composition
+  guard) plus a short-keyword hint, and URL state via `history.replaceState` (no cursor in the
+  URL, so paging stays in-memory). Text fields carry an `.input-clear` button that only clears
+  and refocuses — it never queries.
 - States/a11y (Phase 3): shimmer skeletons (collapsed by `prefers-reduced-motion`), empty vs
   no-match with 清除筛选, `.banner[role=alert]` + 重试, drawer `role="dialog"`/focus trap/
   `inert` background, and row actions as real `<button>`s. Drawer inner `apiKeyToggle` remains

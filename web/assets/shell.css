@@ -273,7 +273,7 @@ a { color: inherit; }
     align-items: center;
     justify-content: center;
     gap: 7px;
-    transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease;
+    transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease, transform .15s ease;
 }
 .btn:hover:not(:disabled) { border-color: var(--primary); }
 .btn:focus-visible {
@@ -285,14 +285,25 @@ a { color: inherit; }
 
 .btn-primary {
     background: var(--brand-navy);
-    border-color: var(--brand-navy);
+    border-color: var(--brand-navy-deep);
     color: #fff;
+    padding: 0 17px;
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .16);
 }
 .btn-primary:hover:not(:disabled) {
     background: var(--brand-navy-deep);
     border-color: var(--brand-navy-deep);
     box-shadow: var(--shadow-md);
+    transform: translateY(-1px);
 }
+.btn-primary:active:not(:disabled) {
+    background: var(--brand-navy-deep);
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .18);
+    transform: translateY(0);
+}
+.btn-primary:focus-visible { box-shadow: 0 0 0 3px var(--focus-ring); }
+.btn-primary:disabled { box-shadow: none; transform: none; }
 .btn-primary svg { width: 15px; height: 15px; }
 
 .btn-ghost {
@@ -317,6 +328,22 @@ a { color: inherit; }
 .field input[type="text"],
 .field input[type="search"],
 .field input[type="datetime-local"] { padding-left: 30px; }
+
+/* 输入框内置清除按钮：仅清空并聚焦，检索仍由回车/查询按钮显式触发（方案A）。 */
+.input-wrap { position: relative; display: block; }
+.input-wrap > input { padding-right: 30px; }
+.input-clear {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    width: 20px; height: 20px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0; border: 0; border-radius: 50%;
+    background: transparent; color: var(--text-muted); cursor: pointer;
+    transition: background .15s ease, color .15s ease;
+}
+.input-clear svg { width: 13px; height: 13px; }
+.input-clear:hover { background: var(--bg-tertiary); color: var(--text-secondary); }
+.input-clear:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.input-clear[hidden] { display: none; }
 
 input[type="text"],
 input[type="search"],

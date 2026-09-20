@@ -72,9 +72,13 @@
         box-shadow: 0 1px 2px rgba(16,24,40,.1);
     }
     .counter {
-        position: absolute; right: 9px; font-size: 10.5px; color: var(--text-muted); pointer-events: none;
+        position: absolute; right: 33px; font-size: 10.5px; color: var(--text-muted); pointer-events: none;
     }
-    .field input.has-counter { padding-right: 44px; }
+    .field input.has-counter { padding-right: 66px; }
+    /* 原生 datalist 下拉箭头占用输入框右缘，整体左移避免与清除按钮重叠 */
+    .field.has-datalist .counter { right: 51px; }
+    .field.has-datalist input.has-counter { padding-right: 84px; }
+    .field.has-datalist .input-clear { right: 26px; }
     .range { display: inline-flex; align-items: center; gap: 8px; }
     .range .sep { color: var(--text-muted); font-size: 13px; }
     .range input[type="datetime-local"] { color: var(--text-secondary); }
@@ -157,7 +161,7 @@
     .col-preview { width: auto; }
     .col-actions { width: 78px; }
     tbody tr { transition: background .12s; }
-    tbody tr:hover { background: #FAFBFC; }
+    tbody tr:hover { background: var(--bg-tertiary); }
     .time { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
     td.col-usage, td.col-latency { white-space: normal; }
     .col-usage .metric, .col-latency .metric { vertical-align: middle; }
@@ -181,7 +185,7 @@
         margin-left: 7px; padding: 1px 7px;
         border-radius: 999px;
         font-size: 11px; font-weight: 500;
-        background: #EEF2F6; color: #475467;
+        background: var(--bg-tertiary); color: var(--text-secondary);
         vertical-align: middle;
     }
     .status { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; font-variant-numeric: tabular-nums; }
@@ -198,10 +202,13 @@
     .metric { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .metric svg { width: 14px; height: 14px; color: var(--text-muted); flex-shrink: 0; }
     .metric.rounds svg { color: var(--primary); }
-    .metric.tokens svg { color: #7C5CD6; }
-    .metric.tools svg { color: #D98219; }
-    .metric.latency svg { color: #12A05C; }
-    .metric.ttft svg { color: #E5484D; }
+    .metric.tokens svg { color: var(--accent-violet); }
+    .metric.tools svg { color: var(--warning); }
+    .metric.latency svg { color: var(--success); }
+    .metric.ttft svg { color: var(--danger); }
+    /* 深色模式：提亮分段控件文字、加强横向滚动提示的阴影对比 */
+    [data-theme="dark"] .segmented button.active { color: var(--text-primary); }
+    [data-theme="dark"] .table-wrap::after { box-shadow: -14px 0 18px -14px rgba(0, 0, 0, .7); }
 
     td.preview { white-space: normal; overflow: hidden; vertical-align: top; }
     .empty-cell { color: var(--text-muted); }
@@ -477,11 +484,14 @@
             </select>
             <datalist id="modelOptions"></datalist>
             <datalist id="clientOptions"></datalist>
-            <div class="field">
+            <div class="field" id="searchField">
                 <label class="sr-only" for="searchInput">检索内容</label>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.2-3.2"></path></svg>
                 <input type="text" id="searchInput" class="has-counter" placeholder="请输入关键词" maxlength="128">
-                <span class="counter" id="searchCounter">0/128</span>
+                <button type="button" class="input-clear" id="searchClear" hidden aria-label="清空检索内容">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"></path></svg>
+                </button>
+                <span class="counter" id="searchCounter" aria-hidden="true">0/128</span>
             </div>
             <span class="search-hint" id="searchHint" hidden>关键词少于 3 个字符会触发全表扫描，可能较慢</span>
             <select id="rangePreset" class="range-preset" aria-label="快速时间范围">
@@ -491,9 +501,9 @@
                 <option value="7d">最近 7 天</option>
                 <option value="custom">自定义…</option>
             </select>
-            <button class="btn-primary" id="refreshBtn">
+            <button class="btn-primary" id="refreshBtn" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><path d="M21 3v6h-6"></path></svg>
-                刷新
+                查询
             </button>
         </div>
         <details class="advanced-filters" id="advancedFilters">

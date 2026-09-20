@@ -38,6 +38,11 @@ const COUNT_CAP: i64 = 10_000;
 const DISTINCT_CAP: i64 = 10_000;
 const PAGE_SIZE_MAX: i64 = 200;
 const TOP_LIMIT_MAX: i64 = 50;
+/// 时延分位统计使用固定宽度直方图近似：50ms 一桶，超过 60s 归入末桶。
+const LATENCY_BUCKET_MS: i64 = 50;
+const LATENCY_BUCKET_CAP_MS: i64 = 60_000;
+const LATENCY_COL: &str = "LatencyMs";
+const TTFT_COL: &str = "TtftMs";
 const ERRORS_LIMIT_MAX: i64 = 100;
 const CACHE_TTL: Duration = Duration::from_secs(15);
 const CACHE_MAX_ENTRIES: usize = 256;
@@ -95,6 +100,11 @@ struct Metrics {
     prompt_tokens: i64,
     completion_tokens: i64,
     total_tokens: i64,
+    latency_sum: f64,
+    latency_count: i64,
+    latency_max: f64,
+    ttft_sum: f64,
+    ttft_count: i64,
 }
 
 impl Metrics {
@@ -105,6 +115,19 @@ impl Metrics {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.total_tokens += other.total_tokens;
+        self.latency_sum += other.latency_sum;
+        self.latency_count += other.latency_count;
+        self.latency_max = self.latency_max.max(other.latency_max);
+        self.ttft_sum += other.ttft_sum;
+        self.ttft_count += other.ttft_count;
+    }
+
+    fn avg_latency(&self) -> Option<f64> {
+        (self.latency_count > 0).then(|| self.latency_sum / self.latency_count as f64)
+    }
+
+    fn avg_ttft(&self) -> Option<f64> {
+        (self.ttft_count > 0).then(|| self.ttft_sum / self.ttft_count as f64)
     }
 }
 
@@ -269,13 +292,19 @@ const SQL_ERRORS: &str = "COALESCE(SUM(CASE WHEN Status >= 400 THEN 1 ELSE 0 END
 const SQL_PROMPT: &str = "COALESCE(SUM(COALESCE(PromptTokens,0)),0)";
 const SQL_COMPLETION: &str = "COALESCE(SUM(COALESCE(CompletionTokens,0)),0)";
 const SQL_TOTAL: &str = "COALESCE(SUM(COALESCE(TotalTokens,0)),0)";
+const SQL_LATENCY_SUM: &str = "COALESCE(SUM(LatencyMs),0) AS latencySum";
+const SQL_LATENCY_COUNT: &str = "COUNT(LatencyMs) AS latencyCount";
+const SQL_LATENCY_MAX: &str = "COALESCE(MAX(LatencyMs),0) AS latencyMax";
+const SQL_TTFT_SUM: &str = "COALESCE(SUM(TtftMs),0) AS ttftSum";
+const SQL_TTFT_COUNT: &str = "COUNT(TtftMs) AS ttftCount";
 
 fn summary_sql(where_sql: &str) -> String {
     format!(
         "SELECT COUNT(*) AS requests, {SQL_SUCCESS} AS success, {SQL_ERRORS} AS errors, \
          {SQL_PROMPT} AS promptTokens, {SQL_COMPLETION} AS completionTokens, \
          {SQL_TOTAL} AS totalTokens, COUNT(DISTINCT Model) AS models, \
-         COUNT(DISTINCT IP) AS ips FROM records{where_sql}"
+         COUNT(DISTINCT IP) AS ips, {SQL_LATENCY_SUM}, {SQL_LATENCY_COUNT}, \
+         {SQL_LATENCY_MAX}, {SQL_TTFT_SUM}, {SQL_TTFT_COUNT} FROM records{where_sql}"
     )
 }
 
@@ -283,7 +312,8 @@ fn trend_sql(interval: &str, where_sql: &str) -> String {
     format!(
         "SELECT {} AS label, {SQL_SUCCESS} AS success, {SQL_ERRORS} AS errors, \
          {SQL_PROMPT} AS promptTokens, {SQL_COMPLETION} AS completionTokens, \
-         {SQL_TOTAL} AS totalTokens FROM records{where_sql} GROUP BY 1 ORDER BY 1 ASC",
+         {SQL_TOTAL} AS totalTokens, {SQL_LATENCY_SUM}, {SQL_LATENCY_COUNT}, \
+         {SQL_TTFT_SUM}, {SQL_TTFT_COUNT} FROM records{where_sql} GROUP BY 1 ORDER BY 1 ASC",
         bucket_expr(interval)
     )
 }
@@ -292,8 +322,21 @@ fn dims_sql(where_sql: &str, expr: &str, cap: usize) -> String {
     format!(
         "SELECT {expr} AS name, COUNT(*) AS requests, {SQL_SUCCESS} AS success, \
          {SQL_ERRORS} AS errors, {SQL_PROMPT} AS promptTokens, \
-         {SQL_COMPLETION} AS completionTokens, {SQL_TOTAL} AS totalTokens \
+         {SQL_COMPLETION} AS completionTokens, {SQL_TOTAL} AS totalTokens, \
+         {SQL_LATENCY_SUM}, {SQL_LATENCY_COUNT}, {SQL_LATENCY_MAX}, \
+         {SQL_TTFT_SUM}, {SQL_TTFT_COUNT} \
          FROM records{where_sql} GROUP BY 1 LIMIT {cap}"
+    )
+}
+
+/// 时延直方图（固定宽度分桶）用于分位近似；`column` 仅取白名单常量。
+fn latency_hist_sql(where_sql: &str, column: &str) -> String {
+    format!(
+        "SELECT CAST(MIN(COALESCE({column},0), {cap}) / {width} AS INTEGER) AS bucket, \
+         COUNT(*) AS c FROM records{where_sql} AND {column} IS NOT NULL \
+         GROUP BY bucket ORDER BY bucket",
+        cap = LATENCY_BUCKET_CAP_MS,
+        width = LATENCY_BUCKET_MS
     )
 }
 
@@ -517,6 +560,13 @@ fn col_text(row: &SqliteRow, name: &str) -> Option<String> {
     row.try_get::<Option<String>, _>(name).ok().flatten()
 }
 
+fn col_f64(row: &SqliteRow, name: &str) -> f64 {
+    row.try_get::<Option<f64>, _>(name)
+        .ok()
+        .flatten()
+        .unwrap_or(0.0)
+}
+
 fn metrics_from_row(row: &SqliteRow) -> Metrics {
     Metrics {
         requests: col_i64(row, "requests"),
@@ -525,6 +575,11 @@ fn metrics_from_row(row: &SqliteRow) -> Metrics {
         prompt_tokens: col_i64(row, "promptTokens"),
         completion_tokens: col_i64(row, "completionTokens"),
         total_tokens: col_i64(row, "totalTokens"),
+        latency_sum: col_f64(row, "latencySum"),
+        latency_count: col_i64(row, "latencyCount"),
+        latency_max: col_f64(row, "latencyMax"),
+        ttft_sum: col_f64(row, "ttftSum"),
+        ttft_count: col_i64(row, "ttftCount"),
     }
 }
 
@@ -564,6 +619,38 @@ fn merge_error_maps(maps: Vec<HashMap<DbErrorKey, i64>>) -> HashMap<DbErrorKey, 
         }
     }
     out
+}
+
+/// 合并各分片的时延直方图（桶 → 计数求和），按桶升序返回。
+fn merge_histograms(rows_per_shard: &[Vec<SqliteRow>]) -> Vec<(i64, i64)> {
+    let mut map: HashMap<i64, i64> = HashMap::new();
+    for rows in rows_per_shard {
+        for row in rows {
+            *map.entry(col_i64(row, "bucket")).or_insert(0) += col_i64(row, "c");
+        }
+    }
+    let mut buckets: Vec<(i64, i64)> = map.into_iter().collect();
+    buckets.sort_by_key(|entry| entry.0);
+    buckets
+}
+
+/// 由累积直方图求分位值，返回该分位所在桶的上界（毫秒）。
+fn percentile_ms(buckets: &[(i64, i64)], total: i64, p: f64) -> Option<f64> {
+    if total <= 0 || buckets.is_empty() {
+        return None;
+    }
+    let rank = ((p * total as f64).ceil() as i64).max(1);
+    let mut acc = 0i64;
+    for (bucket, count) in buckets {
+        acc += count;
+        if acc >= rank {
+            let upper = (bucket + 1).saturating_mul(LATENCY_BUCKET_MS);
+            return Some(upper.min(LATENCY_BUCKET_CAP_MS + LATENCY_BUCKET_MS) as f64);
+        }
+    }
+    buckets
+        .last()
+        .map(|(bucket, _)| ((bucket + 1).saturating_mul(LATENCY_BUCKET_MS)) as f64)
 }
 
 fn normalize_opt(value: Option<String>) -> Option<String> {
@@ -790,6 +877,8 @@ async fn build_analysis(
                 "promptTokens": m.prompt_tokens,
                 "completionTokens": m.completion_tokens,
                 "totalTokens": m.total_tokens,
+                "avgLatencyMs": m.avg_latency(),
+                "avgTtftMs": m.avg_ttft(),
             })
         })
         .collect();
@@ -804,9 +893,31 @@ async fn build_analysis(
                 "promptTokens": m.prompt_tokens,
                 "completionTokens": m.completion_tokens,
                 "totalTokens": m.total_tokens,
+                "avgLatencyMs": m.avg_latency(),
             })
         })
         .collect();
+
+    // 时延分位采用固定宽度直方图合并后近似；均值/最大来自精确聚合，无额外扫描放大。
+    let latency_hist =
+        fetch_all_shards(&shards, &latency_hist_sql(&where_sql, LATENCY_COL), &binds)
+            .await
+            .map_err(internal)?;
+    let latency_buckets = merge_histograms(&latency_hist);
+    let ttft_hist = fetch_all_shards(&shards, &latency_hist_sql(&where_sql, TTFT_COL), &binds)
+        .await
+        .map_err(internal)?;
+    let ttft_buckets = merge_histograms(&ttft_hist);
+
+    // 日志独有的 STREAM_INTERRUPTED：SSE 已提交 200，永不进入 DB Status>=400，
+    // 因此只把它并入错误总数，避免与日志中的 HTTP 错误（DB 已计数）重复。
+    let log_dir = std::path::PathBuf::from(crate::logging::DEFAULT_LOG_DIR);
+    let log_scan =
+        tokio::task::spawn_blocking(move || scan_error_logs(&log_dir, Some(from), Some(to), 1))
+            .await
+            .map_err(internal)?;
+    let db_errors = summary.metrics.errors;
+    let log_only_errors = log_scan.stream_interrupted;
 
     Ok(json!({
         "from": from,
@@ -818,12 +929,23 @@ async fn build_analysis(
         "summary": {
             "requests": summary.metrics.requests,
             "success": summary.metrics.success,
-            "errors": summary.metrics.errors,
+            "errors": db_errors + log_only_errors,
+            "dbErrors": db_errors,
+            "logOnlyErrors": log_only_errors,
             "promptTokens": summary.metrics.prompt_tokens,
             "completionTokens": summary.metrics.completion_tokens,
             "totalTokens": summary.metrics.total_tokens,
             "models": summary.models,
             "ips": summary.ips,
+            "latency": {
+                "avgMs": summary.metrics.avg_latency(),
+                "maxMs": (summary.metrics.latency_count > 0).then_some(summary.metrics.latency_max),
+                "p50Ms": percentile_ms(&latency_buckets, summary.metrics.latency_count, 0.50),
+                "p95Ms": percentile_ms(&latency_buckets, summary.metrics.latency_count, 0.95),
+                "p99Ms": percentile_ms(&latency_buckets, summary.metrics.latency_count, 0.99),
+                "avgTtftMs": summary.metrics.avg_ttft(),
+                "p95TtftMs": percentile_ms(&ttft_buckets, summary.metrics.ttft_count, 0.95),
+            },
         },
         "trend": trend_json,
         "dimensions": {
@@ -997,6 +1119,7 @@ struct LogGroup {
 struct LogScan {
     groups: Vec<LogGroup>,
     unparsed: i64,
+    stream_interrupted: i64,
     files: Vec<String>,
     warnings: Vec<String>,
     total: i64,
@@ -1024,6 +1147,7 @@ fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize)
 
     let mut counts: HashMap<LogErrorKey, i64> = HashMap::new();
     let mut unparsed: i64 = 0;
+    let mut stream_interrupted: i64 = 0;
     let mut total_lines: i64 = 0;
     let mut read_files: Vec<String> = Vec::new();
     let range_active = from.is_some() || to.is_some();
@@ -1076,6 +1200,9 @@ fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize)
                 normalize_opt(entry.backend),
                 normalize_opt(entry.error),
             );
+            if key.0 == "stream_interrupted" {
+                stream_interrupted += 1;
+            }
             *counts.entry(key).or_insert(0) += 1;
         }
     }
@@ -1097,6 +1224,7 @@ fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize)
     LogScan {
         groups,
         unparsed,
+        stream_interrupted,
         files: read_files,
         warnings,
         total,
@@ -1155,6 +1283,10 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                latency_sum: 100.0,
+                latency_count: 2,
+                latency_max: 500.0,
+                ..Default::default()
             },
             models: 2,
             ips: 3,
@@ -1167,6 +1299,10 @@ mod tests {
                 prompt_tokens: 400,
                 completion_tokens: 100,
                 total_tokens: 500,
+                latency_sum: 300.0,
+                latency_count: 4,
+                latency_max: 200.0,
+                ..Default::default()
             },
             models: 4,
             ips: 5,
@@ -1178,11 +1314,27 @@ mod tests {
         assert_eq!(merged.metrics.prompt_tokens, 500);
         assert_eq!(merged.metrics.completion_tokens, 150);
         assert_eq!(merged.metrics.total_tokens, 650);
+        // 时延：和与计数相加，最大值取 max 而非相加。
+        assert_eq!(merged.metrics.latency_sum, 400.0);
+        assert_eq!(merged.metrics.latency_count, 6);
+        assert_eq!(merged.metrics.latency_max, 500.0);
+        assert_eq!(merged.metrics.avg_latency(), Some(400.0 / 6.0));
         // DISTINCT 计数是各分片之和（上界语义）。
         assert_eq!(merged.models, 6);
         assert_eq!(merged.ips, 8);
         // 若误用平均，success 会是 16；确认不是平均值。
         assert_ne!(merged.metrics.success, (5 + 27) / 2);
+    }
+
+    #[test]
+    fn latency_percentile_uses_bucket_upper_bound() {
+        let buckets = vec![(0i64, 99i64), (10i64, 1i64)];
+        assert_eq!(percentile_ms(&buckets, 100, 0.50), Some(50.0));
+        assert_eq!(percentile_ms(&buckets, 100, 0.95), Some(50.0));
+        assert_eq!(percentile_ms(&buckets, 100, 0.99), Some(50.0));
+        assert_eq!(percentile_ms(&buckets, 100, 1.0), Some(550.0));
+        assert_eq!(percentile_ms(&buckets, 0, 0.95), None);
+        assert_eq!(percentile_ms(&[], 10, 0.95), None);
     }
 
     #[test]
@@ -1307,7 +1459,8 @@ mod tests {
             "CREATE TABLE records (\
                 id INTEGER PRIMARY KEY, TimeMs INTEGER, Type TEXT, Model TEXT, Status INTEGER, \
                 Backend TEXT, IP TEXT, ClientName TEXT, UserAgent TEXT, ApiKey TEXT, \
-                PromptTokens INTEGER, CompletionTokens INTEGER, TotalTokens INTEGER, Error TEXT)",
+                PromptTokens INTEGER, CompletionTokens INTEGER, TotalTokens INTEGER, Error TEXT, \
+                LatencyMs REAL, TtftMs REAL)",
         )
         .execute(&pool)
         .await
@@ -1320,9 +1473,9 @@ mod tests {
         let (path, pool) = temp_db("agg").await;
         sqlx::query(
             "INSERT INTO records (id, TimeMs, Type, Model, Status, Backend, IP, ClientName, \
-             UserAgent, ApiKey, PromptTokens, CompletionTokens, TotalTokens, Error) \
-             VALUES (1, 3600000, 'chat', 'm1', 200, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 10, 5, 15, NULL), \
-                    (2, 7200000, 'chat', 'm1', 500, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 20, 8, 28, 'boom')",
+             UserAgent, ApiKey, PromptTokens, CompletionTokens, TotalTokens, Error, LatencyMs, TtftMs) \
+             VALUES (1, 3600000, 'chat', 'm1', 200, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 10, 5, 15, NULL, 120.0, 40.0), \
+                    (2, 7200000, 'chat', 'm1', 500, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 20, 8, 28, 'boom', 800.0, 30.0)",
         )
         .execute(&pool)
         .await
@@ -1348,8 +1501,20 @@ mod tests {
         assert_eq!(merged.metrics.success, 1);
         assert_eq!(merged.metrics.errors, 1);
         assert_eq!(merged.metrics.total_tokens, 43);
+        assert_eq!(merged.metrics.latency_count, 2);
+        assert_eq!(merged.metrics.latency_sum, 920.0);
+        assert_eq!(merged.metrics.latency_max, 800.0);
+        assert_eq!(merged.metrics.avg_latency(), Some(460.0));
         assert_eq!(merged.models, 1);
         assert_eq!(merged.ips, 1);
+
+        let hist_rows =
+            fetch_all_shards(&shards, &latency_hist_sql(" WHERE 1=1", LATENCY_COL), &[])
+                .await
+                .unwrap();
+        let buckets = merge_histograms(&hist_rows);
+        assert_eq!(buckets.iter().map(|(_, count)| count).sum::<i64>(), 2);
+        assert_eq!(percentile_ms(&buckets, 2, 0.99), Some(850.0));
 
         let dim_rows = fetch_sliced(&shards, &params, from, to, |w| {
             dims_sql(w, DEFAULT_DIM_EXPR, GROUP_CAP + 1)

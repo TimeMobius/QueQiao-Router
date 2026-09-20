@@ -141,13 +141,22 @@
         } else {
             $("searchInput").removeAttribute("list");
         }
+        $("searchField").classList.toggle("has-datalist", scope === "model" || scope === "client");
         updateShortHint();
+        syncSearchClear();
     }
 
     function updateShortHint() {
         var h = $("searchHint");
         var len = $("searchInput").value.trim().length;
         h.hidden = state.errors || $("scopeSelect").value !== "q" || len === 0 || len >= 3;
+    }
+
+    // 清除按钮仅在有内容时出现；点击只清空并聚焦，检索仍由回车/查询按钮显式触发。
+    function syncSearchClear() {
+        var clear = $("searchClear");
+        if (!clear) return;
+        clear.hidden = state.errors || $("searchInput").value.length === 0;
     }
 
     function showError(msg) {
@@ -276,6 +285,7 @@
         $("rangePreset").value = "";
         $("advancedFilters").open = false;
         updateScopeUi();
+        syncSearchClear();
         load(true);
     }
 
@@ -587,6 +597,7 @@
         });
         applyView();
         updateShortHint();
+        syncSearchClear();
         if (doLoad) {
             if (errors) { loadErrorLog(true); } else { load(true); }
         }
@@ -635,18 +646,23 @@
         if (state.errors) { loadErrorLog(true); } else { load(true); }
     });
 
-    var searchTimer = null;
     $("searchInput").addEventListener("input", function () {
         $("searchCounter").textContent = this.value.length + "/" + this.maxLength;
         updateShortHint();
-        if (state.errors) return;
-        if (searchTimer) clearTimeout(searchTimer);
-        searchTimer = setTimeout(function () { searchTimer = null; load(true); }, 300);
+        syncSearchClear();
     });
     $("searchInput").addEventListener("keydown", function (e) {
         if (e.key !== "Enter") return;
-        if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }
+        // 中文输入法组合态下回车用于选词，不应触发检索。
+        if (e.isComposing || e.keyCode === 229) return;
         if (!state.errors) load(true);
+    });
+    $("searchClear").addEventListener("click", function () {
+        $("searchInput").value = "";
+        $("searchCounter").textContent = "0/" + $("searchInput").maxLength;
+        updateShortHint();
+        syncSearchClear();
+        $("searchInput").focus();
     });
     $("scopeSelect").addEventListener("change", updateScopeUi);
 
