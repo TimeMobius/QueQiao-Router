@@ -489,7 +489,7 @@ pub async fn list_records(
         return list_records_active(&app_state, &params).await;
     }
 
-    let active = app_state.db_pool.read().await.clone();
+    let active = app_state.query_pool.read().await.clone();
     let archives: Vec<ShardInput> = candidates
         .iter()
         .map(|shard| ShardInput {
@@ -521,7 +521,7 @@ async fn list_records_active(
     app_state: &Arc<AppState>,
     params: &ListParams,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let pool: tokio::sync::RwLockReadGuard<'_, SqlitePool> = app_state.db_pool.read().await;
+    let pool: tokio::sync::RwLockReadGuard<'_, SqlitePool> = app_state.query_pool.read().await;
 
     let (where_sql, base_binds) = build_filters(params);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
@@ -656,7 +656,7 @@ pub async fn record_detail(
     if let Some(shard) = params.shard.as_deref() {
         let (pool, shard_label) = if shard == ACTIVE_SHARD {
             (
-                app_state.db_pool.read().await.clone(),
+                app_state.query_pool.read().await.clone(),
                 ACTIVE_SHARD.to_string(),
             )
         } else if let Some(archive) = app_state.archive_registry.get(shard).await {
@@ -679,7 +679,7 @@ pub async fn record_detail(
     }
 
     // 未指定分片：先查 active，命中则保持既有行为（不附加 shard 字段）。
-    let active = app_state.db_pool.read().await.clone();
+    let active = app_state.query_pool.read().await.clone();
     if let Some(row) = fetch_detail_row(&active, id).await? {
         let mut body = build_detail_body(&row, &active, id).await;
         if include_body {
@@ -729,7 +729,7 @@ pub async fn record_detail(
 pub async fn record_facets(
     State(app_state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let pool = app_state.db_pool.read().await;
+    let pool = app_state.query_pool.read().await;
 
     async fn distinct_text(pool: &SqlitePool, column: &str) -> Vec<String> {
         let sql = format!(

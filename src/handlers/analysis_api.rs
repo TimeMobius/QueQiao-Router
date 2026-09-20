@@ -307,6 +307,13 @@ fn errors_db_sql(where_sql: &str) -> String {
     )
 }
 
+fn distinct_sql(where_sql: &str, column: &str) -> String {
+    format!(
+        "SELECT DISTINCT {column} AS v FROM records{where_sql} \
+         AND {column} IS NOT NULL AND {column} <> '' LIMIT {DISTINCT_CAP}"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // 分片查询（并发受限）
 // ---------------------------------------------------------------------------
@@ -321,41 +328,120 @@ async fn fetch(
         .await
 }
 
+/// 等待一组已 spawn 的查询任务并收集结果。
+///
+/// 必须用 `tokio::spawn`：`join_all` 下 sqlx 的 SQLite 查询会在同一任务内串行执行
+/// （实测单请求 CPU ≈100%），spawn 后各查询才会落到独立的连接执行线程上。
+async fn join_queries(
+    tasks: Vec<tokio::task::JoinHandle<Result<Vec<SqliteRow>, sqlx::Error>>>,
+) -> Result<Vec<Vec<SqliteRow>>, sqlx::Error> {
+    let mut out = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let rows = task
+            .await
+            .map_err(|e| sqlx::Error::Protocol(format!("query task join failed: {e}")))??;
+        out.push(rows);
+    }
+    Ok(out)
+}
+
+/// 不切片的整段查询：用于单行汇总或需要跨分片并集的查询。
+///
+/// 这类查询切片不减少总扫描量，反而成倍放大查询开销，因此只在趋势/维度这类
+/// 大结果集上切片。
 async fn fetch_all_shards(
     shards: &[ShardInput],
     sql: &str,
     binds: &[records_api::Bind],
 ) -> Result<Vec<Vec<SqliteRow>>, sqlx::Error> {
-    let futs = shards.iter().map(|s| {
-        let pool = s.pool.clone();
-        let sql = sql.to_string();
-        let binds = binds.to_vec();
-        async move {
-            let _permit = SHARD_SEM.acquire().await;
-            fetch(&pool, &sql, &binds).await
-        }
-    });
-    let results = futures::future::join_all(futs).await;
-    let mut out = Vec::with_capacity(results.len());
-    for r in results {
-        out.push(r?);
+    let tasks = shards
+        .iter()
+        .map(|s| {
+            let pool = s.pool.clone();
+            let sql = sql.to_string();
+            let binds = binds.to_vec();
+            tokio::spawn(async move {
+                let _permit = SHARD_SEM.acquire().await;
+                fetch(&pool, &sql, &binds).await
+            })
+        })
+        .collect();
+    join_queries(tasks).await
+}
+
+/// 将 `[from, to]` 切成至多 4 段连续、无缝、互不重叠的闭区间。
+///
+/// 闭区间保证每行恰好落入一段（`start_{i+1} == end_i + 1`），因此分段查询的
+/// 结果与整段查询完全等价，可直接交给既有的可加合并逻辑。
+fn range_slices(from: i64, to: i64) -> Vec<(i64, i64)> {
+    let span = to.saturating_sub(from);
+    if to <= from || span < DAY_MS {
+        return vec![(from, to)];
     }
-    Ok(out)
+    let splits = (span / DAY_MS + i64::from(span % DAY_MS != 0)).clamp(1, 4);
+    let step = span / splits;
+    if splits <= 1 || step <= 0 {
+        return vec![(from, to)];
+    }
+    let mut out = Vec::with_capacity(splits as usize);
+    for i in 0..splits {
+        let start = if i == 0 {
+            from
+        } else {
+            from.saturating_add(i.saturating_mul(step))
+        };
+        let end = if i == splits - 1 {
+            to
+        } else {
+            from.saturating_add((i + 1).saturating_mul(step)) - 1
+        };
+        out.push((start, end));
+    }
+    out
+}
+
+/// 对每个 (分片, 时间片) 组合并发执行一次聚合查询。
+///
+/// 分片内按时间切片并行扫描，每个组合产出一个 `Vec<SqliteRow>`；既有的
+/// `merge_summaries`/`merge_group_map`/`merge_error_maps` 对全部内层向量求和，
+/// 因此分片与切片可统一处理，无需改动合并逻辑。
+async fn fetch_sliced<F>(
+    shards: &[ShardInput],
+    p: &AnalysisParams,
+    from: i64,
+    to: i64,
+    make_sql: F,
+) -> Result<Vec<Vec<SqliteRow>>, sqlx::Error>
+where
+    F: Fn(&str) -> String,
+{
+    let slices = range_slices(from, to);
+    let mut tasks = Vec::with_capacity(shards.len().saturating_mul(slices.len()));
+    for shard in shards {
+        for &(slice_from, slice_to) in &slices {
+            let pool = shard.pool.clone();
+            let (where_sql, binds) =
+                records_api::build_filters(&to_list_params(p, slice_from, slice_to));
+            let sql = make_sql(&where_sql);
+            tasks.push(tokio::spawn(async move {
+                let _permit = SHARD_SEM.acquire().await;
+                fetch(&pool, &sql, &binds).await
+            }));
+        }
+    }
+    join_queries(tasks).await
 }
 
 /// 跨分片精确基数：各分片取 DISTINCT 值后在 Rust 侧并集去重，避免
-/// 「各分片 COUNT(DISTINCT) 相加」在跨月时重复计数。`column` 仅接受白名单字面量。
+/// 「各分片 COUNT(DISTINCT) 相加」重复计数。`column` 仅接受白名单字面量。
+/// 不切片：切片的 LIMIT 语义会破坏去重并放大开销。
 async fn distinct_count_across_shards(
     shards: &[ShardInput],
     where_sql: &str,
     binds: &[records_api::Bind],
     column: &str,
 ) -> Result<(usize, bool), sqlx::Error> {
-    let sql = format!(
-        "SELECT DISTINCT {column} AS v FROM records{where_sql} \
-         AND {column} IS NOT NULL AND {column} <> '' LIMIT {DISTINCT_CAP}"
-    );
-    let rows = fetch_all_shards(shards, &sql, binds).await?;
+    let rows = fetch_all_shards(shards, &distinct_sql(where_sql, column), binds).await?;
     let mut set: HashSet<String> = HashSet::new();
     for shard_rows in &rows {
         for row in shard_rows {
@@ -373,7 +459,7 @@ async fn collect_shards(app_state: &Arc<AppState>, from: i64, to: i64) -> Vec<Sh
         .archive_registry
         .candidates(Some(from), Some(to))
         .await;
-    let active = app_state.db_pool.read().await.clone();
+    let active = app_state.query_pool.read().await.clone();
     let mut shards = Vec::with_capacity(candidates.len() + 1);
     shards.push(ShardInput {
         id: ACTIVE_SHARD.to_string(),
@@ -580,9 +666,8 @@ async fn build_analysis(
     }
     let shard_ids: Vec<String> = shards.iter().map(|s| s.id.clone()).collect();
 
-    let (where_sql, binds) = records_api::build_filters(&to_list_params(p, from, to));
-
     // 汇总
+    let (where_sql, binds) = records_api::build_filters(&to_list_params(p, from, to));
     let summary_rows = fetch_all_shards(&shards, &summary_sql(&where_sql), &binds)
         .await
         .map_err(internal)?;
@@ -609,7 +694,7 @@ async fn build_analysis(
     }
 
     // 趋势
-    let trend_rows = fetch_all_shards(&shards, &trend_sql(&interval, &where_sql), &binds)
+    let trend_rows = fetch_sliced(&shards, p, from, to, |w| trend_sql(&interval, w))
         .await
         .map_err(internal)?;
     let per_shard_trend: Vec<Vec<(String, Metrics)>> = trend_rows
@@ -634,11 +719,9 @@ async fn build_analysis(
     }
 
     // 维度
-    let dim_rows = fetch_all_shards(
-        &shards,
-        &dims_sql(&where_sql, dim_expr, GROUP_CAP + 1),
-        &binds,
-    )
+    let dim_rows = fetch_sliced(&shards, p, from, to, |w| {
+        dims_sql(w, dim_expr, GROUP_CAP + 1)
+    })
     .await
     .map_err(internal)?;
     let mut dim_capped = false;
@@ -803,8 +886,7 @@ async fn build_errors_db(
     }
     let shard_ids: Vec<String> = shards.iter().map(|s| s.id.clone()).collect();
 
-    let (where_sql, binds) = records_api::build_filters(&to_list_params(p, from, to));
-    let rows_per_shard = fetch_all_shards(&shards, &errors_db_sql(&where_sql), &binds)
+    let rows_per_shard = fetch_sliced(&shards, p, from, to, errors_db_sql)
         .await
         .map_err(internal)?;
 
@@ -1179,6 +1261,33 @@ mod tests {
         assert_eq!(bucket_expr("bogus"), bucket_expr("day"));
     }
 
+    #[test]
+    fn range_slices_cover_endpoints_contiguously_without_overlap() {
+        let from = 1_000_000_i64;
+        let to = from + 30 * DAY_MS;
+        let slices = range_slices(from, to);
+        assert_eq!(slices.len(), 4);
+        assert_eq!(slices.first().unwrap().0, from);
+        assert_eq!(slices.last().unwrap().1, to);
+        for pair in slices.windows(2) {
+            assert_eq!(pair[1].0, pair[0].1 + 1, "slices must be gap-free");
+        }
+        for &(start, end) in &slices {
+            assert!(start <= end, "slice must be non-empty");
+        }
+        let covered: i64 = slices.iter().map(|(s, e)| e - s + 1).sum();
+        assert_eq!(covered, to - from + 1);
+    }
+
+    #[test]
+    fn range_slices_collapse_short_and_reversed_ranges() {
+        assert_eq!(range_slices(0, HOUR_MS), vec![(0, HOUR_MS)]);
+        assert_eq!(range_slices(0, DAY_MS - 1), vec![(0, DAY_MS - 1)]);
+        assert_eq!(range_slices(5, 5), vec![(5, 5)]);
+        assert_eq!(range_slices(10, 5), vec![(10, 5)]);
+        assert_eq!(range_slices(0, 2 * DAY_MS).len(), 2);
+    }
+
     async fn temp_db(tag: &str) -> (std::path::PathBuf, SqlitePool) {
         let nanos = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1223,9 +1332,10 @@ mod tests {
             id: ACTIVE_SHARD.to_string(),
             pool: pool.clone(),
         }];
-        let (where_sql, binds) = records_api::build_filters(&records_api::ListParams::default());
+        let params = AnalysisParams::default();
+        let (from, to) = (0_i64, 10_000_000_i64);
 
-        let summary_rows = fetch_all_shards(&shards, &summary_sql(&where_sql), &binds)
+        let summary_rows = fetch_sliced(&shards, &params, from, to, summary_sql)
             .await
             .unwrap();
         let merged = merge_summaries(
@@ -1241,18 +1351,16 @@ mod tests {
         assert_eq!(merged.models, 1);
         assert_eq!(merged.ips, 1);
 
-        let dim_rows = fetch_all_shards(
-            &shards,
-            &dims_sql(&where_sql, DEFAULT_DIM_EXPR, GROUP_CAP + 1),
-            &binds,
-        )
+        let dim_rows = fetch_sliced(&shards, &params, from, to, |w| {
+            dims_sql(w, DEFAULT_DIM_EXPR, GROUP_CAP + 1)
+        })
         .await
         .unwrap();
         let dim = metrics_from_row(&dim_rows[0][0]);
         assert_eq!(dim.requests, 2);
         assert_eq!(dim.total_tokens, 43);
 
-        let err_rows = fetch_all_shards(&shards, &errors_db_sql(&where_sql), &binds)
+        let err_rows = fetch_sliced(&shards, &params, from, to, errors_db_sql)
             .await
             .unwrap();
         let row = &err_rows[0][0];
@@ -1261,7 +1369,7 @@ mod tests {
         assert_eq!(col_text(row, "error").as_deref(), Some("boom"));
         assert_eq!(col_i64(row, "c"), 1);
 
-        let trend_rows = fetch_all_shards(&shards, &trend_sql("hour", &where_sql), &binds)
+        let trend_rows = fetch_sliced(&shards, &params, from, to, |w| trend_sql("hour", w))
             .await
             .unwrap();
         let trend_total: i64 = trend_rows[0]

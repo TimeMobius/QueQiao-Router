@@ -13,6 +13,9 @@ pub struct AppState {
     pub client_manager: Arc<ClientManager>,
     pub dispatcher_service: DispatcherService,
     pub db_pool: RwLock<SqlitePool>,
+    /// 仅供 dashboard 只读分析查询使用的独立连接池：与写池分离，避免大表聚合
+    /// 占满连接后饿死请求日志写入。
+    pub query_pool: RwLock<SqlitePool>,
     pub db_rotation_lock: Mutex<()>,
     pub models_cache: ModelsCache,
     /// 跨月归档分片注册表（只读），由 active 数据库路径解析出归档目录。
@@ -28,6 +31,7 @@ impl AppState {
         config_manager: Arc<ConfigManager>,
         client_manager: Arc<ClientManager>,
         db_pool: SqlitePool,
+        query_pool: SqlitePool,
     ) -> Self {
         let dispatcher_service =
             DispatcherService::new(config_manager.clone(), client_manager.clone());
@@ -40,6 +44,7 @@ impl AppState {
             client_manager,
             dispatcher_service,
             db_pool: RwLock::new(db_pool),
+            query_pool: RwLock::new(query_pool),
             db_rotation_lock: Mutex::new(()),
             models_cache: ModelsCache::new(),
             archive_registry,

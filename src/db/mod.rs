@@ -1,10 +1,11 @@
 use chrono::Local;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::config::types::Config;
@@ -360,6 +361,22 @@ pub(crate) fn resolve_db_path() -> std::path::PathBuf {
     std::path::PathBuf::from(url.strip_prefix("sqlite:").unwrap_or(&url))
 }
 
+/// 为 dashboard 只读分析查询开第二个连接池，与写池分离，避免大表聚合占满
+/// 写池连接后饿死请求日志写入。
+///
+/// 不做 `read_only(true)`：只读连接无法在 NFS 上恢复热日志（hot journal）。
+/// 也不设置 `journal_mode`：默认 `delete` 下读写提交互斥，写池与查询池各自独立。
+pub async fn init_query_pool() -> Result<SqlitePool, sqlx::Error> {
+    let path = resolve_db_path();
+    let path_str = path.to_string_lossy();
+    let options = SqliteConnectOptions::from_str(&path_str)?.create_if_missing(false);
+    SqlitePoolOptions::new()
+        .max_connections(16)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(options)
+        .await
+}
+
 /// 当前 record.db 中 MAX(TimeMs) 所属的本地月份；空表/无值返回 None。
 async fn current_data_yyyymm(app_state: &Arc<AppState>) -> Option<i32> {
     let pool = app_state.db_pool.read().await;
@@ -412,9 +429,12 @@ async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
 
     // 获取写锁以阻塞新的请求写入，安全完成轮转。
     let mut pool_guard = app_state.db_pool.write().await;
+    // 与写池同序获取查询池写锁；关闭会等待在途查询归还连接后优雅排空。
+    let mut query_guard = app_state.query_pool.write().await;
 
     // 关闭当前连接池以释放文件锁。
     pool_guard.close().await;
+    query_guard.close().await;
 
     match fs::rename(&db_path, &archive_path) {
         Ok(_) => info!("Database archived successfully."),
@@ -441,6 +461,16 @@ async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
                 "Failed to re-initialize database pool after rotation: {}",
                 e
             );
+        }
+    }
+
+    match init_query_pool().await {
+        Ok(new_query_pool) => {
+            *query_guard = new_query_pool;
+            info!("Query pool re-initialized successfully.");
+        }
+        Err(e) => {
+            error!("Failed to re-initialize query pool after rotation: {}", e);
         }
     }
 }
