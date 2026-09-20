@@ -1,7 +1,10 @@
 use crate::app_error::AppError;
 use crate::config::types::ClientConfig;
 use crate::db::records::log_non_streaming_request;
-use crate::handlers::stream_handler::extract_error_msg;
+use crate::handlers::stream_handler::{
+    extract_error_msg, outcome_to_status, OutcomeSignal, StreamOutcome,
+    STREAM_OUTCOME_UPSTREAM_ERROR,
+};
 use crate::handlers::utils::{log_stream_interruption, truncate_json};
 use crate::metrics::middleware::get_metrics_sender;
 use crate::metrics::prometheus::{TTFT, TTFT_10M_MAX, TTFT_1H_MAX, TTFT_1M_MAX};
@@ -49,6 +52,7 @@ async fn responses_stream_logger_task(
     start_time: Instant,
     endpoint: String,
     status: String,
+    outcome: StreamOutcome,
 ) {
     let mut final_response: Option<Value> = None;
     let mut _ttft_recorded = false;
@@ -95,6 +99,8 @@ async fn responses_stream_logger_task(
         }
     }
 
+    let has_final = final_response.is_some();
+    let upstream_error = outcome.get() == STREAM_OUTCOME_UPSTREAM_ERROR;
     let (completion_tokens, prompt_tokens) = final_response
         .as_ref()
         .and_then(|r| r.get("usage"))
@@ -111,70 +117,54 @@ async fn responses_stream_logger_task(
         })
         .unwrap_or((None, None));
 
-    // Log the final response (or a minimal fallback if truncated stream)
-    let log_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-    if let Some(ref final_resp) = final_response {
-        log_non_streaming_request(
-            &app_state,
-            &headers,
-            &payload,
-            &request_body,
-            final_resp,
-            client_ip,
-            crate::db::records::LogMeta {
-                latency_ms: Some(log_latency_ms),
-                ttft_ms: ttft_secs.map(|s| s * 1000.0),
-                status: status.parse().ok(),
-                backend: Some(backend.clone()),
-                endpoint: Some(endpoint.clone()),
-                ..Default::default()
-            },
-        )
-        .await;
-    } else {
-        // Truncated stream - build minimal fallback response
-        let fallback = json!({
-            "object": "response",
-            "output": [],
-            "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0
-            }
+    if has_final || upstream_error {
+        let (db_status, db_error) = outcome_to_status(outcome.get(), has_final);
+        let log_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let response_body = final_response.unwrap_or_else(|| {
+            json!({
+                "object": "response",
+                "output": [],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                }
+            })
         });
         log_non_streaming_request(
             &app_state,
             &headers,
             &payload,
             &request_body,
-            &fallback,
+            &response_body,
             client_ip,
             crate::db::records::LogMeta {
                 latency_ms: Some(log_latency_ms),
                 ttft_ms: ttft_secs.map(|s| s * 1000.0),
-                status: status.parse().ok(),
+                status: Some(db_status),
                 backend: Some(backend.clone()),
                 endpoint: Some(endpoint.clone()),
+                error: db_error,
                 ..Default::default()
             },
         )
         .await;
-    }
 
-    let total_elapsed = start_time.elapsed().as_secs_f64();
-    if let Some(sender) = get_metrics_sender() {
-        let event = MetricEvent {
-            endpoint,
-            status,
-            model: model.clone(),
-            backend: backend.clone(),
-            latency: total_elapsed,
-            is_success: true,
-            completion_tokens,
-            prompt_tokens,
-            elapsed: Some(total_elapsed),
-        };
-        let _ = sender.try_send(event);
+        let total_elapsed = start_time.elapsed().as_secs_f64();
+        if let Some(sender) = get_metrics_sender() {
+            let event = MetricEvent {
+                endpoint,
+                status,
+                model: model.clone(),
+                backend: backend.clone(),
+                latency: total_elapsed,
+                is_success: !upstream_error,
+                completion_tokens,
+                prompt_tokens,
+                elapsed: Some(total_elapsed),
+            };
+            let _ = sender.try_send(event);
+        }
     }
 }
 
@@ -232,6 +222,8 @@ pub async fn process_responses_streaming_response(
     let model_for_error = model_name.clone();
     let backend_for_error = backend_name.clone();
     let stream_start_time = Instant::now();
+    let outcome = StreamOutcome::new();
+    let outcome_for_logger = outcome.clone();
 
     // Spawn logger task
     tokio::spawn(async move {
@@ -247,12 +239,13 @@ pub async fn process_responses_streaming_response(
             stream_start_time,
             "/v1/responses".to_string(),
             "200".to_string(),
+            outcome_for_logger,
         )
         .await;
     });
 
     // SSE forwarding: preserve event type, forward data verbatim
-    let sse_stream = stream.eventsource().map(move |result| {
+    let sse_stream = OutcomeSignal::new(stream.eventsource(), outcome).map(move |result| {
         match result {
             Ok(event) => {
                 // Send data to logger channel (best-effort, ignore send errors)

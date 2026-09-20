@@ -26,7 +26,7 @@ use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -39,6 +39,86 @@ use tracing::{debug, error, Level};
 const STREAM_UPSTREAM_ERROR_SENTINEL: &str = "\u{0}__STREAM_UPSTREAM_ERROR__\u{0}";
 const DEBUG_RAW_BODY_TAIL_LIMIT: usize = 16 * 1024;
 type RawBodyTail = Arc<Mutex<Vec<u8>>>;
+
+/// 流式请求的最终结局。上游读取由下游驱动：客户端断开时整条上游流被 drop，
+/// 既无 `None` 也无 `Err`，结局停在 `RUNNING`，由 logger 判定为客户端中断。
+pub const STREAM_OUTCOME_RUNNING: u8 = 0;
+pub const STREAM_OUTCOME_COMPLETED: u8 = 1;
+pub const STREAM_OUTCOME_UPSTREAM_ERROR: u8 = 2;
+
+/// 跨任务共享的流结局标记：首个终态优先。
+#[derive(Clone, Default)]
+pub struct StreamOutcome(Arc<AtomicU8>);
+
+impl StreamOutcome {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(STREAM_OUTCOME_RUNNING)))
+    }
+
+    pub fn mark(&self, outcome: u8) {
+        let _ = self.0.compare_exchange(
+            STREAM_OUTCOME_RUNNING,
+            outcome,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn get(&self) -> u8 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// `Err` → 上游中断，`None` → 正常结束；被 drop（客户端断开）则不落任何结局。
+pub struct OutcomeSignal<S> {
+    inner: Pin<Box<S>>,
+    outcome: StreamOutcome,
+}
+
+impl<S> OutcomeSignal<S> {
+    pub fn new(inner: S, outcome: StreamOutcome) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            outcome,
+        }
+    }
+}
+
+impl<S, T, E> Stream for OutcomeSignal<S>
+where
+    S: Stream<Item = Result<T, E>>,
+{
+    type Item = Result<T, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Err(error))) => {
+                this.outcome.mark(STREAM_OUTCOME_UPSTREAM_ERROR);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.outcome.mark(STREAM_OUTCOME_COMPLETED);
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
+/// 结局 → 审计状态码：`200` 正常 / `499` 客户端提前断开 / `502` 上游 SSE 中断。
+pub fn outcome_to_status(outcome: u8, saw_terminal_event: bool) -> (i64, Option<String>) {
+    if outcome == STREAM_OUTCOME_UPSTREAM_ERROR {
+        (502, Some("upstream stream interrupted".to_string()))
+    } else if outcome == STREAM_OUTCOME_COMPLETED || saw_terminal_event {
+        (200, None)
+    } else {
+        (
+            499,
+            Some("client disconnected before stream completed".to_string()),
+        )
+    }
+}
 
 struct ToolCallAccumulator {
     index: u64,
@@ -152,6 +232,7 @@ async fn stream_logger_task(
     start_time: Instant,
     endpoint: String,
     status: String,
+    outcome: StreamOutcome,
 ) {
     let mut accumulator = StreamAccumulator::new();
     let mut last_chunk: Option<Value> = None;
@@ -271,7 +352,17 @@ async fn stream_logger_task(
         }
     }
 
-    if let Some(mut final_chunk) = last_chunk {
+    let upstream_error = outcome.get() == STREAM_OUTCOME_UPSTREAM_ERROR;
+    if last_chunk.is_some() || upstream_error {
+        let (db_status, db_error) = outcome_to_status(outcome.get(), false);
+        let mut final_chunk = last_chunk.unwrap_or_else(|| {
+            json!({
+                "object": "chat.completion",
+                "choices": [{ "index": 0 }],
+                "usage": null
+            })
+        });
+
         // If it's empty (e.g. only one chunk), fallback to first_chunk or mock
         if final_chunk.get("choices").is_none() {
             if let Some(first) = first_chunk {
@@ -321,42 +412,43 @@ async fn stream_logger_task(
             crate::db::records::LogMeta {
                 latency_ms: Some(log_latency_ms),
                 ttft_ms: ttft_secs.map(|s| s * 1000.0),
-                status: status.parse().ok(),
+                status: Some(db_status),
                 backend: Some(backend.clone()),
                 endpoint: Some(endpoint.clone()),
+                error: db_error,
                 ..Default::default()
             },
         )
         .await;
-    }
 
-    // 发送完整流式延迟指标
-    let total_elapsed = start_time.elapsed().as_secs_f64();
+        // 发送完整流式延迟指标
+        let total_elapsed = start_time.elapsed().as_secs_f64();
 
-    // 提取 usage 信息
-    let (completion_tokens, prompt_tokens) = captured_usage
-        .as_ref()
-        .map(|u| {
-            let comp = u.get("completion_tokens").and_then(|v| v.as_u64());
-            let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
-            (comp, prompt)
-        })
-        .unwrap_or((None, None));
+        // 提取 usage 信息
+        let (completion_tokens, prompt_tokens) = captured_usage
+            .as_ref()
+            .map(|u| {
+                let comp = u.get("completion_tokens").and_then(|v| v.as_u64());
+                let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
+                (comp, prompt)
+            })
+            .unwrap_or((None, None));
 
-    // 发送指标事件到 worker
-    if let Some(sender) = get_metrics_sender() {
-        let event = MetricEvent {
-            endpoint,
-            status,
-            model: model.clone(),
-            backend: backend.clone(),
-            latency: total_elapsed,
-            is_success: !stream_failed,
-            completion_tokens,
-            prompt_tokens,
-            elapsed: Some(total_elapsed),
-        };
-        let _ = sender.try_send(event);
+        // 发送指标事件到 worker
+        if let Some(sender) = get_metrics_sender() {
+            let event = MetricEvent {
+                endpoint,
+                status,
+                model: model.clone(),
+                backend: backend.clone(),
+                latency: total_elapsed,
+                is_success: !stream_failed,
+                completion_tokens,
+                prompt_tokens,
+                elapsed: Some(total_elapsed),
+            };
+            let _ = sender.try_send(event);
+        }
     }
 }
 
@@ -625,6 +717,8 @@ pub async fn process_streaming_response(
     let model_for_meta = model_name.clone();
     let backend_for_meta = backend.clone();
     let stream_start_time = Instant::now();
+    let outcome = StreamOutcome::new();
+    let outcome_for_logger = outcome.clone();
 
     tokio::spawn(async move {
         stream_logger_task(
@@ -645,6 +739,7 @@ pub async fn process_streaming_response(
             })
             .to_string(),
             "200".to_string(),
+            outcome_for_logger,
         )
         .await;
     });
@@ -676,12 +771,15 @@ pub async fn process_streaming_response(
     let done_flag_in_flat_map = done_flag.clone();
 
     // 使用 eventsource-stream 进行鲁棒的 SSE 解析
-    let sse_stream = TerminateOnError::new(stream.eventsource()).flat_map(move |result| {
+    let outcome_for_completion = outcome.clone();
+    let upstream_stream = OutcomeSignal::new(TerminateOnError::new(stream.eventsource()), outcome);
+    let sse_stream = upstream_stream.flat_map(move |result| {
         match result {
             Ok(event) => {
                 if event.data == "[DONE]" {
                     // 上游显式发送 [DONE]：通知尾巴不再补发
                     done_flag_in_flat_map.store(true, Ordering::Relaxed);
+                    outcome_for_completion.mark(STREAM_OUTCOME_COMPLETED);
                     if apply_thinking {
                         if let Some(flush_delta) = thinking_transformer.finalize() {
                             let flush_chunk =
@@ -1089,5 +1187,64 @@ mod tests {
         let capture = capture.expect("debug capture must expose its tail");
         let tail = capture.lock().expect("capture mutex must not be poisoned");
         assert_eq!(&*tail, b"data: first\n\ndata: second\n\n");
+    }
+
+    #[test]
+    fn outcome_signal_marks_completed_on_natural_end() {
+        let outcome = StreamOutcome::new();
+        let mut stream = OutcomeSignal::new(
+            stream::iter([Ok::<i32, &'static str>(1), Ok(2)]),
+            outcome.clone(),
+        );
+
+        let items = block_on(async { stream.by_ref().collect::<Vec<_>>().await });
+
+        assert_eq!(items, vec![Ok(1), Ok(2)]);
+        assert_eq!(outcome.get(), STREAM_OUTCOME_COMPLETED);
+    }
+
+    #[test]
+    fn outcome_signal_marks_upstream_error_before_natural_end() {
+        let outcome = StreamOutcome::new();
+        let mut stream = OutcomeSignal::new(
+            stream::iter([Ok::<i32, &'static str>(1), Err("boom")]),
+            outcome.clone(),
+        );
+
+        let items = block_on(async { stream.by_ref().collect::<Vec<_>>().await });
+
+        assert_eq!(items, vec![Ok(1), Err("boom")]);
+        assert_eq!(outcome.get(), STREAM_OUTCOME_UPSTREAM_ERROR);
+    }
+
+    #[test]
+    fn outcome_signal_drop_leaves_running() {
+        let outcome = StreamOutcome::new();
+        let stream =
+            OutcomeSignal::new(stream::iter([Ok::<i32, &'static str>(1)]), outcome.clone());
+
+        drop(stream);
+
+        assert_eq!(outcome.get(), STREAM_OUTCOME_RUNNING);
+    }
+
+    #[test]
+    fn outcome_to_status_maps_outcomes() {
+        assert_eq!(
+            outcome_to_status(STREAM_OUTCOME_COMPLETED, false),
+            (200, None)
+        );
+        assert_eq!(
+            outcome_to_status(STREAM_OUTCOME_UPSTREAM_ERROR, false),
+            (502, Some("upstream stream interrupted".to_string()))
+        );
+        assert_eq!(
+            outcome_to_status(STREAM_OUTCOME_RUNNING, false),
+            (
+                499,
+                Some("client disconnected before stream completed".to_string())
+            )
+        );
+        assert_eq!(outcome_to_status(STREAM_OUTCOME_RUNNING, true), (200, None));
     }
 }

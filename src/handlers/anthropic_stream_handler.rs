@@ -1,7 +1,10 @@
 use crate::app_error::AppError;
 use crate::config::types::ClientConfig;
 use crate::db::records::log_non_streaming_request;
-use crate::handlers::stream_handler::extract_error_msg;
+use crate::handlers::stream_handler::{
+    extract_error_msg, outcome_to_status, OutcomeSignal, StreamOutcome,
+    STREAM_OUTCOME_UPSTREAM_ERROR,
+};
 use crate::handlers::utils::{log_stream_interruption, truncate_json};
 use crate::metrics::middleware::get_metrics_sender;
 use crate::metrics::prometheus::{TTFT, TTFT_10M_MAX, TTFT_1H_MAX, TTFT_1M_MAX};
@@ -164,10 +167,12 @@ async fn anthropic_stream_logger_task(
     start_time: Instant,
     endpoint: String,
     status: String,
+    outcome: StreamOutcome,
 ) {
     let mut accumulator = AnthropicStreamAccumulator::new();
     let mut _ttft_recorded = false;
     let mut ttft_secs: Option<f64> = None;
+    let mut saw_terminal = false;
 
     while let Some(chunk_str) = rx.recv().await {
         let chunk: Value = match serde_json::from_str(&chunk_str) {
@@ -210,6 +215,7 @@ async fn anthropic_stream_logger_task(
             "message_delta" => accumulator.handle_message_delta(&chunk),
             "message_stop" => {
                 // Final event; break after processing to exit loop
+                saw_terminal = true;
                 break;
             }
             _ => {}
@@ -232,82 +238,66 @@ async fn anthropic_stream_logger_task(
         })
         .unwrap_or((None, None));
 
-    // Log the final response (or a minimal fallback if truncated stream)
     let final_resp = accumulator.to_final_response_json();
-
-    // Check if we received at least one valid content block or message metadata
     let has_content = !accumulator.content_blocks.is_empty()
         || accumulator.message_id.is_some()
         || accumulator.model.is_some();
+    let upstream_error = outcome.get() == STREAM_OUTCOME_UPSTREAM_ERROR;
 
-    if has_content {
+    if has_content || upstream_error {
+        let (db_status, db_error) = outcome_to_status(outcome.get(), saw_terminal);
         let log_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-        log_non_streaming_request(
-            &app_state,
-            &headers,
-            &payload,
-            &request_body,
-            &final_resp,
-            client_ip,
-            crate::db::records::LogMeta {
-                latency_ms: Some(log_latency_ms),
-                ttft_ms: ttft_secs.map(|s| s * 1000.0),
-                status: status.parse().ok(),
-                backend: Some(backend.clone()),
-                endpoint: Some(endpoint.clone()),
-                ..Default::default()
-            },
-        )
-        .await;
-    } else {
-        // Truncated stream - build minimal fallback response
-        let fallback = json!({
-            "id": "unknown",
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": "unknown",
-            "stop_reason": null,
-            "stop_sequence": null,
-            "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0
-            }
-        });
-        let log_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-        log_non_streaming_request(
-            &app_state,
-            &headers,
-            &payload,
-            &request_body,
-            &fallback,
-            client_ip,
-            crate::db::records::LogMeta {
-                latency_ms: Some(log_latency_ms),
-                ttft_ms: ttft_secs.map(|s| s * 1000.0),
-                status: status.parse().ok(),
-                backend: Some(backend.clone()),
-                endpoint: Some(endpoint.clone()),
-                ..Default::default()
-            },
-        )
-        .await;
-    }
-
-    let total_elapsed = start_time.elapsed().as_secs_f64();
-    if let Some(sender) = get_metrics_sender() {
-        let event = MetricEvent {
-            endpoint,
-            status,
-            model: model.clone(),
-            backend: backend.clone(),
-            latency: total_elapsed,
-            is_success: true,
-            completion_tokens,
-            prompt_tokens,
-            elapsed: Some(total_elapsed),
+        let response_body = if has_content {
+            final_resp
+        } else {
+            json!({
+                "id": "unknown",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "unknown",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0
+                }
+            })
         };
-        let _ = sender.try_send(event);
+        log_non_streaming_request(
+            &app_state,
+            &headers,
+            &payload,
+            &request_body,
+            &response_body,
+            client_ip,
+            crate::db::records::LogMeta {
+                latency_ms: Some(log_latency_ms),
+                ttft_ms: ttft_secs.map(|s| s * 1000.0),
+                status: Some(db_status),
+                backend: Some(backend.clone()),
+                endpoint: Some(endpoint.clone()),
+                error: db_error,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let total_elapsed = start_time.elapsed().as_secs_f64();
+        if let Some(sender) = get_metrics_sender() {
+            let event = MetricEvent {
+                endpoint,
+                status,
+                model: model.clone(),
+                backend: backend.clone(),
+                latency: total_elapsed,
+                is_success: !upstream_error,
+                completion_tokens,
+                prompt_tokens,
+                elapsed: Some(total_elapsed),
+            };
+            let _ = sender.try_send(event);
+        }
     }
 }
 
@@ -365,6 +355,8 @@ pub async fn process_anthropic_streaming_response(
     let model_for_error = model_name.clone();
     let backend_for_error = backend_name.clone();
     let stream_start_time = Instant::now();
+    let outcome = StreamOutcome::new();
+    let outcome_for_logger = outcome.clone();
 
     // Spawn logger task
     tokio::spawn(async move {
@@ -380,12 +372,13 @@ pub async fn process_anthropic_streaming_response(
             stream_start_time,
             "/v1/messages".to_string(),
             "200".to_string(),
+            outcome_for_logger,
         )
         .await;
     });
 
     // SSE forwarding: preserve event type, forward data verbatim
-    let sse_stream = stream.eventsource().map(move |result| {
+    let sse_stream = OutcomeSignal::new(stream.eventsource(), outcome).map(move |result| {
         match result {
             Ok(event) => {
                 // Send data to logger channel (best-effort, ignore send errors)
