@@ -14,21 +14,15 @@ use std::sync::Arc;
 
 pub mod archive;
 pub mod extract;
+pub mod legacy;
 pub mod payload;
 pub mod records;
 pub mod rotation;
 
-const SCHEMA_VERSION: i64 = 7;
-
-/// 遗留归档 TimeMs 回填的分批大小；限制单条 SELECT 的内存占用。
-const LEGACY_BACKFILL_BATCH: i64 = 2000;
-
-/// 遗留库的明文正文列。迁移把正文映射到 `Prompt`/`Answer` 后这三列即成为死列
-/// （读路径不再引用），删除并 `VACUUM` 可回收约三成空间。
-const LEGACY_PLAINTEXT_COLUMNS: &[&str] = &["Request", "Response", "Headers"];
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 /// v1 新增列；经 `PRAGMA table_info` 守卫后逐列 `ADD COLUMN`，以兼容旧库与测试套件预建的表结构。
-const NEW_COLUMNS: &[(&str, &str)] = &[
+pub(crate) const NEW_COLUMNS: &[(&str, &str)] = &[
     ("TimeMs", "INTEGER"),
     ("Method", "TEXT"),
     ("Endpoint", "TEXT"),
@@ -68,7 +62,7 @@ const NEW_COLUMNS: &[(&str, &str)] = &[
 ];
 
 /// v1 索引：(SQL, 依赖列)。仅当依赖列齐备时创建，避免测试预建表缺列导致失败。
-const NEW_INDEXES: &[(&str, &[&str])] = &[
+pub(crate) const NEW_INDEXES: &[(&str, &[&str])] = &[
     (
         "CREATE INDEX IF NOT EXISTS idx_records_time ON records(TimeMs)",
         &["TimeMs"],
@@ -108,7 +102,7 @@ const DROPPED_INDEXES: &[&str] = &[
     "idx_records_api_key",
 ];
 
-const PAYLOADS_DDL: &str = r#"
+pub(crate) const PAYLOADS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS payloads (
     record_id INTEGER PRIMARY KEY REFERENCES records(id),
     codec TEXT NOT NULL,
@@ -123,7 +117,7 @@ CREATE TABLE IF NOT EXISTS payloads (
 "#;
 
 /// v3 全文检索：external-content + trigram（2 字中文用 LIKE，≥3 字用 MATCH）。
-const FTS_DDL: &[&str] = &[
+pub(crate) const FTS_DDL: &[&str] = &[
     "CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(\
          Prompt, RequestTail, Answer, \
          content='records', content_rowid='id', tokenize='trigram')",
@@ -214,133 +208,6 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await?;
 
     info!("Database schema migrated to version {}", SCHEMA_VERSION);
-    Ok(())
-}
-
-/// 就地迁移一份遗留归档（`user_version=0`、缺少 `TimeMs` 等新列）。
-///
-/// 整个迁移在单个事务内完成：任何一步失败都会完整回滚，下次扫描可安全重试。
-/// `TimeMs` 由本地墙钟文本 `Time` 结合当时的历史 UTC 偏移（含夏令时）回填，
-/// 无法解析的行保持 NULL 隔离（不参与时间范围检索）。
-pub(crate) async fn migrate_legacy_archive(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
-    let existing: Vec<String> = sqlx::query("PRAGMA table_info(records)")
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(|row| row.get::<String, _>("name"))
-        .collect();
-
-    for (name, decl) in NEW_COLUMNS {
-        if !existing.iter().any(|c| c == name) {
-            sqlx::query(&format!("ALTER TABLE records ADD COLUMN {} {}", name, decl))
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-
-    // 遗留库把正文存在 Request/Response 明文中；映射到现代展示/检索列。
-    // 列存在性守卫保证重复迁移（或已瘦身库）不会因引用已删除的列而失败。
-    if existing.iter().any(|c| c == "Request") {
-        sqlx::query(
-            "UPDATE records SET Prompt = Request \
-             WHERE (Prompt IS NULL OR Prompt = '') AND Request IS NOT NULL AND Request <> ''",
-        )
-        .execute(&mut *tx)
-        .await?;
-    }
-    if existing.iter().any(|c| c == "Response") {
-        sqlx::query(
-            "UPDATE records SET Answer = Response \
-             WHERE (Answer IS NULL OR Answer = '') AND Response IS NOT NULL AND Response <> ''",
-        )
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    let mut last_id: i64 = 0;
-    let mut unparseable: u64 = 0;
-    loop {
-        let rows = sqlx::query("SELECT id, Time FROM records WHERE id > ? ORDER BY id LIMIT ?")
-            .bind(last_id)
-            .bind(LEGACY_BACKFILL_BATCH)
-            .fetch_all(&mut *tx)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        for row in &rows {
-            let id: i64 = row.get("id");
-            let time: Option<String> = row.try_get("Time").ok().flatten();
-            match time.as_deref().and_then(rotation::parse_local_time_ms) {
-                Some(ms) => {
-                    sqlx::query("UPDATE records SET TimeMs = ? WHERE id = ?")
-                        .bind(ms)
-                        .bind(id)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                None => unparseable += 1,
-            }
-            last_id = id;
-        }
-    }
-
-    let has_col =
-        |c: &str| existing.iter().any(|e| e == c) || NEW_COLUMNS.iter().any(|(n, _)| *n == c);
-
-    for (sql, required) in NEW_INDEXES {
-        if required.iter().all(|c| has_col(c)) {
-            sqlx::query(sql).execute(&mut *tx).await?;
-        }
-    }
-    sqlx::query(PAYLOADS_DDL).execute(&mut *tx).await?;
-    for sql in FTS_DDL {
-        sqlx::query(sql).execute(&mut *tx).await?;
-    }
-    // 正文映射之后重建外部内容索引，保证 FTS 与 Prompt/Answer 一致。
-    sqlx::query("INSERT INTO records_fts(records_fts) VALUES('rebuild')")
-        .execute(&mut *tx)
-        .await?;
-
-    // 正文已映射到 Prompt/Answer、且已写入 payloads，遗留明文列不再被任何查询引用，
-    // 删除它们再由事务提交后的 VACUUM 回收空间。DDL 无法绑定标识符，列名为编译期常量。
-    let mut slimmed = 0usize;
-    for col in LEGACY_PLAINTEXT_COLUMNS {
-        if existing.iter().any(|c| c == col) {
-            sqlx::query(&format!("ALTER TABLE records DROP COLUMN {}", col))
-                .execute(&mut *tx)
-                .await?;
-            slimmed += 1;
-        }
-    }
-
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records")
-        .fetch_one(&mut *tx)
-        .await?;
-
-    // PRAGMA 不支持绑定参数；此处为编译期常量，无注入风险。
-    sqlx::query(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))
-        .execute(&mut *tx)
-        .await?;
-
-    tx.commit().await?;
-
-    // VACUUM 不能在事务内执行，且失败不应影响已完成并提交的迁移结果。
-    if slimmed > 0 {
-        if let Err(e) = sqlx::query("VACUUM").execute(pool).await {
-            warn!(
-                "Legacy archive VACUUM failed (data already migrated): {}",
-                e
-            );
-        }
-    }
-
-    info!(
-        "Legacy archive migrated to schema {}: {} rows, {} unparseable Time, {} legacy plaintext columns dropped",
-        SCHEMA_VERSION, total, unparseable, slimmed
-    );
     Ok(())
 }
 

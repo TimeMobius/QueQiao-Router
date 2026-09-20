@@ -330,7 +330,7 @@ async fn migrate_legacy_in_place(path: &Path) -> Result<(), sqlx::Error> {
         .connect_with(options)
         .await?;
 
-    let result = crate::db::migrate_legacy_archive(&pool).await;
+    let result = crate::db::legacy::migrate_archive(&pool).await;
     pool.close().await;
     result
 }
@@ -380,7 +380,7 @@ mod tests {
         let archive_path = dir.join("record_202603.db");
         let url = format!("sqlite:{}", archive_path.display());
 
-        // 建立 12 列、user_version=0 的遗留库并写入一行明文正文。
+        // 建立 12 列、user_version=0 的遗留库并写入一行带完整请求/响应 JSON 的明文记录。
         let options = SqliteConnectOptions::from_str(&url)
             .unwrap()
             .create_if_missing(true);
@@ -394,15 +394,25 @@ mod tests {
         .execute(&rw)
         .await
         .unwrap();
+        let request_json =
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hello world"}]}"#;
+        let response_json = r#"{"choices":[{"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}]}"#;
         sqlx::query(
-            "INSERT INTO records (Time, IP, Model, Type, Request, Response) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO records (Time, IP, Model, Type, CompletionTokens, PromptTokens, TotalTokens, \
+             Tool, Multimodal, Headers, Request, Response) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("2026-03-15 10:00:00.000000")
         .bind("127.0.0.1")
         .bind("test-model")
         .bind("chat.completions")
-        .bind("{\"messages\":[]}")
-        .bind("hi")
+        .bind(2i64)
+        .bind(5i64)
+        .bind(7i64)
+        .bind(0i64)
+        .bind(0i64)
+        .bind(r#"{"User-Agent":"curl/8.4.0"}"#)
+        .bind(request_json)
+        .bind(response_json)
         .execute(&rw)
         .await
         .unwrap();
@@ -411,8 +421,8 @@ mod tests {
             .await
             .unwrap();
 
-        crate::db::migrate_legacy_archive(&rw).await.unwrap();
-        crate::db::migrate_legacy_archive(&rw).await.unwrap();
+        crate::db::legacy::migrate_archive(&rw).await.unwrap();
+        crate::db::legacy::migrate_archive(&rw).await.unwrap();
         rw.close().await;
 
         let options = SqliteConnectOptions::from_str(&url)
@@ -427,14 +437,63 @@ mod tests {
 
         let expected =
             crate::db::rotation::parse_local_time_ms("2026-03-15 10:00:00.000000").unwrap();
-        let (time_ms, prompt, answer): (Option<i64>, Option<String>, Option<String>) =
-            sqlx::query_as("SELECT TimeMs, Prompt, Answer FROM records WHERE id = 1")
+        let (time_ms, prompt, request_tail, answer, finish_reason, endpoint, user_agent): (
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT TimeMs, Prompt, RequestTail, Answer, FinishReason, Endpoint, UserAgent \
+                 FROM records WHERE id = 1",
+        )
+        .fetch_one(&rw)
+        .await
+        .unwrap();
+        assert_eq!(time_ms, Some(expected));
+        // 与 V2 提取管线一致：Prompt 取最后一条 user 消息，Answer 取响应内容。
+        assert_eq!(prompt.as_deref(), Some("hello world"));
+        assert_eq!(request_tail.as_deref(), Some("hello world"));
+        assert_eq!(answer.as_deref(), Some("hi there"));
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+        assert_eq!(endpoint.as_deref(), Some("chat/completions"));
+        assert_eq!(user_agent.as_deref(), Some("curl/8.4.0"));
+
+        // 完整正文应压缩进 payloads 并可通过 records.payload_id 关联回放。
+        let rec_payload_id: i64 = sqlx::query_scalar("SELECT payload_id FROM records WHERE id = 1")
+            .fetch_one(&rw)
+            .await
+            .unwrap();
+        assert_eq!(rec_payload_id, 1);
+        let (record_id, codec): (i64, String) =
+            sqlx::query_as("SELECT record_id, codec FROM payloads WHERE record_id = 1")
                 .fetch_one(&rw)
                 .await
                 .unwrap();
-        assert_eq!(time_ms, Some(expected));
-        assert_eq!(prompt.as_deref(), Some("{\"messages\":[]}"));
-        assert_eq!(answer.as_deref(), Some("hi"));
+        assert_eq!(record_id, 1);
+        assert_eq!(codec, "zstd");
+        let (dict_id, blob): (Option<String>, Vec<u8>) =
+            sqlx::query_as("SELECT dict_id, request FROM payloads WHERE record_id = 1")
+                .fetch_one(&rw)
+                .await
+                .unwrap();
+        let restored = crate::db::payload::decompress(&codec, dict_id.as_deref(), &blob).unwrap();
+        assert_eq!(std::str::from_utf8(&restored).unwrap(), request_json);
+
+        // 遗留明文列已删除。
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('records')")
+                .fetch_all(&rw)
+                .await
+                .unwrap();
+        assert!(
+            !columns
+                .iter()
+                .any(|c| matches!(c.as_str(), "Request" | "Response" | "Headers")),
+            "legacy plaintext columns should be dropped, got {columns:?}"
+        );
 
         let bounds: (Option<i64>, Option<i64>) =
             sqlx::query_as("SELECT MIN(TimeMs), MAX(TimeMs) FROM records")
