@@ -1,6 +1,6 @@
 /* QueQiao Router — shared application shell runtime.
  * Owns theme persistence, nav state, and the window.QQShell page API.
- * Framework-free ES5-compatible. See /DESIGN.md. */
+ * Framework-free ES5-compatible. */
 (function () {
     'use strict';
 
