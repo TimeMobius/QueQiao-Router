@@ -100,14 +100,14 @@ latency-percentile card, and a backend-health panel. The page consumes
 `dimension`, `orderBy`, `page`, `pageSize`, `topLimit`, and the shared `model`, `ip`, `apikey`,
 `type`, `backend`, `status`, `client`, and `errors` filters. The response `summary` carries a
 `latency` object (`avgMs`/`maxMs`/`p50Ms`/`p95Ms`/`p99Ms`/`avgTtftMs`/`p95TtftMs`; percentiles are
-50ms-bucket approximations) plus `dbErrors`/`logErrors` (headline `errors` is their sum). A request
-is a *real error* only if `Status >= 400`, the status is neither `422` (validation) nor `499`
-(user-initiated disconnect), and it has a model name; summary `requests` = success + real errors,
-so 成功率 + 错误率 always sum to 100%. The error ranking lists **all** 4xx/5xx (including
-422/499/no-model) for debugging. DB and the error log capture disjoint error populations (DB =
-stream errors, log = hard failures) so they are summed, not deduplicated. Dimension and trend
-buckets include `avgLatencyMs`. Error ranking consumes `GET /dashboard/api/analysis/errors` with
-the same shared filters plus `source=db|log` and `limit`.
+50ms-bucket approximations) plus `dbErrors`/`logErrors` (headline `errors` is their sum). Every
+error carrying a status code counts: DB side `Status >= 400` (includes 499/422/no-model); log
+side, entries with a status code (status-less `STREAM_INTERRUPTED` is listed in the ranking but not
+counted). Summary `requests` = success + all status-coded errors, so 成功率 + 错误率 always sum to
+100%. DB and the error log capture disjoint populations (DB = stream disconnections, log =
+no-result hard failures) so they are summed, not deduplicated. The error ranking lists **all**
+error entries. Dimension and trend buckets include `avgLatencyMs`. Error ranking consumes
+`GET /dashboard/api/analysis/errors` with the same shared filters plus `source=db|log` and `limit`.
 
 ## 6. Layout & scroll ownership
 

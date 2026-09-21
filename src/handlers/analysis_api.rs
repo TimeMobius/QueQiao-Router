@@ -288,15 +288,10 @@ fn clamp_top(v: Option<i64>) -> usize {
 
 const SQL_SUCCESS: &str =
     "COALESCE(SUM(CASE WHEN Status >= 200 AND Status < 400 THEN 1 ELSE 0 END),0)";
-// 真实错误：排除用户主动中断(499)、模型不存在/参数校验(422)、以及无法归因到模型的记录。
-// 汇总（请求总量/错误数/错误率）只统计"成功 + 真实错误"，使 成功率+错误率=100%；
-// 499/422/无模型 仍列于错误排行（排行查询 errors_db_sql / 日志排行不做此过滤）。
-const SQL_ERRORS: &str = "COALESCE(SUM(CASE WHEN Status >= 400 AND Status NOT IN (422, 499) \
-     AND Model IS NOT NULL AND Model <> '' THEN 1 ELSE 0 END),0)";
-// 请求总量口径 = 成功 + 真实错误，与错误数同分母，保证 成功率+错误率=100%。
-const SQL_REQUESTS_COUNTED: &str = "COUNT(CASE WHEN Status >= 200 AND Status < 400 \
-     OR (Status >= 400 AND Status NOT IN (422, 499) AND Model IS NOT NULL AND Model <> '') \
-     THEN 1 END)";
+// 所有带状态码的错误（含 499/422/无模型名）都计入错误数。
+const SQL_ERRORS: &str = "COALESCE(SUM(CASE WHEN Status >= 400 THEN 1 ELSE 0 END),0)";
+// 请求总量 = 成功 + 所有带状态码错误（Status>=200），保证 成功率+错误率=100%。
+const SQL_REQUESTS_COUNTED: &str = "COUNT(CASE WHEN Status >= 200 THEN 1 END)";
 const SQL_PROMPT: &str = "COALESCE(SUM(COALESCE(PromptTokens,0)),0)";
 const SQL_COMPLETION: &str = "COALESCE(SUM(COALESCE(CompletionTokens,0)),0)";
 const SQL_TOTAL: &str = "COALESCE(SUM(COALESCE(TotalTokens,0)),0)";
@@ -1181,21 +1176,10 @@ fn bucket_label(ms: i64, interval: &str) -> Option<String> {
     })
 }
 
-/// 日志错误是否计入统计/错误率/趋势：需同时满足——有模型名、有错误状态码、
-/// 且状态码不是 422（模型不存在/参数校验）或 499（用户主动中断）。
-/// 注意：这些被排除的条目仍会出现在错误排行（scan 的 counts）里。
-fn is_countable_log_error(status: Option<i64>, model: Option<&str>) -> bool {
-    let Some(status) = status else {
-        return false;
-    };
-    if status == 422 || status == 499 {
-        return false;
-    }
-    let Some(model) = model else {
-        return false;
-    };
-    let model = model.trim();
-    !model.is_empty() && model != "-"
+/// 日志错误是否计入统计/错误率/趋势：仅计入带错误状态码（4xx/5xx）的条目。
+/// 流中断（stream_interrupted，响应已提交 200，无状态码）不计入统计，但仍列于错误排行。
+fn is_countable_log_error(status: Option<i64>) -> bool {
+    status.is_some()
 }
 
 fn scan_error_logs(
@@ -1268,8 +1252,8 @@ fn scan_error_logs(
             if !is_error {
                 continue;
             }
-            // 错误排行：列出全部错误（含 422/499/无模型名），供排查。
-            let countable = is_countable_log_error(entry.status, entry.model.as_deref());
+            // 错误排行：列出全部错误（含无状态码的流中断）。
+            let countable = is_countable_log_error(entry.status);
             let key: LogErrorKey = (
                 entry.kind,
                 entry.status,
@@ -1278,7 +1262,7 @@ fn scan_error_logs(
                 normalize_opt(entry.error),
             );
             *counts.entry(key).or_insert(0) += 1;
-            // 统计/错误率/趋势：仅计入真实错误，与汇总同口径。
+            // 统计/错误率/趋势：仅计入带状态码的错误，与汇总同口径。
             if countable {
                 total_error_entries += 1;
                 if let Some(t) = ts {
@@ -1634,21 +1618,17 @@ mod tests {
     }
 
     #[test]
-    fn countable_log_error_filters_noise() {
-        assert!(is_countable_log_error(Some(500), Some("gpt-5.6")));
-        assert!(is_countable_log_error(Some(503), Some("DeepSeek-V4")));
-        assert!(is_countable_log_error(Some(400), Some("model-x")));
-        assert!(!is_countable_log_error(Some(422), Some("model-x")));
-        assert!(!is_countable_log_error(Some(499), Some("model-x")));
-        assert!(!is_countable_log_error(None, Some("model-x")));
-        assert!(!is_countable_log_error(Some(500), None));
-        assert!(!is_countable_log_error(Some(500), Some("")));
-        assert!(!is_countable_log_error(Some(500), Some("  ")));
-        assert!(!is_countable_log_error(Some(500), Some("-")));
+    fn countable_log_error_requires_status_code() {
+        assert!(is_countable_log_error(Some(500)));
+        assert!(is_countable_log_error(Some(503)));
+        assert!(is_countable_log_error(Some(422)));
+        assert!(is_countable_log_error(Some(499)));
+        assert!(is_countable_log_error(Some(400)));
+        assert!(!is_countable_log_error(None));
     }
 
     #[test]
-    fn scan_error_logs_counts_only_countable_but_lists_all() {
+    fn scan_error_logs_lists_all_counts_status_only() {
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1661,21 +1641,22 @@ mod tests {
             "2.2.2.2 - - [20/Sep/2026:10:05:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 422 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"bad\" \"-\"",
             "3.3.3.3 - - [20/Sep/2026:10:06:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 404 50 \"-\" \"ua\" 1.000s \"\" \"-\" \"none\" \"-\"",
             "5.5.5.5 - - [20/Sep/2026:10:16:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 499 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"user cancel\" \"-\"",
+            "[20/Sep/2026:10:20:00 +0000] STREAM_INTERRUPTED client=6.6.6.6 endpoint=/v1/chat/completions model=gpt-5.6 backend=b1 error=\"stream cut\"",
         ]
         .join("\n");
         std::fs::write(dir.join("error.2026-09-20.log"), body).unwrap();
         let scan = scan_error_logs(&dir, None, None, 100, "day");
-        // 错误排行列出全部 4 条
-        assert_eq!(scan.total, 4);
-        // 统计/趋势只计入 1 条真实错误（500 且有模型）
-        assert_eq!(scan.total_error_entries, 1);
+        // 错误排行列出全部 5 条（含无状态码的流中断）
+        assert_eq!(scan.total, 5);
+        // 统计/趋势只计入 4 条带状态码错误
+        assert_eq!(scan.total_error_entries, 4);
         let bucket_sum: i64 = scan.per_bucket.iter().map(|(_, c)| c).sum();
-        assert_eq!(bucket_sum, 1);
+        assert_eq!(bucket_sum, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn counted_requests_exclude_gray_zone() {
+    async fn requests_equal_success_plus_all_errors() {
         let (path, pool) = temp_db("counted").await;
         sqlx::query(
             "INSERT INTO records (id, TimeMs, Model, Status, Error, LatencyMs) VALUES \
@@ -1701,9 +1682,10 @@ mod tests {
                 .flat_map(|r| r.iter().map(summary_from_row))
                 .collect::<Vec<_>>(),
         );
-        assert_eq!(merged.metrics.requests, 2);
+        // 请求总量 = 成功(1) + 所有带状态码错误(4)
+        assert_eq!(merged.metrics.requests, 5);
         assert_eq!(merged.metrics.success, 1);
-        assert_eq!(merged.metrics.errors, 1);
+        assert_eq!(merged.metrics.errors, 4);
         drop(pool);
         let _ = std::fs::remove_file(&path);
     }
