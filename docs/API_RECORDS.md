@@ -116,11 +116,15 @@ UTC 偏移（含夏令时）回填为真实 epoch 毫秒，并把遗留明文 `R
   "file": "error.2026-09-17.log",
   "size": 7040,
   "entries": [
-    { "kind": "http_error", "time": "17/Sep/2026:07:28:00 +0000", "ip": "10.0.0.5",
-      "method": "POST", "path": "/v1/messages", "status": 500, "model": "claude-x",
-      "userAgent": "python-httpx/0.27.0", "latency": "1.250s",
-      "error": "upstream boom", "requestBody": "{\"model\":\"claude-x\"}" },
-    { "kind": "stream_interrupted", "time": "17/Sep/2026:08:00:00 +0000", "ip": "10.0.0.9",
+    { "kind": "http_error", "raw": "10.0.0.5 - - [17/Sep/2026:07:28:00 +0000] \"POST /v1/messages HTTP/1.1\" 500 - \"-\" \"python-httpx/0.27.0\" 1.250s \"claude-x\" \"sk-abc12345…\" \"upstream boom\" \"{\\\"model\\\":\\\"claude-x\\\"}\"",
+      "time": "17/Sep/2026:07:28:00 +0000", "ip": "10.0.0.5",
+      "method": "POST", "path": "/v1/messages", "status": 500,
+      "user_agent": "python-httpx/0.27.0", "latency": "1.250s",
+      "model": "claude-x", "api_key": "sk-abc12345…", "backend": null,
+      "error": "upstream boom", "error_truncated": false, "error_bytes": null,
+      "request_body": "{\"model\":\"claude-x\"}" },
+    { "kind": "stream_interrupted", "raw": "[17/Sep/2026:08:00:00 +0000] STREAM_INTERRUPTED client=10.0.0.9 endpoint=/v1/chat/completions model=gpt-5 backend=alpha error=\"upstream stream interrupted: connection reset\"",
+      "time": "17/Sep/2026:08:00:00 +0000", "ip": "10.0.0.9",
       "path": "/v1/chat/completions", "model": "gpt-5", "backend": "alpha",
       "error": "upstream stream interrupted: connection reset" }
   ],
@@ -129,7 +133,20 @@ UTC 偏移（含夏令时）回填为真实 epoch 毫秒，并把遗留明文 `R
 }
 ```
 
-`kind` 取值 `http_error` / `stream_interrupted` / `unparsed`（无法解析时仅保留 `raw`）。
+字段均为 **snake_case**。`kind` 取值 `http_error` / `stream_interrupted` / `unparsed`
+（无法解析时仅保留 `raw`）。条目字段：
+
+| 字段 | 说明 |
+| :--- | :--- |
+| `kind` | 条目类型 |
+| `raw` | 原始日志行原文（始终存在） |
+| `time` / `ip` / `method` / `path` / `status` | 解析出的请求信息；`stream_interrupted` 无 `status`/`method` |
+| `user_agent` / `latency` / `model` / `api_key` | 请求标识；行内为 `-` 占位时保持 `"-"` 原样（不归一化为 null） |
+| `backend` | 仅 `stream_interrupted` 有值 |
+| `error` | 错误信息；超过 16 KiB 时按字符边界截断并标注 |
+| `error_truncated` / `error_bytes` | 是否发生截断 / 截断前的原始字节数（未截断时为 `false`/`null`） |
+| `request_body` | 请求体（`http_error` 且日志行带请求体时） |
+
 某字段为 `null` 表示该行不含此信息，不是错误。`nextBefore` 为 `null` 表示已到文件开头。
 
 ---
