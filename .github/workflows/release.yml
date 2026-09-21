@@ -48,7 +48,7 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add README.md Cargo.toml Cargo.lock
+          git add README.md Cargo.toml
           # 检查是否有文件改动，只有在 README.md 被修改时才执行提交
           if ! git diff --staged --quiet; then
             git commit -m "chore(release): update build version to ${{ steps.version.outputs.tag }} [skip ci]"
