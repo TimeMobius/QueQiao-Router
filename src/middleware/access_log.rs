@@ -103,24 +103,6 @@ pub async fn access_log_middleware(req: Request<Body>, next: Next) -> Response {
     // 格式: IP - - [Time] "Method URI Version" Status Bytes "Referer" "UserAgent" Latency "Model" "ApiKey" "Error" "RequestBody"
     let time_str = Local::now().format("%d/%b/%Y:%H:%M:%S %z");
 
-    // token 在错误时是否完整输出，需要等拿到 status 后才能决定
-    let api_key_display = "-".to_string();
-    let mut log_line = format!(
-        "{} - - [{}] \"{} {} {:?}\" {} {} \"-\" \"{}\" {:.3}s \"{}\" \"{}\" {:?}",
-        client_ip,
-        time_str,
-        method,
-        uri,
-        version,
-        status.as_u16(),
-        body_bytes,
-        user_agent,
-        latency.as_secs_f64(),
-        model,
-        api_key_display,
-        error_msg
-    );
-
     // 6. 根据状态码决定日志级别
     if status.is_server_error() || status.is_client_error() {
         // 错误日志：默认仍然脱敏；仅在显式开启开关时输出完整 token
@@ -134,9 +116,7 @@ pub async fn access_log_middleware(req: Request<Body>, next: Next) -> Response {
                 }
             })
             .unwrap_or_else(|| "-".to_string());
-        // 将 log_line 中的占位 token 替换为完整 token。
-        // 这里使用固定格式的后两段（model 与 api_key）来重建，避免做脆弱的字符串替换。
-        log_line = format!(
+        let mut log_line = format!(
             "{} - - [{}] \"{} {} {:?}\" {} {} \"-\" \"{}\" {:.3}s \"{}\" \"{}\" {:?}",
             client_ip,
             time_str,
@@ -168,7 +148,7 @@ pub async fn access_log_middleware(req: Request<Body>, next: Next) -> Response {
             .map(truncate_token_for_log)
             .unwrap_or_else(|| "-".to_string());
 
-        log_line = format!(
+        let log_line = format!(
             "{} - - [{}] \"{} {} {:?}\" {} {} \"-\" \"{}\" {:.3}s \"{}\" \"{}\" {:?}",
             client_ip,
             time_str,

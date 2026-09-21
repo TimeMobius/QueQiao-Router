@@ -18,13 +18,6 @@ mod check_api_auth {
     ));
 }
 
-#[cfg(not(feature = "check-api-auth"))]
-mod check_api_auth {
-    pub fn add_auth_to_router(router: axum::Router) -> axum::Router {
-        router
-    }
-}
-
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
