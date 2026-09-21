@@ -17,7 +17,9 @@ metrics、不写访问日志，可安全频繁轮询。
 | `backend` | string | 精确 | 上游客户端名 |
 | `status` | i64 | 精确 | HTTP 状态码 |
 | `client` | string | 子串 | 同时匹配 `ClientName` 或 `UserAgent` |
-| `session_id` / `parent_session_id` / `request_id` | string | 子串 | |
+| `session_id` | string | 子串 | 按 `SessionId`（界面「会话 ID」）检索；来源请求头 `x-session-id`（见下「ID 字段与请求头对应关系」） |
+| `parent_session_id` | string | 子串 | 按 `ParentSessionId`（界面「父会话 ID」）检索；来源请求头 `x-parent-session-id`（见下「ID 字段与请求头对应关系」） |
+| `request_id` | string | 子串 | 按 `RequestId`（界面「请求 ID」）检索；来源为 `x-request-id` / `x-trace-id` / `request-id` / `x-correlation-id` 中第一个非空（见下「ID 字段与请求头对应关系」） |
 | `q` | string | 见下 | 关键词检索 |
 | `errors` | `1` | — | 仅返回 `Status >= 400` |
 | `cursor` | string | — | 翻页游标，对客户端**不透明**：单月为 `"<TimeMs>:<id>"`，跨月为 `"<TimeMs>:<id>:<shard>"` |
@@ -25,6 +27,20 @@ metrics、不写访问日志，可安全频繁轮询。
 
 `q` 按长度分支：**≥3 字符** 走 FTS5 trigram 子串索引（快）；**<3 字符** 退化为三列
 `LIKE '%x%'` 全表扫描，建议前端限制最少 3 字符，或同时附带 `from`/`to` 收窄范围。
+
+### ID 字段与请求头对应关系
+
+会话/请求标识由客户端请求头提取入库（见 `src/db/extract.rs` 的 `header_meta`），并按白名单
+**原样转发**给上游（客户端 `User-Agent` 不转发，上游看到的是网关自身 UA）：
+
+| 界面显示 | 数据库列 | 查询参数 / 响应字段 | 来源请求头 | 转发上游 |
+| :--- | :--- | :--- | :--- | :--- |
+| 会话 ID | `SessionId` | `session_id` / `sessionId` | `x-session-id` | 是 |
+| 父会话 ID | `ParentSessionId` | `parent_session_id` / `parentSessionId` | `x-parent-session-id` | 是 |
+| 请求 ID | `RequestId` | `request_id` / `requestId` | `x-request-id` / `x-trace-id` / `request-id` / `x-correlation-id` 中第一个非空（trim、截断 200 字符） | `x-request-id` / `x-trace-id` / `x-correlation-id` 三个会转发；裸 `request-id` 不转发 |
+
+同一次请求若同时携带多个候选请求头：审计库 `RequestId` 只存上述顺序中第一个非空的值；
+转发则按白名单逐个进行，两个行为相互独立。
 
 ### 返回结果
 

@@ -97,7 +97,11 @@ v1 起通过迁移补齐的现代列：
 其中 `x-request-id`、`x-trace-id`、`x-correlation-id`、`x-session-id`、`x-parent-session-id`、
 `x-session-affinity` 会按白名单**原样透传给上游**（见 `src/client/proxy.rs` 的 `FORWARD_HEADERS`，
 供后端做日志关联）；`authorization`/`x-api-key` 始终替换为上游 key，`user-agent` 与其余客户端头
-不转发（上游看到的是网关自身 UA）。
+不转发（上游看到的是 `QueQiao-Router/b<提交数> reqwest/<版本>`）。
+
+界面「会话 ID / 父会话 ID / 请求 ID」分别对应 `SessionId`/`ParentSessionId`/`RequestId`，
+可通过 `GET /dashboard/api/records` 的 `session_id`/`parent_session_id`/`request_id` 参数检索
+（见 `API_RECORDS.md` 的「ID 字段与请求头对应关系」）。
 
 ---
 

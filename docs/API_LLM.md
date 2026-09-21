@@ -44,8 +44,8 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 | `x-session-id` / `x-parent-session-id` / `x-session-affinity` | 会话标识 |
 
 `authorization` / `x-api-key` **不**透传——网关始终用上游 key 重建 `Authorization`；
-`user-agent` 也不透传，上游看到的是**网关自身 UA**（`QueQiao-Router/<版本> reqwest/<版本>`）；
-其余客户端头一律不转发。上述头同时会被写入审计库（见 `DATABASE_SCHEMA.md`
+`user-agent` 也不透传，上游看到的是**网关自身 UA**（`QueQiao-Router/b<提交数> reqwest/<版本>`）；
+其余客户端头一律不转发。上述标识头同时会被写入审计库（见 `DATABASE_SCHEMA.md`
 的「身份字段与请求头的对应关系」）。
 
 ## 思考格式（ThinkingFormat）

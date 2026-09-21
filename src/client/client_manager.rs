@@ -5,11 +5,10 @@ use crate::config::{
 use reqwest::Client;
 use tokio::sync::RwLockReadGuard;
 
-/// 网关自身 UA：`<产品>/<版本> <HTTP 客户端>/<版本>`。上游看到的是本网关而非客户端 UA。
-/// `REQWEST_VERSION` 由 `build.rs` 从 Cargo.lock 解析。
+/// 网关自身 UA：`<产品>/b<提交数> <HTTP 客户端>/<版本>`。上游看到的是本网关而非客户端 UA。
 const USER_AGENT: &str = concat!(
-    "QueQiao-Router/",
-    env!("CARGO_PKG_VERSION"),
+    "QueQiao-Router/b",
+    env!("CARGO_PKG_VERSION_PATCH"),
     " reqwest/",
     env!("REQWEST_VERSION"),
 );

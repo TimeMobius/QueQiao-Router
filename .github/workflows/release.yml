@@ -25,6 +25,7 @@ jobs:
         run: |
           commit_count=$(git rev-list --count HEAD)
           echo "tag=b${commit_count}" >> $GITHUB_OUTPUT
+          echo "cargo_version=0.2.${commit_count}" >> $GITHUB_OUTPUT
 
       - name: Set owner to lowercase
         id: lower_owner
@@ -37,15 +38,21 @@ jobs:
           # 这个命令会查找 ghcr.io/your-user/queqiao-router: 这一行，并把冒号后面的所有内容替换为新的版本号
           sed -i "s|\(ghcr.io/${{ env.OWNER_LC }}/queqiao-router:\).*|\1${{ steps.version.outputs.tag }}|g" README.md
 
-      # --- 新增步骤：提交并推送 README.md 的改动 ---
-      - name: Commit and push README.md
+      - name: Update Cargo package version
+        run: |
+          cargo_version="${{ steps.version.outputs.cargo_version }}"
+          sed -i -E "s/^version = \"[^\"]+\"\$/version = \"${cargo_version}\"/" Cargo.toml
+          awk -v v="$cargo_version" '/^name = "queqiao-router"$/{ print; getline nl; sub(/^version = "[^"]+"$/, "version = \"" v "\"", nl); print nl; next } { print }' Cargo.lock > Cargo.lock.new
+          mv Cargo.lock.new Cargo.lock
+
+      - name: Commit and push release metadata
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add README.md
+          git add README.md Cargo.toml Cargo.lock
           # 检查是否有文件改动，只有在 README.md 被修改时才执行提交
           if ! git diff --staged --quiet; then
-            git commit -m "docs: Update README to version ${{ steps.version.outputs.tag }} [skip ci]"
+            git commit -m "chore(release): update build version to ${{ steps.version.outputs.tag }} [skip ci]"
             git push
           else
             echo "No changes to README.md to commit."

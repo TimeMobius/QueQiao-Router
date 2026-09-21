@@ -252,7 +252,9 @@ cargo test
 
 推送到 `main` 或创建针对 `main` 的 Pull Request 时，CI 会依次执行格式检查、Clippy 和 Rust 单元测试。推送到 `main` 且检查通过后，CI 还会构建并发布 `linux/amd64` 与 `linux/arm64` Docker 镜像到 GitHub Container Registry，并生成 `b<提交数>` 和 `latest` 标签。
 
-另一个发布工作流会根据提交数量创建 GitHub Release，并自动将 README 中的 Docker 镜像标签更新为对应版本。因此，README 中的镜像标签可能会由 CI 自动更新。
+另一个发布工作流会根据提交数量创建 GitHub Release，并自动将 README 中的 Docker 镜像标签更新为
+`b<提交数>`、将 `Cargo.toml`/`Cargo.lock` 中的版本更新为 `0.2.<提交数>`。因此，这些版本信息
+可能会由 CI 自动更新。
 
 ---
 
