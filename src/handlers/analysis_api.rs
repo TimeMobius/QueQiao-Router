@@ -288,9 +288,15 @@ fn clamp_top(v: Option<i64>) -> usize {
 
 const SQL_SUCCESS: &str =
     "COALESCE(SUM(CASE WHEN Status >= 200 AND Status < 400 THEN 1 ELSE 0 END),0)";
-// 499 为用户主动中断（client disconnected），不计入错误统计。
-const SQL_ERRORS: &str =
-    "COALESCE(SUM(CASE WHEN Status >= 400 AND Status <> 499 THEN 1 ELSE 0 END),0)";
+// 真实错误：排除用户主动中断(499)、模型不存在/参数校验(422)、以及无法归因到模型的记录。
+// 汇总（请求总量/错误数/错误率）只统计"成功 + 真实错误"，使 成功率+错误率=100%；
+// 499/422/无模型 仍列于错误排行（排行查询 errors_db_sql / 日志排行不做此过滤）。
+const SQL_ERRORS: &str = "COALESCE(SUM(CASE WHEN Status >= 400 AND Status NOT IN (422, 499) \
+     AND Model IS NOT NULL AND Model <> '' THEN 1 ELSE 0 END),0)";
+// 请求总量口径 = 成功 + 真实错误，与错误数同分母，保证 成功率+错误率=100%。
+const SQL_REQUESTS_COUNTED: &str = "COUNT(CASE WHEN Status >= 200 AND Status < 400 \
+     OR (Status >= 400 AND Status NOT IN (422, 499) AND Model IS NOT NULL AND Model <> '') \
+     THEN 1 END)";
 const SQL_PROMPT: &str = "COALESCE(SUM(COALESCE(PromptTokens,0)),0)";
 const SQL_COMPLETION: &str = "COALESCE(SUM(COALESCE(CompletionTokens,0)),0)";
 const SQL_TOTAL: &str = "COALESCE(SUM(COALESCE(TotalTokens,0)),0)";
@@ -302,7 +308,7 @@ const SQL_TTFT_COUNT: &str = "COUNT(TtftMs) AS ttftCount";
 
 fn summary_sql(where_sql: &str) -> String {
     format!(
-        "SELECT COUNT(*) AS requests, {SQL_SUCCESS} AS success, {SQL_ERRORS} AS errors, \
+        "SELECT {SQL_REQUESTS_COUNTED} AS requests, {SQL_SUCCESS} AS success, {SQL_ERRORS} AS errors, \
          {SQL_PROMPT} AS promptTokens, {SQL_COMPLETION} AS completionTokens, \
          {SQL_TOTAL} AS totalTokens, COUNT(DISTINCT Model) AS models, \
          COUNT(DISTINCT IP) AS ips, {SQL_LATENCY_SUM}, {SQL_LATENCY_COUNT}, \
@@ -346,8 +352,8 @@ fn errors_db_sql(where_sql: &str) -> String {
     format!(
         "SELECT Status AS status, COALESCE(NULLIF(Model,''),'Unknown') AS model, \
          COALESCE(Backend,'') AS backend, COALESCE(NULLIF(Error,''),'-') AS error, \
-         COUNT(*) AS c FROM records{where_sql} AND Status >= 400 AND Status <> 499 \
-         GROUP BY 1,2,3,4 ORDER BY c DESC LIMIT {}",
+         COUNT(*) AS c FROM records{where_sql} AND Status >= 400 GROUP BY 1,2,3,4 \
+         ORDER BY c DESC LIMIT {}",
         COUNT_CAP + 1
     )
 }
@@ -1175,13 +1181,14 @@ fn bucket_label(ms: i64, interval: &str) -> Option<String> {
     })
 }
 
-/// 日志错误是否计入统计/错误率/趋势/排行：需同时满足——有模型名、有错误状态码、
-/// 且状态码不是 422（模型不存在/参数校验类噪音，非上游故障）。
+/// 日志错误是否计入统计/错误率/趋势：需同时满足——有模型名、有错误状态码、
+/// 且状态码不是 422（模型不存在/参数校验）或 499（用户主动中断）。
+/// 注意：这些被排除的条目仍会出现在错误排行（scan 的 counts）里。
 fn is_countable_log_error(status: Option<i64>, model: Option<&str>) -> bool {
     let Some(status) = status else {
         return false;
     };
-    if status == 422 {
+    if status == 422 || status == 499 {
         return false;
     }
     let Some(model) = model else {
@@ -1258,15 +1265,11 @@ fn scan_error_logs(
                 }
             }
             let is_error = entry.kind == "http_error" || entry.kind == "stream_interrupted";
-            if !(is_error && is_countable_log_error(entry.status, entry.model.as_deref())) {
+            if !is_error {
                 continue;
             }
-            total_error_entries += 1;
-            if let Some(t) = ts {
-                if let Some(label) = bucket_label(t, interval) {
-                    *bucket_counts.entry(label).or_insert(0) += 1;
-                }
-            }
+            // 错误排行：列出全部错误（含 422/499/无模型名），供排查。
+            let countable = is_countable_log_error(entry.status, entry.model.as_deref());
             let key: LogErrorKey = (
                 entry.kind,
                 entry.status,
@@ -1275,6 +1278,15 @@ fn scan_error_logs(
                 normalize_opt(entry.error),
             );
             *counts.entry(key).or_insert(0) += 1;
+            // 统计/错误率/趋势：仅计入真实错误，与汇总同口径。
+            if countable {
+                total_error_entries += 1;
+                if let Some(t) = ts {
+                    if let Some(label) = bucket_label(t, interval) {
+                        *bucket_counts.entry(label).or_insert(0) += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -1627,6 +1639,7 @@ mod tests {
         assert!(is_countable_log_error(Some(503), Some("DeepSeek-V4")));
         assert!(is_countable_log_error(Some(400), Some("model-x")));
         assert!(!is_countable_log_error(Some(422), Some("model-x")));
+        assert!(!is_countable_log_error(Some(499), Some("model-x")));
         assert!(!is_countable_log_error(None, Some("model-x")));
         assert!(!is_countable_log_error(Some(500), None));
         assert!(!is_countable_log_error(Some(500), Some("")));
@@ -1635,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_error_logs_counts_only_countable_and_buckets() {
+    fn scan_error_logs_counts_only_countable_but_lists_all() {
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1647,13 +1660,51 @@ mod tests {
             "1.1.1.1 - - [20/Sep/2026:10:00:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 500 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"all failed\" \"-\"",
             "2.2.2.2 - - [20/Sep/2026:10:05:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 422 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"bad\" \"-\"",
             "3.3.3.3 - - [20/Sep/2026:10:06:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 404 50 \"-\" \"ua\" 1.000s \"\" \"-\" \"none\" \"-\"",
+            "5.5.5.5 - - [20/Sep/2026:10:16:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 499 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"user cancel\" \"-\"",
         ]
         .join("\n");
         std::fs::write(dir.join("error.2026-09-20.log"), body).unwrap();
         let scan = scan_error_logs(&dir, None, None, 100, "day");
+        // 错误排行列出全部 4 条
+        assert_eq!(scan.total, 4);
+        // 统计/趋势只计入 1 条真实错误（500 且有模型）
         assert_eq!(scan.total_error_entries, 1);
         let bucket_sum: i64 = scan.per_bucket.iter().map(|(_, c)| c).sum();
         assert_eq!(bucket_sum, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn counted_requests_exclude_gray_zone() {
+        let (path, pool) = temp_db("counted").await;
+        sqlx::query(
+            "INSERT INTO records (id, TimeMs, Model, Status, Error, LatencyMs) VALUES \
+             (1, 1000, 'm1', 200, NULL, 10.0), \
+             (2, 2000, 'm1', 500, 'boom', 20.0), \
+             (3, 3000, 'm1', 499, 'user cancel', 30.0), \
+             (4, 4000, 'm1', 422, 'bad', 40.0), \
+             (5, 5000, '',    500, 'nomodel', 50.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let shards = [ShardInput {
+            id: ACTIVE_SHARD.to_string(),
+            pool: pool.clone(),
+        }];
+        let rows = fetch_all_shards(&shards, &summary_sql(" WHERE 1=1"), &[])
+            .await
+            .unwrap();
+        let merged = merge_summaries(
+            &rows
+                .iter()
+                .flat_map(|r| r.iter().map(summary_from_row))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(merged.metrics.requests, 2);
+        assert_eq!(merged.metrics.success, 1);
+        assert_eq!(merged.metrics.errors, 1);
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
     }
 }
