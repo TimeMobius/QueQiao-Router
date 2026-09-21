@@ -32,7 +32,7 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
   - **Random**: 纯加权随机路由，无状态调度。
   - **LeastConnections**: 加权最少连接路由，实时读取活跃请求数（Prometheus gauge），将新请求调度至当前负载最低的后端。
 - **自动故障转移 (Failover)**: 当前端客户端返回 5xx 错误或网络错误时，自动并发尝试后续客户端（多后端场景）；若所有后端均失败且配置了 `fallback`，则切换至指定的后备模型。
-- **灵活的客户端配置**: 支持自定义请求头 (`headers`)、提示词前缀 (`special_prefix`)、停止序列 (`stop`)、最大令牌数 (`max_tokens`) 和请求体字段注入 (`extra_body`)。
+- **灵活的客户端配置**: 支持提示词前缀 (`special_prefix`)、停止序列 (`stop`)、最大令牌数 (`max_tokens`) 和请求体字段注入 (`extra_body`)。
 
 ### 🔄 思考格式归一化 (Thinking Format Normalization)
 - **多格式互转**: 将模型输出的推理/思考内容在 `<think>...</think>`（ThinkTag）、`reasoning` 字段、`reasoning_content` 字段之间任意转换。
@@ -185,8 +185,6 @@ openai_clients:
     special_prefix: "<PREFIX>"   # 可选：添加特殊前缀
     stop: ["<STOP1>"]            # 可选：停止序列
     max_tokens: 4096             # 可选：最大令牌数覆盖
-    headers:                     # 可选：自定义请求头
-      "X-Custom-Header": "value"
     extra_body: |                # 可选：JSON 对象，仅当请求未提供同名字段时注入
       {"frequency_penalty": 1, "presence_penalty": 0.91}
     thinking_format: "reasoning" # 可选：覆盖全局思考格式

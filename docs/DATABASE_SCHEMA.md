@@ -83,8 +83,7 @@ v1 起通过迁移补齐的现代列：
 
 ### 身份字段与请求头的对应关系
 
-以下字段直接取自客户端请求头，**仅用于审计入库，不**透传给上游（见
-`src/db/extract.rs` 的 `header_meta`）：
+以下字段直接取自客户端请求头（见 `src/db/extract.rs` 的 `header_meta`）：
 
 | 列 | 来源请求头 |
 | :--- | :--- |
@@ -94,6 +93,11 @@ v1 起通过迁移补齐的现代列：
 | `RequestId` | `x-request-id` → `x-trace-id` → `request-id` → `x-correlation-id`（依次取第一个非空，trim 后截断至 200 字符） |
 | `ApiKey` | `Authorization: Bearer <token>` 或 `x-api-key`；默认明文入库，设 `RECORD_STORE_RAW_CREDENTIALS=false` 时不落库 |
 | `UserAgent` / `ClientName` / `ClientVersion` | `user-agent`（后两者由 UA 解析出名称/版本） |
+
+其中 `user-agent`、`x-request-id`、`x-trace-id`、`x-correlation-id`、`x-session-id`、
+`x-parent-session-id`、`x-session-affinity` 会按白名单**原样透传给上游**（见 `src/client/proxy.rs`
+的 `FORWARD_HEADERS`，供后端做日志关联与客户端识别）；`authorization`/`x-api-key` 始终替换为
+上游 key，其余客户端头不转发。
 
 ---
 

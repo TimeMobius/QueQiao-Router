@@ -259,6 +259,7 @@ async fn send_streaming_with_retry(
     url: &str,
     request_body: &Value,
     api_endpoint: &str,
+    client_headers: &HeaderMap,
 ) -> Result<reqwest::Response, AppError> {
     for attempt in 1..=2u8 {
         match build_and_send_request(
@@ -269,6 +270,7 @@ async fn send_streaming_with_retry(
             request_body,
             true,
             api_endpoint,
+            client_headers,
         )
         .await
         {
@@ -297,6 +299,7 @@ async fn fetch_non_streaming_with_retry(
     url: &str,
     request_body: &Value,
     api_endpoint: &str,
+    client_headers: &HeaderMap,
 ) -> Result<(StatusCode, Bytes), AppError> {
     for attempt in 1..=2u8 {
         let response = match build_and_send_request(
@@ -307,6 +310,7 @@ async fn fetch_non_streaming_with_retry(
             request_body,
             false,
             api_endpoint,
+            client_headers,
         )
         .await
         {
@@ -391,6 +395,7 @@ async fn dispatch_request(
             &url,
             &request_body,
             &api_endpoint,
+            headers,
         )
         .await?;
 
@@ -440,6 +445,7 @@ async fn dispatch_request(
             &url,
             &request_body,
             &api_endpoint,
+            headers,
         )
         .await?;
         let request_elapsed = request_start.elapsed().as_secs_f64();

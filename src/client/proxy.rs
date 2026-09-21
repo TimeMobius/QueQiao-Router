@@ -54,6 +54,33 @@ fn is_retryable_send_error(err: &(dyn std::error::Error + Send + Sync + 'static)
     }
 }
 
+/// 透传给上游的客户端标识头白名单，供后端做日志关联与客户端识别。
+/// 鉴权头（`authorization` / `x-api-key`）不在此列——始终由网关替换为上游 key。
+const FORWARD_HEADERS: &[&str] = &[
+    "user-agent",
+    "x-request-id",
+    "x-trace-id",
+    "x-correlation-id",
+    "x-session-id",
+    "x-parent-session-id",
+    "x-session-affinity",
+];
+
+fn forward_identity_headers(
+    rb: reqwest::RequestBuilder,
+    client_headers: &axum::http::HeaderMap,
+) -> reqwest::RequestBuilder {
+    let mut rb = rb;
+    for name in FORWARD_HEADERS {
+        if let Some(value) = client_headers.get(*name) {
+            if let Ok(v) = value.to_str() {
+                rb = rb.header(*name, v);
+            }
+        }
+    }
+    rb
+}
+
 async fn send_json_once(
     request_builder: reqwest::RequestBuilder,
     is_streaming: bool,
@@ -79,11 +106,15 @@ pub async fn build_and_send_request(
     request_body: &Value,
     is_streaming: bool,
     _endpoint: &str,
+    client_headers: &axum::http::HeaderMap,
 ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
     let client: Client = app_state.client_manager.get_client();
 
     let build_request = || {
-        let mut rb = client.post(url).header("Content-Type", "application/json");
+        let mut rb = forward_identity_headers(
+            client.post(url).header("Content-Type", "application/json"),
+            client_headers,
+        );
         if let Some(key) = api_key {
             rb = rb.header("Authorization", format!("Bearer {}", key));
         }
@@ -108,10 +139,12 @@ pub async fn build_and_send_request_multipart(
     is_streaming: bool,
     _endpoint: &str,
     _model: &str,
+    client_headers: &axum::http::HeaderMap,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let http_client = app_state.client_manager.get_client();
 
-    let mut request_builder = http_client.post(url).multipart(form);
+    let mut request_builder =
+        forward_identity_headers(http_client.post(url).multipart(form), client_headers);
 
     if let Some(key) = api_key {
         request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
@@ -158,6 +191,33 @@ mod tests {
 
     fn with_x_api_key(headers: &mut HeaderMap, key: &str) {
         headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
+    }
+
+    #[test]
+    fn forwards_only_whitelisted_identity_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-cli/1.0"));
+        headers.insert("x-request-id", HeaderValue::from_static("req-1"));
+        headers.insert("x-session-id", HeaderValue::from_static("sess-1"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-secret"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("sk-secret"));
+        headers.insert("x-custom", HeaderValue::from_static("nope"));
+
+        let built =
+            forward_identity_headers(reqwest::Client::new().post("http://example.com"), &headers)
+                .build()
+                .unwrap();
+        let out = built.headers();
+
+        assert_eq!(out.get("user-agent").unwrap(), "claude-cli/1.0");
+        assert_eq!(out.get("x-request-id").unwrap(), "req-1");
+        assert_eq!(out.get("x-session-id").unwrap(), "sess-1");
+        assert!(out.get("authorization").is_none());
+        assert!(out.get("x-api-key").is_none());
+        assert!(out.get("x-custom").is_none());
     }
 
     #[test]

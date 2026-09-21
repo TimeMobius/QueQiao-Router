@@ -152,6 +152,7 @@ async fn handle_audio_request(
                         false,
                         &api_endpoint,
                         current_model.as_str(),
+                        &headers,
                     )
                     .await
                     {
