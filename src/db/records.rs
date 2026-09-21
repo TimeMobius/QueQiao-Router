@@ -107,8 +107,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
             CompletionTokens, PromptTokens, TotalTokens, Tool, Multimodal,
             RequestBytes, ResponseBytes, PromptBytes, RequestTailBytes, AnswerBytes,
             MessageCount, SystemCount, ToolCount, AssistantCount, ToolResultCount, ImageCount,
-            Prompt, RequestTail, Answer, ToolNames,
-            Headers, Request, Response
+            Prompt, RequestTail, Answer, ToolNames
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?,
@@ -117,8 +116,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?
+            ?, ?, ?, ?
         )
         "#,
     )
@@ -166,9 +164,6 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
     .bind(&record.request_tail)
     .bind(&record.answer)
     .bind(&record.tool_names)
-    .bind("")
-    .bind("")
-    .bind("")
     .execute(&mut *tx)
     .await?;
 
