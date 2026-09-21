@@ -813,8 +813,16 @@ async fn build_analysis(
     // 并按趋势粒度并入对应时间桶。
     let log_dir = std::path::PathBuf::from(crate::logging::DEFAULT_LOG_DIR);
     let interval_for_scan = interval.clone();
+    let scan_filters = to_list_params(p, from, to);
     let log_scan = tokio::task::spawn_blocking(move || {
-        scan_error_logs(&log_dir, Some(from), Some(to), 1, &interval_for_scan)
+        scan_error_logs(
+            &log_dir,
+            Some(from),
+            Some(to),
+            1,
+            &interval_for_scan,
+            &scan_filters,
+        )
     })
     .await
     .map_err(internal)?;
@@ -1101,10 +1109,12 @@ async fn build_errors_log(p: &AnalysisParams) -> Result<Value, (StatusCode, Stri
     let (rf, rt) = resolve_range(p);
     let (interval, _) = effective_interval(p.interval.as_deref(), rf, rt);
 
-    let scan =
-        tokio::task::spawn_blocking(move || scan_error_logs(&dir, from, to, limit, &interval))
-            .await
-            .map_err(internal)?;
+    let scan_filters = to_list_params(p, rf, rt);
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_error_logs(&dir, from, to, limit, &interval, &scan_filters)
+    })
+    .await
+    .map_err(internal)?;
 
     let items: Vec<Value> = scan
         .groups
@@ -1182,12 +1192,83 @@ fn is_countable_log_error(status: Option<i64>) -> bool {
     status.is_some()
 }
 
+/// 日志请求路径 → 审计库 `Type` 列取值，必须与 `db::records::request_type_label` 保持一致。
+fn log_type_label(path: &str) -> Option<&'static str> {
+    match path {
+        "/v1/chat/completions" => Some("chat.completions"),
+        "/v1/completions" => Some("text_completion"),
+        "/v1/embeddings" => Some("embeddings"),
+        "/v1/rerank" | "/rerank" => Some("rerank"),
+        "/score" => Some("score"),
+        "/classify" => Some("classify"),
+        "/v1/responses" => Some("responses"),
+        "/v1/messages" => Some("anthropic.messages"),
+        _ => None,
+    }
+}
+
+/// 日志条目版通用筛选，语义与 `records_api::build_filters` 的 DB 侧保持一致：
+/// model/ip 大小写不敏感前缀、apikey/status/backend 精确、client 对 UA 大小写不敏感子串
+/// （ClientName 是 UA 解析片段，包含于 UA）、type 经路径映射后精确、errors=1 要求 Status>=400。
+fn log_entry_matches(e: &error_log_api::LogEntry, p: &records_api::ListParams) -> bool {
+    let ci_prefix = |field: &Option<String>, v: &str| match field {
+        Some(s) => s.to_lowercase().starts_with(&v.to_lowercase()),
+        None => false,
+    };
+    if let Some(v) = p.model.as_deref().filter(|s| !s.is_empty()) {
+        if !ci_prefix(&e.model, v) {
+            return false;
+        }
+    }
+    if let Some(v) = p.ip.as_deref().filter(|s| !s.is_empty()) {
+        if !ci_prefix(&e.ip, v) {
+            return false;
+        }
+    }
+    if let Some(v) = p.apikey.as_deref().filter(|s| !s.is_empty()) {
+        if e.api_key.as_deref() != Some(v) {
+            return false;
+        }
+    }
+    if let Some(v) = p.status {
+        if e.status != Some(v) {
+            return false;
+        }
+    }
+    if let Some(v) = p.backend.as_deref().filter(|s| !s.is_empty()) {
+        if e.backend.as_deref() != Some(v) {
+            return false;
+        }
+    }
+    if let Some(v) = p.client.as_deref().filter(|s| !s.is_empty()) {
+        let hay = e.user_agent.as_deref().unwrap_or("");
+        if !hay.to_lowercase().contains(&v.to_lowercase()) {
+            return false;
+        }
+    }
+    if let Some(v) = p.type_.as_deref().filter(|s| !s.is_empty()) {
+        if !matches!(e.path.as_deref(), Some(path) if log_type_label(path) == Some(v)) {
+            return false;
+        }
+    }
+    if p.errors
+        .as_deref()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        if !matches!(e.status, Some(s) if s >= 400) {
+            return false;
+        }
+    }
+    true
+}
+
 fn scan_error_logs(
     dir: &Path,
     from: Option<i64>,
     to: Option<i64>,
     limit: usize,
     interval: &str,
+    filters: &records_api::ListParams,
 ) -> LogScan {
     let mut warnings: Vec<String> = Vec::new();
     let mut files: Vec<std::path::PathBuf> = Vec::new();
@@ -1250,6 +1331,9 @@ fn scan_error_logs(
             }
             let is_error = entry.kind == "http_error" || entry.kind == "stream_interrupted";
             if !is_error {
+                continue;
+            }
+            if !log_entry_matches(&entry, filters) {
                 continue;
             }
             // 错误排行：列出全部错误（含无状态码的流中断）。
@@ -1645,13 +1729,190 @@ mod tests {
         ]
         .join("\n");
         std::fs::write(dir.join("error.2026-09-20.log"), body).unwrap();
-        let scan = scan_error_logs(&dir, None, None, 100, "day");
+        let scan = scan_error_logs(
+            &dir,
+            None,
+            None,
+            100,
+            "day",
+            &records_api::ListParams::default(),
+        );
         // 错误排行列出全部 5 条（含无状态码的流中断）
         assert_eq!(scan.total, 5);
         // 统计/趋势只计入 4 条带状态码错误
         assert_eq!(scan.total_error_entries, 4);
         let bucket_sum: i64 = scan.per_bucket.iter().map(|(_, c)| c).sum();
         assert_eq!(bucket_sum, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_http_entry() -> error_log_api::LogEntry {
+        error_log_api::LogEntry {
+            kind: "http_error".to_string(),
+            ip: Some("192.168.10.32".to_string()),
+            path: Some("/v1/chat/completions".to_string()),
+            status: Some(500),
+            user_agent: Some("python-httpx/0.27.0".to_string()),
+            model: Some("GPT-5.6-sol".to_string()),
+            api_key: Some("sk-abc".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn log_entry_matches_mirrors_db_filter_semantics() {
+        let e = test_http_entry();
+        let lp = |kv: Vec<(&str, String)>| {
+            let mut p = records_api::ListParams::default();
+            for (k, v) in kv {
+                match k {
+                    "model" => p.model = Some(v),
+                    "ip" => p.ip = Some(v),
+                    "apikey" => p.apikey = Some(v),
+                    "status" => p.status = v.parse().ok(),
+                    "backend" => p.backend = Some(v),
+                    "client" => p.client = Some(v),
+                    "type" => p.type_ = Some(v),
+                    "errors" => p.errors = Some(v),
+                    _ => unreachable!(),
+                }
+            }
+            p
+        };
+
+        assert!(log_entry_matches(&e, &records_api::ListParams::default()));
+
+        // model：大小写不敏感前缀
+        assert!(log_entry_matches(&e, &lp(vec![("model", "gpt".into())])));
+        assert!(log_entry_matches(&e, &lp(vec![("model", "GPT-5".into())])));
+        assert!(!log_entry_matches(
+            &e,
+            &lp(vec![("model", "deepseek".into())])
+        ));
+        // 条目缺 model 时任何 model 筛选都不命中
+        let no_model = error_log_api::LogEntry {
+            kind: "http_error".to_string(),
+            ..Default::default()
+        };
+        assert!(!log_entry_matches(
+            &no_model,
+            &lp(vec![("model", "gpt".into())])
+        ));
+
+        // ip：大小写不敏感前缀
+        assert!(log_entry_matches(&e, &lp(vec![("ip", "192.168".into())])));
+        assert!(!log_entry_matches(&e, &lp(vec![("ip", "10.0.0".into())])));
+
+        // apikey：精确
+        assert!(log_entry_matches(
+            &e,
+            &lp(vec![("apikey", "sk-abc".into())])
+        ));
+        assert!(!log_entry_matches(&e, &lp(vec![("apikey", "sk-a".into())])));
+
+        // status：精确
+        assert!(log_entry_matches(&e, &lp(vec![("status", "500".into())])));
+        assert!(!log_entry_matches(&e, &lp(vec![("status", "404".into())])));
+
+        // client：对 UA 大小写不敏感子串
+        assert!(log_entry_matches(
+            &e,
+            &lp(vec![("client", "PYTHON-HTTPX".into())])
+        ));
+        assert!(!log_entry_matches(&e, &lp(vec![("client", "curl".into())])));
+
+        // type：经路径映射后精确
+        assert!(log_entry_matches(
+            &e,
+            &lp(vec![("type", "chat.completions".into())])
+        ));
+        assert!(!log_entry_matches(
+            &e,
+            &lp(vec![("type", "responses".into())])
+        ));
+
+        // backend：http_error 无 backend，任何 backend 筛选都不命中
+        assert!(!log_entry_matches(
+            &e,
+            &lp(vec![("backend", "alpha".into())])
+        ));
+        let stream = error_log_api::LogEntry {
+            kind: "stream_interrupted".to_string(),
+            backend: Some("alpha".to_string()),
+            ..Default::default()
+        };
+        assert!(log_entry_matches(
+            &stream,
+            &lp(vec![("backend", "alpha".into())])
+        ));
+
+        // errors=1：要求 Status>=400，无状态码的流中断被排除
+        assert!(log_entry_matches(&e, &lp(vec![("errors", "1".into())])));
+        assert!(!log_entry_matches(
+            &stream,
+            &lp(vec![("errors", "1".into())])
+        ));
+    }
+
+    #[test]
+    fn scan_error_logs_applies_common_filters() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("qq_logfilter_{}_{}", pid, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = [
+            "1.1.1.1 - - [20/Sep/2026:10:00:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 500 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"all failed\" \"-\"",
+            "2.2.2.2 - - [20/Sep/2026:10:05:00 +0000] \"POST /v1/responses HTTP/1.1\" 503 50 \"-\" \"ua\" 1.000s \"DeepSeek-V4\" \"-\" \"cooling\" \"-\"",
+            "[20/Sep/2026:10:20:00 +0000] STREAM_INTERRUPTED client=6.6.6.6 endpoint=/v1/chat/completions model=gpt-5.6 backend=b1 error=\"stream cut\"",
+        ]
+        .join("\n");
+        std::fs::write(dir.join("error.2026-09-20.log"), body).unwrap();
+
+        // 无筛选：全部计入
+        let scan = scan_error_logs(
+            &dir,
+            None,
+            None,
+            100,
+            "day",
+            &records_api::ListParams::default(),
+        );
+        assert_eq!(scan.total_error_entries, 2);
+
+        // model 前缀筛选：只命中 gpt
+        let p = records_api::ListParams {
+            model: Some("gpt".to_string()),
+            ..Default::default()
+        };
+        let scan = scan_error_logs(&dir, None, None, 100, "day", &p);
+        assert_eq!(
+            scan.total, 2,
+            "gpt-5.6 的 http_error 与 stream_interrupted 都应命中"
+        );
+        assert_eq!(scan.total_error_entries, 1, "流中断不计入统计");
+        assert_eq!(scan.groups.iter().map(|g| g.count).sum::<i64>(), 2);
+
+        // ip 前缀筛选：全部不命中
+        let p = records_api::ListParams {
+            ip: Some("10.0.0".to_string()),
+            ..Default::default()
+        };
+        let scan = scan_error_logs(&dir, None, None, 100, "day", &p);
+        assert_eq!(scan.total, 0);
+        assert_eq!(scan.total_error_entries, 0);
+
+        // status 精确筛选
+        let p = records_api::ListParams {
+            status: Some(503),
+            ..Default::default()
+        };
+        let scan = scan_error_logs(&dir, None, None, 100, "day", &p);
+        assert_eq!(scan.total, 1);
+        assert_eq!(scan.total_error_entries, 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

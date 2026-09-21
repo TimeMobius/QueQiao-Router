@@ -43,6 +43,12 @@
 （并发由 `Semaphore` 限制为 8），并在 Rust 侧归并；响应中的 `shards` 列出本次实际
 查询的分片 id（`active` 或 `record_YYYYMM`）。
 
+这些筛选**同时作用于错误日志来源**（主接口的 `logErrors`/趋势合并与
+`GET /dashboard/api/analysis/errors?source=log`）：日志条目按相同语义过滤
+（model/ip 大小写不敏感前缀、apikey/status/backend 精确、client 对 `User-Agent`
+大小写不敏感子串、type 按日志请求路径映射为 `Type` 取值后精确匹配，如
+`/v1/messages` → `anthropic.messages`、`/v1/completions` → `text_completion`）。
+
 ---
 
 ## `GET /dashboard/api/analysis`
@@ -138,7 +144,8 @@
 枚举 `logs/error.*.log`，**从文件开头正向读取**并逐行解析（复用 `error_log_api::parse_line`
 的解析器，不重复实现）。若提供了 `from`/`to`，解析每行的 `time` 字段
 （格式 `17/Sep/2026:07:28:00 +0000`）并按时段过滤；**时间无法解析的条目会被保留并计入
-`unparsed`**。分组键为 `(kind, status, model, backend, error)`。
+`unparsed`**。通用筛选参数同样作用于日志条目（见上文「通用筛选参数」末尾说明）。
+分组键为 `(kind, status, model, backend, error)`。
 
 ```json
 {"source":"log","files":["error.2026-09-17.log"],"warnings":[],
