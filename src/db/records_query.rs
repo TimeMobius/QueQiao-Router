@@ -1,17 +1,150 @@
 //! records 检索的 SQL/查询引擎：列清单、过滤 DSL、跨分片查询与详情/分面查询。
 //!
-//! 从 `handlers::records_api` 下沉而来，供 handler 层与 analysis_api 复用。
-//! 行 → JSON 映射（`row_to_item`/`int`）、游标解析（`CursorKey`/`parse_cursor`/
-//! `format_cursor`）与查询参数模型（`ListParams`）仍留在 handler 层，由本模块引用。
 
 use axum::http::StatusCode;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Row, Sqlite, SqlitePool};
 
 use crate::db::archive::ACTIVE_SHARD;
-use crate::handlers::records_api::{
-    format_cursor, int, parse_cursor, row_to_item, CursorKey, ListParams,
-};
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListParams {
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    pub model: Option<String>,
+    pub status: Option<i64>,
+    pub backend: Option<String>,
+    pub ip: Option<String>,
+    pub client: Option<String>,
+    pub session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub request_id: Option<String>,
+    pub apikey: Option<String>,
+    pub q: Option<String>,
+    pub errors: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CursorKey {
+    pub(crate) time_ms: i64,
+    pub(crate) id: i64,
+    pub(crate) shard: Option<String>,
+}
+
+pub(crate) fn parse_cursor(s: &str) -> Option<CursorKey> {
+    let mut parts = s.split(':');
+    let time_ms = parts.next()?.parse::<i64>().ok()?;
+    let id = parts.next()?.parse::<i64>().ok()?;
+    match parts.next() {
+        None => Some(CursorKey {
+            time_ms,
+            id,
+            shard: None,
+        }),
+        Some(shard) => {
+            if shard.is_empty() || parts.next().is_some() {
+                return None;
+            }
+            Some(CursorKey {
+                time_ms,
+                id,
+                shard: Some(shard.to_string()),
+            })
+        }
+    }
+}
+
+pub(crate) fn format_cursor(time_ms: i64, id: i64, shard: Option<&str>) -> String {
+    match shard {
+        Some(s) => format!("{time_ms}:{id}:{s}"),
+        None => format!("{time_ms}:{id}"),
+    }
+}
+
+pub(crate) fn text(row: &sqlx::sqlite::SqliteRow, name: &str) -> Option<String> {
+    row.try_get::<Option<String>, _>(name).ok().flatten()
+}
+
+pub(crate) fn int(row: &sqlx::sqlite::SqliteRow, name: &str) -> Option<i64> {
+    row.try_get::<Option<i64>, _>(name).ok().flatten()
+}
+
+fn real(row: &sqlx::sqlite::SqliteRow, name: &str) -> Option<f64> {
+    row.try_get::<Option<f64>, _>(name).ok().flatten()
+}
+
+fn flag(row: &sqlx::sqlite::SqliteRow, name: &str) -> bool {
+    int(row, name).unwrap_or(0) != 0
+}
+
+fn preview(row: &sqlx::sqlite::SqliteRow) -> Option<String> {
+    let raw = text(row, "PromptPreview")?;
+    let mut chars = raw.chars();
+    let head: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        Some(format!("{head}…"))
+    } else {
+        Some(head)
+    }
+}
+
+fn tokens(row: &sqlx::sqlite::SqliteRow) -> (i64, i64, i64) {
+    let prompt = int(row, "PromptTokens").unwrap_or(0);
+    let completion = int(row, "CompletionTokens").unwrap_or(0);
+    let mut total = int(row, "TotalTokens").unwrap_or(0);
+    if total == 0 {
+        total = prompt + completion;
+    }
+    (prompt, completion, total)
+}
+
+pub(crate) fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> Value {
+    let (prompt_tokens, completion_tokens, total_tokens) = tokens(row);
+    json!({
+        "id": int(row, "id").unwrap_or(0),
+        "time": text(row, "Time"),
+        "timeMs": int(row, "TimeMs"),
+        "type": text(row, "Type"),
+        "model": text(row, "Model"),
+        "status": int(row, "Status"),
+        "backend": text(row, "Backend"),
+        "ip": text(row, "IP"),
+        "method": text(row, "Method"),
+        "endpoint": text(row, "Endpoint"),
+        "sessionId": text(row, "SessionId"),
+        "parentSessionId": text(row, "ParentSessionId"),
+        "requestId": text(row, "RequestId"),
+        "clientName": text(row, "ClientName"),
+        "clientVersion": text(row, "ClientVersion"),
+        "userAgent": text(row, "UserAgent"),
+        "latencyMs": real(row, "LatencyMs"),
+        "ttftMs": real(row, "TtftMs"),
+        "upstreamMs": real(row, "UpstreamMs"),
+        "streamMs": real(row, "StreamMs"),
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "totalTokens": total_tokens,
+        "messageCount": int(row, "MessageCount"),
+        "systemCount": int(row, "SystemCount"),
+        "toolCount": int(row, "ToolCount"),
+        "assistantCount": int(row, "AssistantCount"),
+        "toolResultCount": int(row, "ToolResultCount"),
+        "imageCount": int(row, "ImageCount"),
+        "tool": flag(row, "Tool"),
+        "multimodal": flag(row, "Multimodal"),
+        "requestBytes": int(row, "RequestBytes"),
+        "responseBytes": int(row, "ResponseBytes"),
+        "finishReason": text(row, "FinishReason"),
+        "error": text(row, "Error"),
+        "retryCount": int(row, "RetryCount"),
+        "promptPreview": preview(row),
+    })
+}
 
 const LIST_COLS: &str = "id, Time, TimeMs, Type, Model, Status, Backend, IP, Method, Endpoint, \
     SessionId, ParentSessionId, RequestId, ClientName, ClientVersion, UserAgent, \
@@ -433,6 +566,41 @@ pub(crate) async fn query_facets(
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn cursor_roundtrip_two_and_three_fields() {
+        let two = parse_cursor("1789639720742:273").unwrap();
+        assert_eq!(
+            two,
+            CursorKey {
+                time_ms: 1789639720742,
+                id: 273,
+                shard: None,
+            }
+        );
+        assert_eq!(
+            format_cursor(two.time_ms, two.id, None),
+            "1789639720742:273"
+        );
+
+        let three = parse_cursor("1789639720742:273:record_202608").unwrap();
+        assert_eq!(
+            three,
+            CursorKey {
+                time_ms: 1789639720742,
+                id: 273,
+                shard: Some("record_202608".to_string()),
+            }
+        );
+        assert_eq!(
+            format_cursor(three.time_ms, three.id, three.shard.as_deref()),
+            "1789639720742:273:record_202608"
+        );
+
+        assert!(parse_cursor("not-a-cursor").is_none());
+        assert!(parse_cursor("1:2:3:4").is_none());
+        assert!(parse_cursor("1:2:").is_none());
+    }
 
     #[test]
     fn prefix_upper_sorts_after_every_matching_string() {
