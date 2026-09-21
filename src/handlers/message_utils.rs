@@ -81,7 +81,7 @@ fn has_reasoning(message: &Message) -> bool {
     non_empty(&message.reasoning) || non_empty(&message.reasoning_content)
 }
 
-static THINK_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r" thinking.*? response").unwrap());
+static THINK_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
 
 /// 移除助手消息中的思考标签
 pub fn remove_think_tags(messages: Vec<Message>) -> Vec<Message> {
@@ -224,7 +224,7 @@ mod tests {
         let messages = vec![Message {
             role: "assistant".to_string(),
             content: Some(MessageContent::String(
-                " thinking thinking process response actual response".to_string(),
+                "<think> thinking process</think> actual response".to_string(),
             )),
             reasoning: None,
             reasoning_content: None,
@@ -244,8 +244,7 @@ mod tests {
         let messages = vec![Message {
             role: "assistant".to_string(),
             content: Some(MessageContent::String(
-                " thinking think 1 response response 1 thinking think 2 response response 2"
-                    .to_string(),
+                "<think> think 1</think> response 1<think> think 2</think> response 2".to_string(),
             )),
             reasoning: None,
             reasoning_content: None,
@@ -257,6 +256,21 @@ mod tests {
         assert_eq!(
             result[0].content.as_ref().unwrap(),
             &MessageContent::String(" response 1 response 2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_remove_think_tags_multiline() {
+        let messages = vec![create_message(
+            "assistant",
+            "<think>first line\nsecond line</think>actual response",
+        )];
+
+        let result = remove_think_tags(messages);
+
+        assert_eq!(
+            result[0].content.as_ref().unwrap(),
+            &MessageContent::String("actual response".to_string())
         );
     }
 }
