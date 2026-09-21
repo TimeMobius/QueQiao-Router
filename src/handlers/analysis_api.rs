@@ -288,7 +288,9 @@ fn clamp_top(v: Option<i64>) -> usize {
 
 const SQL_SUCCESS: &str =
     "COALESCE(SUM(CASE WHEN Status >= 200 AND Status < 400 THEN 1 ELSE 0 END),0)";
-const SQL_ERRORS: &str = "COALESCE(SUM(CASE WHEN Status >= 400 THEN 1 ELSE 0 END),0)";
+// 499 为用户主动中断（client disconnected），不计入错误统计。
+const SQL_ERRORS: &str =
+    "COALESCE(SUM(CASE WHEN Status >= 400 AND Status <> 499 THEN 1 ELSE 0 END),0)";
 const SQL_PROMPT: &str = "COALESCE(SUM(COALESCE(PromptTokens,0)),0)";
 const SQL_COMPLETION: &str = "COALESCE(SUM(COALESCE(CompletionTokens,0)),0)";
 const SQL_TOTAL: &str = "COALESCE(SUM(COALESCE(TotalTokens,0)),0)";
@@ -344,8 +346,8 @@ fn errors_db_sql(where_sql: &str) -> String {
     format!(
         "SELECT Status AS status, COALESCE(NULLIF(Model,''),'Unknown') AS model, \
          COALESCE(Backend,'') AS backend, COALESCE(NULLIF(Error,''),'-') AS error, \
-         COUNT(*) AS c FROM records{where_sql} AND Status >= 400 GROUP BY 1,2,3,4 \
-         ORDER BY c DESC LIMIT {}",
+         COUNT(*) AS c FROM records{where_sql} AND Status >= 400 AND Status <> 499 \
+         GROUP BY 1,2,3,4 ORDER BY c DESC LIMIT {}",
         COUNT_CAP + 1
     )
 }
@@ -805,6 +807,35 @@ async fn build_analysis(
         warnings.push(format!("trend capped to last {MAX_BUCKETS} buckets"));
     }
 
+    // 错误日志捕获的是 DB 之外的另一类错误（硬失败 500/503/404/400/422 等，多为非流式
+    // 请求且未写入 DB），与 DB 的流式错误（499/502）互不重叠，可直接相加得到完整错误集，
+    // 并按趋势粒度并入对应时间桶。
+    let log_dir = std::path::PathBuf::from(crate::logging::DEFAULT_LOG_DIR);
+    let interval_for_scan = interval.clone();
+    let log_scan = tokio::task::spawn_blocking(move || {
+        scan_error_logs(&log_dir, Some(from), Some(to), 1, &interval_for_scan)
+    })
+    .await
+    .map_err(internal)?;
+    for (label, count) in &log_scan.per_bucket {
+        if let Some(entry) = trend.iter_mut().find(|(l, _)| l == label) {
+            entry.1.errors += *count;
+        } else {
+            trend.push((
+                label.clone(),
+                Metrics {
+                    errors: *count,
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    trend.sort_by(|a, b| a.0.cmp(&b.0));
+    if trend.len() > MAX_BUCKETS as usize {
+        let drop = trend.len() - MAX_BUCKETS as usize;
+        trend.drain(..drop);
+    }
+
     // 维度
     let dim_rows = fetch_sliced(&shards, p, from, to, |w| {
         dims_sql(w, dim_expr, GROUP_CAP + 1)
@@ -909,15 +940,8 @@ async fn build_analysis(
         .map_err(internal)?;
     let ttft_buckets = merge_histograms(&ttft_hist);
 
-    // 日志独有的 STREAM_INTERRUPTED：SSE 已提交 200，永不进入 DB Status>=400，
-    // 因此只把它并入错误总数，避免与日志中的 HTTP 错误（DB 已计数）重复。
-    let log_dir = std::path::PathBuf::from(crate::logging::DEFAULT_LOG_DIR);
-    let log_scan =
-        tokio::task::spawn_blocking(move || scan_error_logs(&log_dir, Some(from), Some(to), 1))
-            .await
-            .map_err(internal)?;
     let db_errors = summary.metrics.errors;
-    let log_only_errors = log_scan.stream_interrupted;
+    let log_errors = log_scan.total_error_entries;
 
     Ok(json!({
         "from": from,
@@ -927,11 +951,11 @@ async fn build_analysis(
         "shards": shard_ids,
         "warnings": warnings,
         "summary": {
-            "requests": summary.metrics.requests,
+            "requests": summary.metrics.requests + log_errors,
             "success": summary.metrics.success,
-            "errors": db_errors + log_only_errors,
+            "errors": db_errors + log_errors,
             "dbErrors": db_errors,
-            "logOnlyErrors": log_only_errors,
+            "logErrors": log_errors,
             "promptTokens": summary.metrics.prompt_tokens,
             "completionTokens": summary.metrics.completion_tokens,
             "totalTokens": summary.metrics.total_tokens,
@@ -1073,10 +1097,13 @@ async fn build_errors_log(p: &AnalysisParams) -> Result<Value, (StatusCode, Stri
     let from = p.from;
     let to = p.to;
     let dir = std::path::PathBuf::from(crate::logging::DEFAULT_LOG_DIR);
+    let (rf, rt) = resolve_range(p);
+    let (interval, _) = effective_interval(p.interval.as_deref(), rf, rt);
 
-    let scan = tokio::task::spawn_blocking(move || scan_error_logs(&dir, from, to, limit))
-        .await
-        .map_err(internal)?;
+    let scan =
+        tokio::task::spawn_blocking(move || scan_error_logs(&dir, from, to, limit, &interval))
+            .await
+            .map_err(internal)?;
 
     let items: Vec<Value> = scan
         .groups
@@ -1119,7 +1146,11 @@ struct LogGroup {
 struct LogScan {
     groups: Vec<LogGroup>,
     unparsed: i64,
-    stream_interrupted: i64,
+    /// 区间内解析出的全部可计入错误条目数（http_error + stream_interrupted），
+    /// 即错误日志中实际的错误请求总量，用于并入汇总与趋势。
+    total_error_entries: i64,
+    /// 按趋势粒度聚合的错误条目计数（桶标签 → 次数），与 SQL `bucket_expr` 对齐。
+    per_bucket: Vec<(String, i64)>,
     files: Vec<String>,
     warnings: Vec<String>,
     total: i64,
@@ -1132,7 +1163,41 @@ fn parse_log_time(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize) -> LogScan {
+/// 将 epoch 毫秒映射为与 SQL `bucket_expr` 完全一致的桶标签（进程本地时区），
+/// 保证日志错误能并入同一条趋势桶。
+fn bucket_label(ms: i64, interval: &str) -> Option<String> {
+    use chrono::TimeZone;
+    let dt = chrono::Local.timestamp_millis_opt(ms).single()?;
+    Some(match interval {
+        "hour" => dt.format("%Y-%m-%d %H").to_string(),
+        "month" => dt.format("%Y-%m").to_string(),
+        _ => dt.format("%Y-%m-%d").to_string(),
+    })
+}
+
+/// 日志错误是否计入统计/错误率/趋势/排行：需同时满足——有模型名、有错误状态码、
+/// 且状态码不是 422（模型不存在/参数校验类噪音，非上游故障）。
+fn is_countable_log_error(status: Option<i64>, model: Option<&str>) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    if status == 422 {
+        return false;
+    }
+    let Some(model) = model else {
+        return false;
+    };
+    let model = model.trim();
+    !model.is_empty() && model != "-"
+}
+
+fn scan_error_logs(
+    dir: &Path,
+    from: Option<i64>,
+    to: Option<i64>,
+    limit: usize,
+    interval: &str,
+) -> LogScan {
     let mut warnings: Vec<String> = Vec::new();
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1146,8 +1211,9 @@ fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize)
     files.sort();
 
     let mut counts: HashMap<LogErrorKey, i64> = HashMap::new();
+    let mut bucket_counts: HashMap<String, i64> = HashMap::new();
     let mut unparsed: i64 = 0;
-    let mut stream_interrupted: i64 = 0;
+    let mut total_error_entries: i64 = 0;
     let mut total_lines: i64 = 0;
     let mut read_files: Vec<String> = Vec::new();
     let range_active = from.is_some() || to.is_some();
@@ -1182,15 +1248,23 @@ fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize)
             if entry.kind == "unparsed" {
                 unparsed += 1;
             }
+            let ts = entry.time.as_deref().and_then(parse_log_time);
             if range_active {
-                match entry.time.as_deref().and_then(parse_log_time) {
-                    Some(t) => {
-                        if t < lo || t > hi {
-                            continue;
-                        }
-                    }
+                match ts {
+                    Some(t) if t < lo || t > hi => continue,
                     // 时间无法解析的条目被保留并计数。
                     None => unparsed += 1,
+                    _ => {}
+                }
+            }
+            let is_error = entry.kind == "http_error" || entry.kind == "stream_interrupted";
+            if !(is_error && is_countable_log_error(entry.status, entry.model.as_deref())) {
+                continue;
+            }
+            total_error_entries += 1;
+            if let Some(t) = ts {
+                if let Some(label) = bucket_label(t, interval) {
+                    *bucket_counts.entry(label).or_insert(0) += 1;
                 }
             }
             let key: LogErrorKey = (
@@ -1200,9 +1274,6 @@ fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize)
                 normalize_opt(entry.backend),
                 normalize_opt(entry.error),
             );
-            if key.0 == "stream_interrupted" {
-                stream_interrupted += 1;
-            }
             *counts.entry(key).or_insert(0) += 1;
         }
     }
@@ -1221,10 +1292,12 @@ fn scan_error_logs(dir: &Path, from: Option<i64>, to: Option<i64>, limit: usize)
     groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.kind.cmp(&b.kind)));
     let total = groups.len() as i64;
     groups.truncate(limit);
+    let per_bucket: Vec<(String, i64)> = bucket_counts.into_iter().collect();
     LogScan {
         groups,
         unparsed,
-        stream_interrupted,
+        total_error_entries,
+        per_bucket,
         files: read_files,
         warnings,
         total,
@@ -1546,5 +1619,41 @@ mod tests {
 
         drop(pool);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn countable_log_error_filters_noise() {
+        assert!(is_countable_log_error(Some(500), Some("gpt-5.6")));
+        assert!(is_countable_log_error(Some(503), Some("DeepSeek-V4")));
+        assert!(is_countable_log_error(Some(400), Some("model-x")));
+        assert!(!is_countable_log_error(Some(422), Some("model-x")));
+        assert!(!is_countable_log_error(None, Some("model-x")));
+        assert!(!is_countable_log_error(Some(500), None));
+        assert!(!is_countable_log_error(Some(500), Some("")));
+        assert!(!is_countable_log_error(Some(500), Some("  ")));
+        assert!(!is_countable_log_error(Some(500), Some("-")));
+    }
+
+    #[test]
+    fn scan_error_logs_counts_only_countable_and_buckets() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("qq_logscan_{}_{}", pid, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = [
+            "1.1.1.1 - - [20/Sep/2026:10:00:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 500 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"all failed\" \"-\"",
+            "2.2.2.2 - - [20/Sep/2026:10:05:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 422 50 \"-\" \"ua\" 1.000s \"gpt-5.6\" \"-\" \"bad\" \"-\"",
+            "3.3.3.3 - - [20/Sep/2026:10:06:00 +0000] \"POST /v1/chat/completions HTTP/1.1\" 404 50 \"-\" \"ua\" 1.000s \"\" \"-\" \"none\" \"-\"",
+        ]
+        .join("\n");
+        std::fs::write(dir.join("error.2026-09-20.log"), body).unwrap();
+        let scan = scan_error_logs(&dir, None, None, 100, "day");
+        assert_eq!(scan.total_error_entries, 1);
+        let bucket_sum: i64 = scan.per_bucket.iter().map(|(_, c)| c).sum();
+        assert_eq!(bucket_sum, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
