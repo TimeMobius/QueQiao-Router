@@ -40,10 +40,9 @@ jobs:
 
       - name: Update Cargo package version
         run: |
+          # Cargo.lock 未纳入版本控制（.gitignore），无需同步；构建时由 cargo 自动重建
           cargo_version="${{ steps.version.outputs.cargo_version }}"
           sed -i -E "s/^version = \"[^\"]+\"\$/version = \"${cargo_version}\"/" Cargo.toml
-          awk -v v="$cargo_version" '/^name = "queqiao-router"$/{ print; getline nl; sub(/^version = "[^"]+"$/, "version = \"" v "\"", nl); print nl; next } { print }' Cargo.lock > Cargo.lock.new
-          mv Cargo.lock.new Cargo.lock
 
       - name: Commit and push release metadata
         run: |

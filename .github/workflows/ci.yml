@@ -69,10 +69,9 @@ jobs:
 
       - name: Set Cargo version to build number
         run: |
+          # Cargo.lock 未纳入版本控制，docker 构建时由 cargo 自动同步
           cargo_version="0.2.${COUNT}"
           sed -i -E "s/^version = \"[^\"]+\"\$/version = \"${cargo_version}\"/" Cargo.toml
-          awk -v v="$cargo_version" '/^name = "queqiao-router"$/{ print; getline nl; sub(/^version = "[^"]+"$/, "version = \"" v "\"", nl); print nl; next } { print }' Cargo.lock > Cargo.lock.new
-          mv Cargo.lock.new Cargo.lock
 
       - name: Set owner to lowercase
         run: echo "OWNER_LC=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
