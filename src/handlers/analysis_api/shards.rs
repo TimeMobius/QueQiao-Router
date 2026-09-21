@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::db::archive::ACTIVE_SHARD;
-use crate::handlers::records_api;
+use crate::db::records_query;
 use crate::state::app_state::AppState;
 
 use super::aggregation::col_text;
@@ -29,9 +29,9 @@ pub(super) struct ShardInput {
 async fn fetch(
     pool: &SqlitePool,
     sql: &str,
-    binds: &[records_api::Bind],
+    binds: &[records_query::Bind],
 ) -> Result<Vec<SqliteRow>, sqlx::Error> {
-    records_api::bind_all(sqlx::query(sql), binds)
+    records_query::bind_all(sqlx::query(sql), binds)
         .fetch_all(pool)
         .await
 }
@@ -60,7 +60,7 @@ async fn join_queries(
 pub(super) async fn fetch_all_shards(
     shards: &[ShardInput],
     sql: &str,
-    binds: &[records_api::Bind],
+    binds: &[records_query::Bind],
 ) -> Result<Vec<Vec<SqliteRow>>, sqlx::Error> {
     let tasks = shards
         .iter()
@@ -129,7 +129,7 @@ where
         for &(slice_from, slice_to) in &slices {
             let pool = shard.pool.clone();
             let (where_sql, binds) =
-                records_api::build_filters(&to_list_params(p, slice_from, slice_to));
+                records_query::build_filters(&to_list_params(p, slice_from, slice_to));
             let sql = make_sql(&where_sql);
             tasks.push(tokio::spawn(async move {
                 let _permit = SHARD_SEM.acquire().await;
@@ -146,7 +146,7 @@ where
 pub(super) async fn distinct_count_across_shards(
     shards: &[ShardInput],
     where_sql: &str,
-    binds: &[records_api::Bind],
+    binds: &[records_query::Bind],
     column: &str,
 ) -> Result<(usize, bool), sqlx::Error> {
     let rows =

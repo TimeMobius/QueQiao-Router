@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::handlers::records_api;
+use crate::db::records_query;
 use crate::state::app_state::AppState;
 
 use super::aggregation::{
@@ -76,7 +76,7 @@ async fn build_analysis(
     let shard_ids: Vec<String> = shards.iter().map(|s| s.id.clone()).collect();
 
     // 汇总
-    let (where_sql, binds) = records_api::build_filters(&to_list_params(p, from, to));
+    let (where_sql, binds) = records_query::build_filters(&to_list_params(p, from, to));
     let summary_rows = fetch_all_shards(&shards, &summary_sql(&where_sql), &binds)
         .await
         .map_err(internal)?;

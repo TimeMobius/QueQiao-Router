@@ -38,7 +38,7 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
         .map(|row| row.get::<String, _>("name"))
         .collect();
 
-    for (name, decl) in super::NEW_COLUMNS {
+    for (name, decl) in crate::db::schema::NEW_COLUMNS {
         if !existing.iter().any(|c| c == name) {
             sqlx::query(&format!("ALTER TABLE records ADD COLUMN {} {}", name, decl))
                 .execute(&mut *tx)
@@ -47,7 +47,9 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
     }
 
     // 逐行处理需要写 payloads，其表必须先行存在。
-    sqlx::query(super::PAYLOADS_DDL).execute(&mut *tx).await?;
+    sqlx::query(crate::db::schema::PAYLOADS_DDL)
+        .execute(&mut *tx)
+        .await?;
 
     // 列存在性守卫：重复迁移（或已转换库）没有 Request 列时整体跳过逐行管线。
     let has_legacy_body = existing.iter().any(|c| c == "Request");
@@ -215,15 +217,16 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
     }
 
     let has_col = |c: &str| {
-        existing.iter().any(|e| e == c) || super::NEW_COLUMNS.iter().any(|(n, _)| *n == c)
+        existing.iter().any(|e| e == c)
+            || crate::db::schema::NEW_COLUMNS.iter().any(|(n, _)| *n == c)
     };
 
-    for (sql, required) in super::NEW_INDEXES {
+    for (sql, required) in crate::db::schema::NEW_INDEXES {
         if required.iter().all(|c| has_col(c)) {
             sqlx::query(sql).execute(&mut *tx).await?;
         }
     }
-    for sql in super::FTS_DDL {
+    for sql in crate::db::schema::FTS_DDL {
         sqlx::query(sql).execute(&mut *tx).await?;
     }
     // 预览列在逐行管线中已写入，重建外部内容索引使 FTS 与之一致。
@@ -248,9 +251,12 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
         .await?;
 
     // PRAGMA 不支持绑定参数；此处为编译期常量，无注入风险。
-    sqlx::query(&format!("PRAGMA user_version = {}", super::SCHEMA_VERSION))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(&format!(
+        "PRAGMA user_version = {}",
+        crate::db::schema::SCHEMA_VERSION
+    ))
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
@@ -266,7 +272,7 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
 
     info!(
         "Legacy archive migrated to schema {}: {} rows, {} unparseable Time, {} unparseable request bodies, {} legacy plaintext columns dropped",
-        super::SCHEMA_VERSION,
+        crate::db::schema::SCHEMA_VERSION,
         total,
         unparseable_time,
         unparseable_body,

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::handlers::records_api;
+use crate::db::records_query::ListParams;
 
 use super::aggregation::Metrics;
 
@@ -71,8 +71,8 @@ pub(super) fn resolve_range(p: &AnalysisParams) -> (i64, i64) {
 /// 把分析参数映射回 records 的过滤参数，复用完全一致的筛选语义。
 ///
 /// `from`/`to` 传入已解析的区间，保证查询始终有时间上界（缺省 7 天窗口）。
-pub(super) fn to_list_params(p: &AnalysisParams, from: i64, to: i64) -> records_api::ListParams {
-    records_api::ListParams {
+pub(super) fn to_list_params(p: &AnalysisParams, from: i64, to: i64) -> ListParams {
+    ListParams {
         from: Some(from),
         to: Some(to),
         type_: p.type_.clone(),
@@ -190,6 +190,7 @@ pub(super) fn clamp_top(v: Option<i64>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::records_query;
 
     #[test]
     fn interval_auto_by_span_and_explicit_override() {
@@ -245,7 +246,7 @@ mod tests {
         assert!(to > from);
         assert_eq!(to - from, DEFAULT_WINDOW_MS);
         let (sql, _) =
-            records_api::build_filters(&to_list_params(&AnalysisParams::default(), from, to));
+            records_query::build_filters(&to_list_params(&AnalysisParams::default(), from, to));
         assert!(sql.contains("TimeMs >= ?"));
         assert!(sql.contains("TimeMs <= ?"));
     }
