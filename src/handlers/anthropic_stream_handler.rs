@@ -1,11 +1,11 @@
 use crate::app_error::AppError;
 use crate::config::types::ClientConfig;
 use crate::db::records::log_non_streaming_request;
+use crate::handlers::log_utils::{log_stream_interruption, truncate_json};
 use crate::handlers::stream_handler::{
     extract_error_msg, outcome_to_status, OutcomeSignal, StreamOutcome,
     STREAM_OUTCOME_UPSTREAM_ERROR,
 };
-use crate::handlers::utils::{log_stream_interruption, truncate_json};
 use crate::metrics::middleware::get_metrics_sender;
 use crate::metrics::prometheus::{TTFT, TTFT_10M_MAX, TTFT_1H_MAX, TTFT_1M_MAX};
 use crate::metrics::sliding_window;

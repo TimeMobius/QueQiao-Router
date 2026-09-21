@@ -22,13 +22,13 @@ use crate::{
     config::types::ClientConfig,
     db::records::log_non_streaming_request,
     handlers::anthropic_stream_handler::process_anthropic_streaming_response,
+    handlers::log_utils::truncate_json,
+    handlers::message_utils::{filter_empty_messages, process_messages, remove_think_tags},
+    handlers::request_body::{apply_prefix_to_json, build_request_body_generic},
     handlers::responses_stream_handler::process_responses_streaming_response,
     handlers::stream_handler::{extract_error_msg, process_streaming_response},
-    handlers::utils::{
-        apply_prefix_to_json, build_request_body_generic, filter_empty_messages, get_client_ip,
-        process_messages, remove_think_tags, truncate_json,
-    },
     metrics::active_requests::{ActiveRequestLabels, GuardedBody},
+    middleware::client_ip::get_client_ip,
     models::requests::RequestPayload,
     state::app_state::AppState,
 };

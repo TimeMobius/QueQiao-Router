@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 use tracing::{error, info};
 
-use crate::handlers::utils::get_client_ip;
+use crate::middleware::client_ip::get_client_ip;
 use crate::models::AccessLogMeta;
 
 fn should_log_full_token_on_error() -> bool {

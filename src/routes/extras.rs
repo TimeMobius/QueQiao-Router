@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::{
-    handlers::{common_handler::handle_request_logic, utils::CustomJson},
+    handlers::{common_handler::handle_request_logic, extractors::CustomJson},
     models::requests::{ClassifyRequest, RequestPayload, RerankRequest, ScoreRequest},
     state::app_state::AppState,
 };
