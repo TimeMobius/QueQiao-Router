@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::db::records_query::ListParams;
+use crate::handlers::records_api;
 
 use super::aggregation::Metrics;
 
@@ -71,8 +71,8 @@ pub(super) fn resolve_range(p: &AnalysisParams) -> (i64, i64) {
 /// 把分析参数映射回 records 的过滤参数，复用完全一致的筛选语义。
 ///
 /// `from`/`to` 传入已解析的区间，保证查询始终有时间上界（缺省 7 天窗口）。
-pub(super) fn to_list_params(p: &AnalysisParams, from: i64, to: i64) -> ListParams {
-    ListParams {
+pub(super) fn to_list_params(p: &AnalysisParams, from: i64, to: i64) -> records_api::ListParams {
+    records_api::ListParams {
         from: Some(from),
         to: Some(to),
         type_: p.type_.clone(),
