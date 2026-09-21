@@ -94,10 +94,10 @@ v1 起通过迁移补齐的现代列：
 | `ApiKey` | `Authorization: Bearer <token>` 或 `x-api-key`；默认明文入库，设 `RECORD_STORE_RAW_CREDENTIALS=false` 时不落库 |
 | `UserAgent` / `ClientName` / `ClientVersion` | `user-agent`（后两者由 UA 解析出名称/版本） |
 
-其中 `user-agent`、`x-request-id`、`x-trace-id`、`x-correlation-id`、`x-session-id`、
-`x-parent-session-id`、`x-session-affinity` 会按白名单**原样透传给上游**（见 `src/client/proxy.rs`
-的 `FORWARD_HEADERS`，供后端做日志关联与客户端识别）；`authorization`/`x-api-key` 始终替换为
-上游 key，其余客户端头不转发。
+其中 `x-request-id`、`x-trace-id`、`x-correlation-id`、`x-session-id`、`x-parent-session-id`、
+`x-session-affinity` 会按白名单**原样透传给上游**（见 `src/client/proxy.rs` 的 `FORWARD_HEADERS`，
+供后端做日志关联）；`authorization`/`x-api-key` 始终替换为上游 key，`user-agent` 与其余客户端头
+不转发（上游看到的是网关自身 UA）。
 
 ---
 

@@ -5,6 +5,15 @@ use crate::config::{
 use reqwest::Client;
 use tokio::sync::RwLockReadGuard;
 
+/// 网关自身 UA：`<产品>/<版本> <HTTP 客户端>/<版本>`。上游看到的是本网关而非客户端 UA。
+/// `REQWEST_VERSION` 由 `build.rs` 从 Cargo.lock 解析。
+const USER_AGENT: &str = concat!(
+    "QueQiao-Router/",
+    env!("CARGO_PKG_VERSION"),
+    " reqwest/",
+    env!("REQWEST_VERSION"),
+);
+
 pub struct ClientManager {
     client: Client,
 }
@@ -30,6 +39,7 @@ impl ClientManager {
             .tcp_keepalive(pool.effective_tcp_keepalive())
             // 禁用 Nagle 算法，降低 SSE 流式小包延迟
             .tcp_nodelay(true)
+            .user_agent(USER_AGENT)
             .build()
             .expect("Failed to build reqwest client");
         ClientManager { client }

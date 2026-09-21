@@ -35,18 +35,18 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 
 ## 透传请求头
 
-以下客户端请求头会**原样透传**给上游，供后端做日志关联与客户端识别（白名单见
-`src/client/proxy.rs` 的 `FORWARD_HEADERS`）：
+以下客户端请求头会**原样透传**给上游，供后端做日志关联（白名单见 `src/client/proxy.rs`
+的 `FORWARD_HEADERS`）：
 
 | 请求头 | 用途 |
 | :--- | :--- |
-| `user-agent` | 客户端标识 |
 | `x-request-id` / `x-trace-id` / `x-correlation-id` | 请求追踪 id |
 | `x-session-id` / `x-parent-session-id` / `x-session-affinity` | 会话标识 |
 
-鉴权头（`authorization` / `x-api-key`）**不**透传——网关始终用上游 key 重建
-`Authorization`；其余客户端头一律不转发。上述头同时会被写入审计库（见
-`DATABASE_SCHEMA.md` 的「身份字段与请求头的对应关系」）。
+`authorization` / `x-api-key` **不**透传——网关始终用上游 key 重建 `Authorization`；
+`user-agent` 也不透传，上游看到的是**网关自身 UA**（`QueQiao-Router/<版本> reqwest/<版本>`）；
+其余客户端头一律不转发。上述头同时会被写入审计库（见 `DATABASE_SCHEMA.md`
+的「身份字段与请求头的对应关系」）。
 
 ## 思考格式（ThinkingFormat）
 

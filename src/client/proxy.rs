@@ -54,10 +54,10 @@ fn is_retryable_send_error(err: &(dyn std::error::Error + Send + Sync + 'static)
     }
 }
 
-/// 透传给上游的客户端标识头白名单，供后端做日志关联与客户端识别。
-/// 鉴权头（`authorization` / `x-api-key`）不在此列——始终由网关替换为上游 key。
+/// 透传给上游的客户端标识头白名单，供后端做日志关联。
+/// 鉴权头（`authorization` / `x-api-key`）不在此列——始终由网关替换为上游 key；
+/// `user-agent` 也不透传，上游看到的是网关自身 UA（见 `client_manager` 的 `USER_AGENT`）。
 const FORWARD_HEADERS: &[&str] = &[
-    "user-agent",
     "x-request-id",
     "x-trace-id",
     "x-correlation-id",
@@ -212,9 +212,9 @@ mod tests {
                 .unwrap();
         let out = built.headers();
 
-        assert_eq!(out.get("user-agent").unwrap(), "claude-cli/1.0");
         assert_eq!(out.get("x-request-id").unwrap(), "req-1");
         assert_eq!(out.get("x-session-id").unwrap(), "sess-1");
+        assert!(out.get("user-agent").is_none());
         assert!(out.get("authorization").is_none());
         assert!(out.get("x-api-key").is_none());
         assert!(out.get("x-custom").is_none());
