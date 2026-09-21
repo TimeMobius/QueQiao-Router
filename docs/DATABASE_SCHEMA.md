@@ -81,6 +81,20 @@ v1 起通过迁移补齐的现代列：
 | `ToolNames` | TEXT | 工具名列表 |
 | `payload_id` | INTEGER | 关联 `payloads.record_id` |
 
+### 身份字段与请求头的对应关系
+
+以下字段直接取自客户端请求头，**仅用于审计入库，不**透传给上游（见
+`src/db/extract.rs` 的 `header_meta`）：
+
+| 列 | 来源请求头 |
+| :--- | :--- |
+| `SessionId` | `x-session-id` |
+| `ParentSessionId` | `x-parent-session-id` |
+| `SessionAffinity` | `x-session-affinity` |
+| `RequestId` | `x-request-id` → `x-trace-id` → `request-id` → `x-correlation-id`（依次取第一个非空，trim 后截断至 200 字符） |
+| `ApiKey` | `Authorization: Bearer <token>` 或 `x-api-key`；默认明文入库，设 `RECORD_STORE_RAW_CREDENTIALS=false` 时不落库 |
+| `UserAgent` / `ClientName` / `ClientVersion` | `user-agent`（后两者由 UA 解析出名称/版本） |
+
 ---
 
 ## 索引
