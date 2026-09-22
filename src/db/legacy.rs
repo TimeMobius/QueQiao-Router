@@ -234,6 +234,15 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
         .execute(&mut *tx)
         .await?;
 
+    // 遗留 schema 的索引集合未知（如 `idx_records_headers_app` 是基于 `headers` 的
+    // 表达式索引），`DROP COLUMN` 会因索引仍引用被删列而失败。先按标识符（大小写
+    // 不敏感）从索引 DDL 中找出引用明文列的索引并删除。
+    for name in plaintext_indexes(&mut tx).await? {
+        sqlx::query(&format!("DROP INDEX \"{}\"", name))
+            .execute(&mut *tx)
+            .await?;
+    }
+
     // 正文已写入 payloads、预览已写入 Prompt/RequestTail/Answer，遗留明文列不再被任何
     // 查询引用，删除它们再由事务提交后的 VACUUM 回收空间。DDL 无法绑定标识符，列名为编译期常量。
     let mut slimmed = 0usize;
@@ -281,6 +290,35 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
     Ok(())
 }
 
+/// 找出 `records` 表上引用明文正文列（即将被删除）的索引名。
+///
+/// `PRAGMA index_info` 对表达式索引返回 NULL 列名，因此改读 `sqlite_master` 中的
+/// 索引 DDL，按标识符（大小写不敏感）匹配被删列名。`sqlite_autoindex_*` 为约束
+/// 自动索引（DDL 为 NULL），不含被删列，天然被排除。
+async fn plaintext_indexes(
+    tx: &mut sqlx::Transaction<'_, sqlx::sqlite::Sqlite>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT name, sql FROM sqlite_master \
+         WHERE type = 'index' AND tbl_name = 'records' AND sql IS NOT NULL",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut names = Vec::new();
+    for row in rows {
+        let name: String = row.get("name");
+        let sql: String = row.get("sql");
+        let references = PLAINTEXT_COLUMNS.iter().any(|col| {
+            sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok.eq_ignore_ascii_case(col))
+        });
+        if references {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
 /// 旧库 `Type` 标签到 V2 请求变体的映射：按标签选择对应结构体解析，失败返回 None。
 /// 标签与 `records::request_type_label` 的取值一一对应，另含少量宽松别名。
 fn parse_legacy_request(type_label: Option<&str>, body: &str) -> Option<RequestPayload> {
@@ -318,4 +356,96 @@ fn legacy_header_meta(headers_json: &str) -> HeaderMeta {
         }
     }
     header_meta(&map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrate_archive;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+    use sqlx::Row;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn migrates_v0_db_with_expression_index_on_plaintext_column() {
+        let dir = std::env::temp_dir().join(format!("qrouter_legacy_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.db");
+        let _ = std::fs::remove_file(&path);
+        let uri = format!("sqlite://{}", path.display());
+
+        let setup = SqliteConnectOptions::from_str(&uri)
+            .unwrap()
+            .create_if_missing(true);
+        let setup_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(setup)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE records (
+                id INTEGER PRIMARY KEY, Time TEXT, IP TEXT, Model TEXT, Type TEXT,
+                CompletionTokens INTEGER, PromptTokens INTEGER, TotalTokens INTEGER,
+                Tool BOOLEAN, Multimodal BOOLEAN, Headers TEXT, Request TEXT, Response TEXT
+            )",
+        )
+        .execute(&setup_pool)
+        .await
+        .unwrap();
+        sqlx::query("CREATE INDEX idx_records_headers_app ON records(lower(Headers))")
+            .execute(&setup_pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO records (Time, IP, Model, Type, Headers, Request, Response) \
+             VALUES ('2026-09-01 10:00:00', '1.2.3.4', 'gpt-4', 'chat.completions', \
+                     '{\"User-Agent\":\"ua\"}', \
+                     '{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}', \
+                     '{\"choices\":[{\"message\":{\"content\":\"hello\"}}]}')",
+        )
+        .execute(&setup_pool)
+        .await
+        .unwrap();
+        setup_pool.close().await;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&uri).unwrap())
+            .await
+            .unwrap();
+        migrate_archive(&pool).await.unwrap();
+
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, crate::db::schema::SCHEMA_VERSION);
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(records)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        assert!(!cols
+            .iter()
+            .any(|c| c == "Headers" || c == "Request" || c == "Response"));
+        assert!(cols.iter().any(|c| c == "TimeMs"));
+        let idx_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_records_headers_app'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(idx_count, 0);
+        let (time_ms, prompt): (Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT TimeMs, Prompt FROM records WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(time_ms.is_some());
+        assert_eq!(prompt.as_deref(), Some("hi"));
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -10,7 +10,7 @@
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +43,8 @@ pub struct ArchiveRegistry {
     shards: RwLock<HashMap<String, Arc<ArchiveShard>>>,
     /// 串行化扫描；保证同一遗留归档不会被并发迁移两次。
     scan_lock: Mutex<()>,
+    /// 本次进程内迁移失败的归档名；扫描时跳过，避免每次查询都触发全量重试。
+    failed: Mutex<HashSet<String>>,
 }
 
 impl ArchiveRegistry {
@@ -58,6 +60,7 @@ impl ArchiveRegistry {
             dir,
             shards: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            failed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -97,6 +100,9 @@ impl ArchiveRegistry {
                 continue;
             }
             if self.shards.read().await.contains_key(stem) {
+                continue;
+            }
+            if self.failed.lock().await.contains(stem) {
                 continue;
             }
             pending.push((stem.to_string(), path));
@@ -148,6 +154,9 @@ impl ArchiveRegistry {
         for (stem, shard, notices) in completed {
             for notice in notices {
                 warn!("{}", notice);
+                if notice.starts_with("Legacy archive migration failed") {
+                    self.failed.lock().await.insert(stem.clone());
+                }
             }
             if let Some(shard) = shard {
                 self.register_shard(&stem, shard).await;
