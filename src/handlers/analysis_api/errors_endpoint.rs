@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::state::app_state::AppState;
@@ -53,14 +53,8 @@ async fn build_errors_db(
     if shards.len() > 1 {
         warnings.push("counts are summed across shards".to_string());
     }
-    let registered: HashSet<String> = app_state
-        .archive_registry
-        .all_shards()
-        .await
-        .iter()
-        .map(|s| s.id.clone())
-        .collect();
-    if let Some(w) = skipped_archive_warning(&registered) {
+    let skipped = app_state.archive_registry.skipped_count().await;
+    if let Some(w) = skipped_archive_warning(skipped) {
         warnings.push(w);
     }
     let shard_ids: Vec<String> = shards.iter().map(|s| s.id.clone()).collect();

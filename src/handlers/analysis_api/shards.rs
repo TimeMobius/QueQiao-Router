@@ -188,30 +188,7 @@ pub(super) async fn collect_shards(
 }
 
 /// 检测归档目录中未被注册的 `record_YYYYMM*` 文件（遗留/不支持分片）。
-pub(super) fn skipped_archive_warning(registered: &HashSet<String>) -> Option<String> {
-    let path = crate::db::resolve_db_path();
-    let dir = path.parent()?;
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut skipped = 0usize;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Some(rest) = stem.strip_prefix("record_") else {
-            continue;
-        };
-        let bytes = rest.as_bytes();
-        if bytes.len() < 6 || !bytes[..6].iter().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        if !registered.contains(stem) {
-            skipped += 1;
-        }
-    }
+pub(super) fn skipped_archive_warning(skipped: usize) -> Option<String> {
     (skipped > 0).then(|| format!("{skipped} legacy/unsupported archive shard(s) skipped"))
 }
 

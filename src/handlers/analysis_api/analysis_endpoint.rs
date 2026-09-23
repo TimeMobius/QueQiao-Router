@@ -6,7 +6,6 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::handlers::records_api;
@@ -63,14 +62,8 @@ async fn build_analysis(
     }
 
     let shards = collect_shards(app_state, from, to).await;
-    let registered: HashSet<String> = app_state
-        .archive_registry
-        .all_shards()
-        .await
-        .iter()
-        .map(|s| s.id.clone())
-        .collect();
-    if let Some(w) = skipped_archive_warning(&registered) {
+    let skipped = app_state.archive_registry.skipped_count().await;
+    if let Some(w) = skipped_archive_warning(skipped) {
         warnings.push(w);
     }
     let shard_ids: Vec<String> = shards.iter().map(|s| s.id.clone()).collect();
