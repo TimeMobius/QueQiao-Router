@@ -118,32 +118,39 @@ impl ArchiveRegistry {
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
                 let mut notices: Vec<String> = Vec::new();
-                let opened = match open_archive_shard(&path, &stem).await {
-                    Ok(Some(shard)) => Some(shard),
+                let (opened, busy) = match open_archive_shard(&path, &stem).await {
+                    Ok(Some(shard)) => (Some(shard), false),
                     Ok(None) => {
                         if migration_disabled {
-                            None
+                            (None, false)
                         } else {
                             Self::migrate_and_reopen(&path, &stem, &mut notices).await
                         }
                     }
                     Err(e) => {
+                        let busy = crate::db::is_sqlite_busy_error(&e);
                         notices.push(format!(
                             "archive shard '{}' open failed: {}",
                             path.display(),
                             e
                         ));
-                        None
+                        (None, busy)
                     }
                 };
-                let quarantine = opened.is_none() && !notices.is_empty();
-                (stem, path, opened, notices, quarantine)
+                let quarantine = opened.is_none() && !busy && !notices.is_empty();
+                (stem, path, opened, notices, quarantine, busy)
             }));
         }
 
         let results = futures::future::join_all(tasks).await;
-        let mut completed: Vec<(String, PathBuf, Option<ArchiveShard>, Vec<String>, bool)> =
-            Vec::new();
+        let mut completed: Vec<(
+            String,
+            PathBuf,
+            Option<ArchiveShard>,
+            Vec<String>,
+            bool,
+            bool,
+        )> = Vec::new();
         for result in results {
             match result {
                 Ok(item) => completed.push(item),
@@ -152,8 +159,8 @@ impl ArchiveRegistry {
         }
         // 按文件名排序后统一登记，保证日志与登记顺序稳定（不受目录遍历顺序影响）。
         completed.sort_by(|a, b| a.0.cmp(&b.0));
-        for (stem, path, shard, notices, quarantine) in completed {
-            if shard.is_none() {
+        for (stem, path, shard, notices, quarantine, busy) in completed {
+            if shard.is_none() && !busy {
                 self.failed.lock().await.insert(stem.clone());
             }
             for notice in notices {
@@ -196,31 +203,33 @@ impl ArchiveRegistry {
         path: &Path,
         stem: &str,
         notices: &mut Vec<String>,
-    ) -> Option<ArchiveShard> {
+    ) -> (Option<ArchiveShard>, bool) {
         if let Err(e) = crate::db::migrate_database_or_quarantine(path).await {
+            let busy = crate::db::is_sqlite_busy_error(&e);
             notices.push(format!(
-                "Legacy archive migration failed and was quarantined for '{}': {}",
+                "Legacy archive migration failed for '{}': {}",
                 path.display(),
                 e
             ));
-            return None;
+            return (None, busy);
         }
         match open_archive_shard(path, stem).await {
-            Ok(Some(shard)) => Some(shard),
+            Ok(Some(shard)) => (Some(shard), false),
             Ok(None) => {
                 notices.push(format!(
                     "Archive '{}' still lacks TimeMs after migration; skipping",
                     path.display()
                 ));
-                None
+                (None, false)
             }
             Err(e) => {
+                let busy = crate::db::is_sqlite_busy_error(&e);
                 notices.push(format!(
                     "archive shard '{}' open failed: {}",
                     path.display(),
                     e
                 ));
-                None
+                (None, busy)
             }
         }
     }
@@ -370,7 +379,7 @@ fn legacy_migration_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{archive_stem_for_path, parse_archive_stem, ArchiveRegistry};
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
     use std::path::Path;
     use std::str::FromStr;
 
@@ -459,6 +468,56 @@ mod tests {
 
         assert!(!archive.exists());
         assert!(dir.join("record_202603.db.bak").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn retries_locked_legacy_archive_after_lock_is_released() {
+        let dir = temp_dir("locked_migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("record_202603.db");
+        let url = format!("sqlite:{}", archive.display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE records (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, Time TEXT, IP TEXT, Model TEXT, Type TEXT, \
+                CompletionTokens INTEGER, PromptTokens INTEGER, TotalTokens INTEGER, Tool BOOLEAN, \
+                Multimodal BOOLEAN, Headers TEXT, Request TEXT, Response TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO records (Time, Type, Request, Response) \
+             VALUES ('2026-03-15 10:00:00.000000', 'chat.completions', '{}', '{}')",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+        let registry = ArchiveRegistry::new(dir.join("record.db"));
+        registry.ensure_scanned().await;
+
+        assert!(archive.exists());
+        assert!(!dir.join("record_202603.db.bak").exists());
+        assert_eq!(registry.skipped_count().await, 1);
+        assert!(!registry.failed.lock().await.contains("record_202603"));
+
+        transaction.rollback().await.unwrap();
+        registry.ensure_scanned().await;
+
+        assert_eq!(registry.skipped_count().await, 0);
+        assert!(registry.get("record_202603").await.is_some());
+
+        pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

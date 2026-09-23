@@ -50,6 +50,9 @@ async fn init_db_pool_with_url(database_url: &str) -> Result<SqlitePool, sqlx::E
         );
         pool.close().await;
         if let Err(error) = migrate_database_or_quarantine(Path::new(db_path)).await {
+            if is_sqlite_busy_error(&error) {
+                return Err(error);
+            }
             warn!(
                 "Active database legacy migration failed for '{}': {}; quarantining and creating a fresh active database",
                 db_path, error
@@ -88,6 +91,9 @@ pub(crate) async fn migrate_database_in_place(path: &Path) -> Result<(), sqlx::E
 
 pub(crate) async fn migrate_database_or_quarantine(path: &Path) -> Result<(), sqlx::Error> {
     if let Err(error) = migrate_database_in_place(path).await {
+        if is_sqlite_busy_error(&error) {
+            return Err(error);
+        }
         let quarantined = quarantine_database(path).map_err(|quarantine_error| {
             sqlx::Error::Protocol(format!(
                 "database migration failed: {error}; quarantine failed: {quarantine_error}"
@@ -105,6 +111,19 @@ pub(crate) async fn migrate_database_or_quarantine(path: &Path) -> Result<(), sq
         )));
     }
     Ok(())
+}
+
+pub(crate) fn is_sqlite_busy_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(database_error) => database_error.code().is_some_and(|code| {
+            code.eq_ignore_ascii_case("SQLITE_BUSY")
+                || code.eq_ignore_ascii_case("SQLITE_LOCKED")
+                || code
+                    .parse::<i32>()
+                    .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
+        }),
+        _ => false,
+    }
 }
 
 async fn ensure_base_records_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -210,6 +229,45 @@ mod tests {
         assert_eq!(version, crate::db::schema::SCHEMA_VERSION);
 
         fresh.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn keeps_locked_archive_in_place() {
+        let dir = temp_dir("locked_archive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record_202608.db");
+        let url = format!("sqlite:{}", path.display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE records (id INTEGER PRIMARY KEY, Time TEXT, Request TEXT, Response TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO records (Time, Request, Response) VALUES ('now', '{}', '{}')")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
+        let result = super::migrate_database_or_quarantine(&path).await;
+
+        let error = result.expect_err("the active transaction must hold a write lock");
+        assert!(super::is_sqlite_busy_error(&error));
+        assert!(path.exists());
+        assert!(!dir.join("record_202608.db.bak").exists());
+
+        transaction.rollback().await.unwrap();
+        pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
