@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::handlers::{error_log_api, records_api};
+use chrono::{Local, NaiveDate, TimeZone};
 
 use super::aggregation::{normalize_opt, LogErrorKey};
 
@@ -128,6 +129,25 @@ fn log_entry_matches(e: &error_log_api::LogEntry, p: &records_api::ListParams) -
     true
 }
 
+fn error_log_date(path: &Path) -> Option<NaiveDate> {
+    let name = path.file_name()?.to_str()?;
+    let date = name.strip_prefix("error.")?.strip_suffix(".log")?;
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+fn error_log_file_in_range(path: &Path, from: Option<i64>, to: Option<i64>) -> bool {
+    let Some(date) = error_log_date(path) else {
+        return true;
+    };
+    let from_date = from
+        .and_then(|ms| Local.timestamp_millis_opt(ms).single())
+        .map(|datetime| datetime.date_naive());
+    let to_date = to
+        .and_then(|ms| Local.timestamp_millis_opt(ms).single())
+        .map(|datetime| datetime.date_naive());
+    from_date.is_none_or(|lower| date >= lower) && to_date.is_none_or(|upper| date <= upper)
+}
+
 pub(super) fn scan_error_logs(
     dir: &Path,
     from: Option<i64>,
@@ -141,7 +161,11 @@ pub(super) fn scan_error_logs(
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("error.") && name.ends_with(".log") && entry.path().is_file() {
+            if name.starts_with("error.")
+                && name.ends_with(".log")
+                && entry.path().is_file()
+                && error_log_file_in_range(&entry.path(), from, to)
+            {
                 files.push(entry.path());
             }
         }
@@ -481,6 +505,44 @@ mod tests {
         assert_eq!(scan.total, 1);
         assert_eq!(scan.total_error_entries, 1);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selects_error_log_files_by_local_date() {
+        use chrono::TimeZone;
+
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("qq_logdates_{}_{}", pid, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("error.2026-09-19.log"), "").unwrap();
+        std::fs::write(dir.join("error.2026-09-20.log"), "").unwrap();
+        std::fs::write(dir.join("error.2026-09-21.log"), "").unwrap();
+
+        let from = chrono::Local
+            .with_ymd_and_hms(2026, 9, 20, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let to = chrono::Local
+            .with_ymd_and_hms(2026, 9, 20, 23, 59, 59)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let scan = scan_error_logs(
+            &dir,
+            Some(from),
+            Some(to),
+            100,
+            "day",
+            &records_api::ListParams::default(),
+        );
+
+        assert_eq!(scan.files, vec!["error.2026-09-20.log"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
