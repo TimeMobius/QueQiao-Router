@@ -50,7 +50,7 @@ async fn init_db_pool_with_url(database_url: &str) -> Result<SqlitePool, sqlx::E
         );
         pool.close().await;
         if let Err(error) = migrate_database_or_quarantine(Path::new(db_path)).await {
-            if is_sqlite_busy_error(&error) {
+            if is_sqlite_retryable_error(&error) {
                 return Err(error);
             }
             warn!(
@@ -91,7 +91,7 @@ pub(crate) async fn migrate_database_in_place(path: &Path) -> Result<(), sqlx::E
 
 pub(crate) async fn migrate_database_or_quarantine(path: &Path) -> Result<(), sqlx::Error> {
     if let Err(error) = migrate_database_in_place(path).await {
-        if is_sqlite_busy_error(&error) {
+        if is_sqlite_retryable_error(&error) {
             return Err(error);
         }
         let quarantined = quarantine_database(path).map_err(|quarantine_error| {
@@ -113,14 +113,14 @@ pub(crate) async fn migrate_database_or_quarantine(path: &Path) -> Result<(), sq
     Ok(())
 }
 
-pub(crate) fn is_sqlite_busy_error(error: &sqlx::Error) -> bool {
+pub(crate) fn is_sqlite_retryable_error(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(database_error) => database_error.code().is_some_and(|code| {
             code.eq_ignore_ascii_case("SQLITE_BUSY")
                 || code.eq_ignore_ascii_case("SQLITE_LOCKED")
                 || code
                     .parse::<i32>()
-                    .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
+                    .is_ok_and(|code| matches!(code & 0xff, 5 | 6 | 8))
         }),
         _ => false,
     }
@@ -262,7 +262,7 @@ mod tests {
         let result = super::migrate_database_or_quarantine(&path).await;
 
         let error = result.expect_err("the active transaction must hold a write lock");
-        assert!(super::is_sqlite_busy_error(&error));
+        assert!(super::is_sqlite_retryable_error(&error));
         assert!(path.exists());
         assert!(!dir.join("record_202608.db.bak").exists());
 

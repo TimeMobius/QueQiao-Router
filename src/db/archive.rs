@@ -128,7 +128,7 @@ impl ArchiveRegistry {
                         }
                     }
                     Err(e) => {
-                        let busy = crate::db::is_sqlite_busy_error(&e);
+                        let busy = crate::db::is_sqlite_retryable_error(&e);
                         notices.push(format!(
                             "archive shard '{}' open failed: {}",
                             path.display(),
@@ -205,7 +205,7 @@ impl ArchiveRegistry {
         notices: &mut Vec<String>,
     ) -> (Option<ArchiveShard>, bool) {
         if let Err(e) = crate::db::migrate_database_or_quarantine(path).await {
-            let busy = crate::db::is_sqlite_busy_error(&e);
+            let busy = crate::db::is_sqlite_retryable_error(&e);
             notices.push(format!(
                 "Legacy archive migration failed for '{}': {}",
                 path.display(),
@@ -223,7 +223,7 @@ impl ArchiveRegistry {
                 (None, false)
             }
             Err(e) => {
-                let busy = crate::db::is_sqlite_busy_error(&e);
+                let busy = crate::db::is_sqlite_retryable_error(&e);
                 notices.push(format!(
                     "archive shard '{}' open failed: {}",
                     path.display(),
@@ -330,6 +330,24 @@ fn archive_stem_for_path(path: &Path) -> Option<&str> {
 
 /// 以只读单连接池打开归档；缺少 `TimeMs` 的遗留库返回 `Ok(None)` 并告警。
 async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard>, sqlx::Error> {
+    let journal_path = PathBuf::from(format!("{}-journal", path.display()));
+    if journal_path.exists() {
+        // NFS read-only SQLite opens cannot replay a hot rollback journal.
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(false)
+            .create_if_missing(false);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(options)
+            .await?;
+        sqlx::query("SELECT 1 FROM sqlite_master LIMIT 1")
+            .fetch_optional(&pool)
+            .await?;
+        pool.close().await;
+    }
+
     let options = SqliteConnectOptions::new()
         .filename(path)
         .read_only(true)
@@ -381,6 +399,7 @@ mod tests {
     use super::{archive_stem_for_path, parse_archive_stem, ArchiveRegistry};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
     use std::path::Path;
+    use std::process::Command;
     use std::str::FromStr;
 
     #[test]
@@ -469,6 +488,88 @@ mod tests {
         assert!(!archive.exists());
         assert!(dir.join("record_202603.db.bak").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migrates_legacy_archive_with_hot_journal() {
+        let dir = temp_dir("hot_journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("record_202603.db");
+        let url = format!("sqlite:{}", archive.display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE records (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, Time TEXT, IP TEXT, Model TEXT, Type TEXT, \
+                CompletionTokens INTEGER, PromptTokens INTEGER, TotalTokens INTEGER, Tool BOOLEAN, \
+                Multimodal BOOLEAN, Headers TEXT, Request TEXT, Response TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::archive::tests::leave_hot_journal_child",
+                "--nocapture",
+            ])
+            .env("QQ_HOT_JOURNAL_DB", &archive)
+            .status()
+            .unwrap();
+
+        assert!(!child.success());
+        assert!(Path::new(&format!("{}-journal", archive.display())).exists());
+
+        let registry = ArchiveRegistry::new(dir.join("record.db"));
+        registry.ensure_scanned().await;
+
+        assert!(archive.exists());
+        assert!(!dir.join("record_202603.db.bak").exists());
+        assert!(!Path::new(&format!("{}-journal", archive.display())).exists());
+        let shard = registry.get("record_202603").await;
+        assert!(shard.is_some());
+        let pool = &shard.as_ref().expect("archive should be registered").pool;
+        let recovered_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(recovered_rows, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leave_hot_journal_child() {
+        let Ok(path) = std::env::var("QQ_HOT_JOURNAL_DB") else {
+            return;
+        };
+        let options = SqliteConnectOptions::from_str(&path)
+            .unwrap()
+            .create_if_missing(false);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = SqlitePool::connect_with(options).await.unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query(
+                "INSERT INTO records (Time, Type, Request, Response) \
+                 VALUES ('2026-03-15 10:00:00.000000', 'chat.completions', '{}', '{}')",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            let _ = Command::new("kill")
+                .args(["-KILL", &std::process::id().to_string()])
+                .status();
+        });
     }
 
     #[tokio::test]
