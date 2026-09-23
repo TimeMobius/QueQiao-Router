@@ -361,7 +361,7 @@ fn legacy_header_meta(headers_json: &str) -> HeaderMeta {
 #[cfg(test)]
 mod tests {
     use super::migrate_archive;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
 

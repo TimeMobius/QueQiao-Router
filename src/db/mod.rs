@@ -1,7 +1,8 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::types::Config;
 
@@ -20,7 +21,10 @@ pub use rotation::{check_and_rotate, init_rotation_state, rotate_if_needed};
 pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
     let database_url =
         std::env::var("RECD_PATH").unwrap_or_else(|_| "sqlite:./record.db".to_string());
+    init_db_pool_with_url(&database_url).await
+}
 
+async fn init_db_pool_with_url(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let db_path = database_url
         .strip_prefix("sqlite:")
         .unwrap_or(&database_url);
@@ -30,9 +34,80 @@ pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
     // 连接前判断文件是否已存在：全新库（本次刚创建）必须走普通初始化，
     // 只有"已存在且仍是 V0 结构"的老库才需要阻塞式 legacy 数据迁移。
     let db_exists = std::path::Path::new(db_path).exists();
-    let pool = SqlitePool::connect_with(options).await?;
+    let mut pool = SqlitePool::connect_with(options).await?;
 
     // 兼容测试套件的 12 列基表；已有库不会重复创建。
+    ensure_base_records_table(&pool).await?;
+
+    let existing = schema::table_columns(&pool, "records").await?;
+
+    // V0 遗留活跃库（缺 TimeMs）：迁移成功才继续使用原文件；失败则隔离原文件，
+    // 让服务用全新 active 库启动，避免容器因同一个坏库无限重启阻塞。
+    if db_exists && is_legacy_schema(&existing) {
+        info!(
+            "Active database '{}' is V0 (no TimeMs); running blocking legacy migration...",
+            db_path
+        );
+        pool.close().await;
+        if let Err(error) = migrate_database_or_quarantine(Path::new(db_path)).await {
+            warn!(
+                "Active database legacy migration failed for '{}': {}; quarantining and creating a fresh active database",
+                db_path, error
+            );
+            let fresh_options = SqliteConnectOptions::from_str(db_path)?.create_if_missing(true);
+            pool = SqlitePool::connect_with(fresh_options).await?;
+            ensure_base_records_table(&pool).await?;
+        } else {
+            info!("Active database legacy migration completed.");
+            let reopened_options =
+                SqliteConnectOptions::from_str(db_path)?.create_if_missing(false);
+            pool = SqlitePool::connect_with(reopened_options).await?;
+        }
+    }
+
+    schema::migrate(&pool).await?;
+
+    info!("Database at '{}' initialized successfully", db_path);
+    Ok(pool)
+}
+
+pub(crate) async fn migrate_database_in_place(path: &Path) -> Result<(), sqlx::Error> {
+    let path_str = path.to_string_lossy();
+    let options = SqliteConnectOptions::from_str(&path_str)?
+        .read_only(false)
+        .create_if_missing(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(options)
+        .await?;
+    let result = legacy::migrate_archive(&pool).await;
+    pool.close().await;
+    result
+}
+
+pub(crate) async fn migrate_database_or_quarantine(path: &Path) -> Result<(), sqlx::Error> {
+    if let Err(error) = migrate_database_in_place(path).await {
+        let quarantined = quarantine_database(path).map_err(|quarantine_error| {
+            sqlx::Error::Protocol(format!(
+                "database migration failed: {error}; quarantine failed: {quarantine_error}"
+            ))
+        })?;
+        warn!(
+            "Failed database quarantined: '{}' -> '{}': {}",
+            path.display(),
+            quarantined.display(),
+            error
+        );
+        return Err(sqlx::Error::Protocol(format!(
+            "database migration failed; quarantined as '{}'",
+            quarantined.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_base_records_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS records (
@@ -52,27 +127,9 @@ pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
         )
         "#,
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
-
-    let existing = schema::table_columns(&pool, "records").await?;
-
-    // V0 遗留活跃库（缺 TimeMs 列）：旧数据仍是明文正文且没有 TimeMs/payloads/FTS，
-    // 必须在这里阻塞启动并完整迁移（schema + 数据回填一起），否则服务会带着
-    // 无法按时间检索、详情回放为空的数据上线。迁移失败直接阻止启动。
-    if db_exists && is_legacy_schema(&existing) {
-        info!(
-            "Active database '{}' is V0 (no TimeMs); running blocking legacy migration...",
-            db_path
-        );
-        legacy::migrate_archive(&pool).await?;
-        info!("Active database legacy migration completed.");
-    }
-
-    schema::migrate(&pool).await?;
-
-    info!("Database at '{}' initialized successfully", db_path);
-    Ok(pool)
+    Ok(())
 }
 
 /// V0 遗留 schema 判定：`records` 表缺少 `TimeMs` 列。
@@ -83,7 +140,18 @@ fn is_legacy_schema(columns: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_legacy_schema;
+    use super::{init_db_pool_with_url, is_legacy_schema};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::Row;
+    use std::str::FromStr;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("qq_db_{}_{}_{}", std::process::id(), tag, nanos))
+    }
 
     #[test]
     fn legacy_schema_has_no_time_ms() {
@@ -102,12 +170,78 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!is_legacy_schema(&modern));
     }
+
+    #[tokio::test]
+    async fn quarantines_failed_active_migration_and_starts_fresh() {
+        let dir = temp_dir("active_quarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.db");
+        let url = format!("sqlite:{}", path.display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE records (Time TEXT PRIMARY KEY, IP TEXT, Model TEXT, Request TEXT, Response TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let fresh = init_db_pool_with_url(&url).await.unwrap();
+        let columns = sqlx::query("PRAGMA table_info(records)")
+            .fetch_all(&fresh)
+            .await
+            .unwrap();
+        let names: Vec<String> = columns.iter().map(|row| row.get("name")).collect();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&fresh)
+            .await
+            .unwrap();
+
+        assert!(path.exists());
+        assert!(dir.join("record.db.bak").exists());
+        assert!(names.iter().any(|name| name == "TimeMs"));
+        assert_eq!(version, crate::db::schema::SCHEMA_VERSION);
+
+        fresh.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 解析 `RECD_PATH` 得到数据库文件路径（去掉 `sqlite:` 前缀）。
 pub(crate) fn resolve_db_path() -> std::path::PathBuf {
     let url = std::env::var("RECD_PATH").unwrap_or_else(|_| "sqlite:./record.db".to_string());
     std::path::PathBuf::from(url.strip_prefix("sqlite:").unwrap_or(&url))
+}
+
+pub(crate) fn quarantine_database(path: &Path) -> std::io::Result<PathBuf> {
+    let backup = unique_backup_path(path);
+    std::fs::rename(path, &backup)?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        if sidecar.exists() {
+            let sidecar_backup = unique_backup_path(&sidecar);
+            std::fs::rename(sidecar, sidecar_backup)?;
+        }
+    }
+    Ok(backup)
+}
+
+fn unique_backup_path(path: &Path) -> PathBuf {
+    let base = PathBuf::from(format!("{}.bak", path.display()));
+    let mut candidate = base.clone();
+    let mut suffix = 1u32;
+    while candidate.exists() {
+        candidate = PathBuf::from(format!("{}.{}", base.display(), suffix));
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
 }
 
 /// 为 dashboard 只读分析查询开第二个连接池，与写池分离，避免大表聚合占满

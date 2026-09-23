@@ -43,8 +43,9 @@ pub struct ArchiveRegistry {
     shards: RwLock<HashMap<String, Arc<ArchiveShard>>>,
     /// 串行化扫描；保证同一遗留归档不会被并发迁移两次。
     scan_lock: Mutex<()>,
-    /// 本次进程内迁移失败的归档名；扫描时跳过，避免每次查询都触发全量重试。
+    /// 本次进程内无法登记的归档名；扫描时跳过，避免每次查询都重复打开失败文件。
     failed: Mutex<HashSet<String>>,
+    skipped: Mutex<usize>,
 }
 
 impl ArchiveRegistry {
@@ -61,6 +62,7 @@ impl ArchiveRegistry {
             shards: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             failed: Mutex::new(HashSet::new()),
+            skipped: Mutex::new(0),
         }
     }
 
@@ -84,21 +86,17 @@ impl ArchiveRegistry {
             }
         };
 
+        let mut archive_stems: HashSet<String> = HashSet::new();
         let mut pending: Vec<(String, PathBuf)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
             if path == self.active_path {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(stem) = archive_stem_for_path(&path) else {
                 continue;
             };
-            if parse_archive_stem(stem).is_none() {
-                continue;
-            }
+            archive_stems.insert(stem.to_string());
             if self.shards.read().await.contains_key(stem) {
                 continue;
             }
@@ -108,6 +106,7 @@ impl ArchiveRegistry {
             pending.push((stem.to_string(), path));
         }
         if pending.is_empty() {
+            self.update_skipped_count(&archive_stems).await;
             return;
         }
 
@@ -137,12 +136,14 @@ impl ArchiveRegistry {
                         None
                     }
                 };
-                (stem, opened, notices)
+                let quarantine = opened.is_none() && !notices.is_empty();
+                (stem, path, opened, notices, quarantine)
             }));
         }
 
         let results = futures::future::join_all(tasks).await;
-        let mut completed: Vec<(String, Option<ArchiveShard>, Vec<String>)> = Vec::new();
+        let mut completed: Vec<(String, PathBuf, Option<ArchiveShard>, Vec<String>, bool)> =
+            Vec::new();
         for result in results {
             match result {
                 Ok(item) => completed.push(item),
@@ -151,17 +152,43 @@ impl ArchiveRegistry {
         }
         // 按文件名排序后统一登记，保证日志与登记顺序稳定（不受目录遍历顺序影响）。
         completed.sort_by(|a, b| a.0.cmp(&b.0));
-        for (stem, shard, notices) in completed {
+        for (stem, path, shard, notices, quarantine) in completed {
+            if shard.is_none() {
+                self.failed.lock().await.insert(stem.clone());
+            }
             for notice in notices {
                 warn!("{}", notice);
-                if notice.starts_with("Legacy archive migration failed") {
-                    self.failed.lock().await.insert(stem.clone());
-                }
             }
             if let Some(shard) = shard {
                 self.register_shard(&stem, shard).await;
+            } else if quarantine {
+                match crate::db::quarantine_database(&path) {
+                    Ok(quarantined) => {
+                        archive_stems.remove(&stem);
+                        warn!(
+                            "Failed archive quarantined: '{}' -> '{}'",
+                            path.display(),
+                            quarantined.display()
+                        );
+                    }
+                    Err(error) => warn!(
+                        "Failed archive quarantine failed for '{}': {}",
+                        path.display(),
+                        error
+                    ),
+                }
             }
         }
+        self.update_skipped_count(&archive_stems).await;
+    }
+
+    async fn update_skipped_count(&self, archive_stems: &HashSet<String>) {
+        let registered: HashSet<String> = self.shards.read().await.keys().cloned().collect();
+        let skipped = archive_stems
+            .iter()
+            .filter(|stem| !registered.contains(*stem))
+            .count();
+        *self.skipped.lock().await = skipped;
     }
 
     /// 迁移一个遗留归档后重新打开；失败或仍缺 `TimeMs` 时返回 `None` 并追加告警。
@@ -170,9 +197,9 @@ impl ArchiveRegistry {
         stem: &str,
         notices: &mut Vec<String>,
     ) -> Option<ArchiveShard> {
-        if let Err(e) = migrate_legacy_in_place(path).await {
+        if let Err(e) = crate::db::migrate_database_or_quarantine(path).await {
             notices.push(format!(
-                "Legacy archive migration failed for '{}': {}",
+                "Legacy archive migration failed and was quarantined for '{}': {}",
                 path.display(),
                 e
             ));
@@ -248,6 +275,10 @@ impl ArchiveRegistry {
         self.ensure_scanned().await;
         self.shards.read().await.values().cloned().collect()
     }
+
+    pub async fn skipped_count(&self) -> usize {
+        *self.skipped.lock().await
+    }
 }
 
 /// 解析归档文件名主干，返回 `YYYYMM`；格式非法或月份越界返回 None。
@@ -277,6 +308,15 @@ fn parse_archive_stem(stem: &str) -> Option<i32> {
         return None;
     }
     Some(yyyymm)
+}
+
+fn archive_stem_for_path(path: &Path) -> Option<&str> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("db") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    parse_archive_stem(stem)?;
+    Some(stem)
 }
 
 /// 以只读单连接池打开归档；缺少 `TimeMs` 的遗留库返回 `Ok(None)` 并告警。
@@ -327,27 +367,11 @@ fn legacy_migration_disabled() -> bool {
         .unwrap_or(false)
 }
 
-/// 以读写单连接池就地迁移遗留归档，完成后立即关闭连接池。
-async fn migrate_legacy_in_place(path: &Path) -> Result<(), sqlx::Error> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .read_only(false)
-        .create_if_missing(false);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect_with(options)
-        .await?;
-
-    let result = crate::db::legacy::migrate_archive(&pool).await;
-    pool.close().await;
-    result
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_archive_stem, ArchiveRegistry};
+    use super::{archive_stem_for_path, parse_archive_stem, ArchiveRegistry};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+    use std::path::Path;
     use std::str::FromStr;
 
     #[test]
@@ -369,6 +393,45 @@ mod tests {
         assert_eq!(parse_archive_stem("record_"), None);
     }
 
+    #[test]
+    fn accepts_only_database_archive_files() {
+        assert_eq!(
+            archive_stem_for_path(Path::new("record_202608.db")),
+            Some("record_202608")
+        );
+        assert_eq!(
+            archive_stem_for_path(Path::new("record_202608.db.bak")),
+            None
+        );
+        assert_eq!(
+            archive_stem_for_path(Path::new("record_202608.db-journal")),
+            None
+        );
+        assert_eq!(
+            archive_stem_for_path(Path::new("record_202608.db-wal")),
+            None
+        );
+        assert_eq!(
+            archive_stem_for_path(Path::new("record_202608.db-shm")),
+            None
+        );
+    }
+
+    #[test]
+    fn quarantines_failed_database_as_bak() {
+        let dir = temp_dir("quarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record_202608.db");
+        std::fs::write(&path, b"not a database").unwrap();
+
+        let quarantined = crate::db::quarantine_database(&path).unwrap();
+
+        assert_eq!(quarantined, dir.join("record_202608.db.bak"));
+        assert!(!path.exists());
+        assert!(quarantined.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -380,6 +443,23 @@ mod tests {
             tag,
             nanos
         ))
+    }
+
+    #[tokio::test]
+    async fn quarantines_unreadable_archive_during_scan() {
+        let dir = temp_dir("scan_quarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("record.db");
+        let archive = dir.join("record_202603.db");
+        std::fs::write(&archive, b"not a sqlite database").unwrap();
+
+        let registry = ArchiveRegistry::new(active);
+        registry.ensure_scanned().await;
+        registry.ensure_scanned().await;
+
+        assert!(!archive.exists());
+        assert!(dir.join("record_202603.db.bak").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
