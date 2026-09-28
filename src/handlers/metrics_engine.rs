@@ -1,236 +1,212 @@
-use chrono::{Datelike, Local, TimeZone};
-use serde_json::{json, Value};
-use sqlx::sqlite::SqliteRow;
+use chrono::Local;
+use serde_json::Value;
 use sqlx::Row;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::db::records_query::Bind;
-use crate::handlers::{
-    analysis_api::shards::{collect_shards, fetch_one_shard},
-    records_api,
-};
+use crate::handlers::analysis_api::shards::{collect_shards, fetch_one_shard, ShardInput};
 use crate::state::app_state::AppState;
 
-use super::{MetricName, MetricPeriod, MetricQuery};
+use super::metrics_result::{merge_groups, render_result};
+use super::metrics_sql::{
+    build_filters, build_sql, group_expression, resolve_query_range, row_metric,
+};
+use super::{metrics_cache, GroupBy, MetricName, MetricQuery};
 
-pub(super) async fn execute_query(
-    app_state: &std::sync::Arc<AppState>,
-    query: &MetricQuery,
-) -> Result<Value, sqlx::Error> {
-    let (from, to) = resolve_query_range(query);
-    let shards = collect_shards(app_state, from, to).await;
-    let expression = group_expression(&query.group_by);
-    let (filtered, binds) = build_filters(query, from, to, false);
-    let sql = build_sql(expression, &query.metrics, &filtered);
-    let mut tasks = Vec::with_capacity(shards.len());
-    for shard in &shards {
-        let pool = shard.pool.clone();
-        let shard_sql = if shard_is_complete(shard, from, to) {
-            let (where_sql, full_binds) = build_filters(query, from, to, true);
-            (
-                build_sql(expression, &query.metrics, &where_sql),
-                full_binds,
-            )
-        } else {
-            (sql.clone(), binds.clone())
-        };
-        tasks.push(tokio::spawn(async move {
-            fetch_one_shard(&pool, &shard_sql.0, &shard_sql.1).await
-        }));
-    }
+pub(super) struct PlannedQuery {
+    pub(super) from: i64,
+    pub(super) to: i64,
+    pub(super) shards: Vec<String>,
+    pub(super) jobs: Vec<String>,
+}
 
-    let mut merged: HashMap<String, HashMap<MetricName, f64>> = HashMap::new();
-    for task in tasks {
-        for row in task
-            .await
-            .map_err(|error| sqlx::Error::Protocol(error.to_string()))??
-        {
-            let name = row.try_get::<String, _>("metric_group").unwrap_or_default();
-            let entry = merged.entry(name).or_default();
-            for metric in query.metrics.iter().copied() {
-                let value = row_metric(&row, metric.alias());
-                if metric == MetricName::MaxLatency {
-                    let current = entry.entry(metric).or_insert(0.0);
-                    *current = current.max(value);
-                } else {
-                    *entry.entry(metric).or_insert(0.0) += value;
+struct Job {
+    shard: ShardInput,
+    full: bool,
+    where_sql: String,
+    binds: Vec<Bind>,
+    group: GroupBy,
+    metrics: Vec<MetricName>,
+    cache_key: Option<String>,
+}
+
+pub(super) async fn execute_queries(
+    app_state: &Arc<AppState>,
+    queries: &[MetricQuery],
+) -> Result<serde_json::Map<String, Value>, sqlx::Error> {
+    let now = Local::now();
+    let ranges: Vec<(i64, i64)> = queries
+        .iter()
+        .map(|query| resolve_query_range(query, now))
+        .collect();
+    let range_from = ranges
+        .iter()
+        .map(|(from, _)| *from)
+        .min()
+        .unwrap_or(now.timestamp_millis());
+    let range_to = ranges
+        .iter()
+        .map(|(_, to)| *to)
+        .max()
+        .unwrap_or(now.timestamp_millis());
+    let candidates = collect_shards(app_state, range_from, range_to).await;
+    let mut plans = Vec::with_capacity(queries.len());
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+    for (query, (from, to)) in queries.iter().zip(ranges) {
+        let shards: Vec<&ShardInput> = candidates
+            .iter()
+            .filter(|shard| {
+                shard.is_active
+                    || shard.min_ms.is_some_and(|min| min <= to)
+                        && shard.max_ms.is_some_and(|max| max >= from)
+            })
+            .collect();
+        let mut keys = Vec::with_capacity(shards.len());
+        for shard in &shards {
+            let full = shard_is_complete(shard, from, to, now.timestamp_millis());
+            let (where_sql, binds) = build_filters(query, from, to, full);
+            let key = job_key(shard, &query.group_by, &where_sql, &binds);
+            let job = jobs.entry(key.clone()).or_insert_with(|| Job {
+                shard: (*shard).clone(),
+                full,
+                where_sql,
+                binds,
+                group: query.group_by.clone(),
+                metrics: Vec::new(),
+                cache_key: None,
+            });
+            for metric in required_metrics(query) {
+                if !job.metrics.contains(&metric) {
+                    job.metrics.push(metric);
                 }
             }
+            keys.push(key);
+        }
+        plans.push(PlannedQuery {
+            from,
+            to,
+            shards: shards.iter().map(|shard| shard.id.clone()).collect(),
+            jobs: keys,
+        });
+    }
+
+    let mut results = HashMap::new();
+    let mut tasks = Vec::new();
+    for (key, mut job) in jobs {
+        job.metrics.sort_by_key(|metric| metric.alias());
+        let sql = build_sql(&group_expression(&job.group), &job.metrics, &job.where_sql);
+        job.cache_key = archive_cache_key(&job, &sql);
+        if let Some(rows) = job.cache_key.as_deref().and_then(metrics_cache::get) {
+            results.insert(key, rows);
+            continue;
+        }
+        tasks.push(tokio::spawn(async move {
+            let rows = fetch_one_shard(&job.shard.pool, &sql, &job.binds).await?;
+            let mut groups = metrics_cache::GroupRows::new();
+            for row in rows {
+                let name = row.try_get::<String, _>("metric_group")?;
+                let entry = groups.entry(name).or_default();
+                for metric in &job.metrics {
+                    if !matches!(
+                        metric,
+                        MetricName::AvgLatency
+                            | MetricName::AvgTtft
+                            | MetricName::SuccessRate
+                            | MetricName::ErrorRate
+                    ) {
+                        entry.insert(*metric, row_metric(&row, *metric)?);
+                    }
+                }
+            }
+            Ok::<_, sqlx::Error>((key, groups, job.cache_key, job.shard.is_active))
+        }));
+    }
+    for task in futures::future::join_all(tasks).await {
+        let (key, groups, cache_key, active) =
+            task.map_err(|error| sqlx::Error::Protocol(error.to_string()))??;
+        if let Some(cache_key) = cache_key {
+            metrics_cache::insert(cache_key, active, &groups);
+        }
+        results.insert(key, groups);
+    }
+
+    let mut output = serde_json::Map::new();
+    for (query, plan) in queries.iter().zip(plans) {
+        let mut merged = metrics_cache::GroupRows::new();
+        for key in &plan.jobs {
+            if let Some(groups) = results.get(key) {
+                merge_groups(&mut merged, groups, &required_metrics(query));
+            }
+        }
+        output.insert(query.id.clone(), render_result(query, plan, merged));
+    }
+    Ok(output)
+}
+
+fn job_key(shard: &ShardInput, group: &GroupBy, where_sql: &str, binds: &[Bind]) -> String {
+    format!("{}:{group:?}:{where_sql}:{binds:?}", shard.id)
+}
+
+fn required_metrics(query: &MetricQuery) -> Vec<MetricName> {
+    let mut required = query.metrics.clone();
+    required.push(query.order_by);
+    for metric in [MetricName::AvgLatency, MetricName::AvgTtft] {
+        if required.contains(&metric) {
+            let dependencies = match metric {
+                MetricName::AvgLatency => [MetricName::LatencySum, MetricName::LatencyCount],
+                MetricName::AvgTtft => [MetricName::TtftSum, MetricName::TtftCount],
+                _ => continue,
+            };
+            required.extend(dependencies);
         }
     }
-
-    let mut items: Vec<(String, HashMap<MetricName, f64>)> = merged.into_iter().collect();
-    items.sort_by(|a, b| {
-        metric_value(&b.1, query.order_by)
-            .total_cmp(&metric_value(&a.1, query.order_by))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    let items = items
-        .into_iter()
-        .take(query.limit)
-        .map(|(name, values)| {
-            let mut object = serde_json::Map::new();
-            object.insert(query.group_by.clone(), json!(name));
-            for metric in query.metrics.iter().copied() {
-                let value = match metric {
-                    MetricName::AvgLatency => {
-                        average(&values, MetricName::LatencySum, MetricName::LatencyCount)
-                    }
-                    MetricName::AvgTtft => {
-                        average(&values, MetricName::TtftSum, MetricName::TtftCount)
-                    }
-                    _ => Some(values.get(&metric).copied().unwrap_or(0.0)),
-                };
-                object.insert(metric.alias().to_string(), json!(value));
-            }
-            Value::Object(object)
-        })
-        .collect::<Vec<_>>();
-
-    Ok(json!({
-        "from": from,
-        "to": to,
-        "groupBy": query.group_by,
-        "items": items,
-        "shards": shards.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
-    }))
-}
-
-fn resolve_query_range(query: &MetricQuery) -> (i64, i64) {
-    let now = Local::now().timestamp_millis();
-    if let Some(period) = query.period {
-        let start = Local::now().date_naive();
-        let date = match period {
-            MetricPeriod::Week => {
-                start - chrono::Days::new(u64::from(start.weekday().num_days_from_monday()))
-            }
-            MetricPeriod::Month => start.with_day(1).unwrap_or(start),
-            MetricPeriod::Year => start
-                .with_month(1)
-                .and_then(|date| date.with_day(1))
-                .unwrap_or(start),
-        };
-        let from = Local
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default())
-            .earliest()
-            .map(|date| date.timestamp_millis())
-            .unwrap_or(now);
-        return (from, now);
+    if required.contains(&MetricName::SuccessRate) || required.contains(&MetricName::ErrorRate) {
+        required.extend([
+            MetricName::Requests,
+            MetricName::Success,
+            MetricName::Errors,
+        ]);
     }
-    let to = query.to.unwrap_or(now);
-    (query.from.unwrap_or(to.saturating_sub(7 * 86_400_000)), to)
+    required.sort_by_key(|metric| metric.alias());
+    required.dedup();
+    required
 }
 
-fn build_filters(query: &MetricQuery, from: i64, to: i64, full_shard: bool) -> (String, Vec<Bind>) {
-    let params = records_api::ListParams {
-        from: (!full_shard).then_some(from),
-        to: (!full_shard).then_some(to),
-        type_: query.filters.type_.clone(),
-        model: query.filters.model.clone(),
-        status: query.filters.status,
-        backend: query.filters.backend.clone(),
-        ip: query.filters.ip.clone(),
-        client: query.filters.client.clone(),
-        apikey: query.filters.apikey.clone(),
-        ..Default::default()
-    };
-    records_api::build_filters(&params)
-}
-
-fn build_sql(group: &str, metrics: &[MetricName], where_sql: &str) -> String {
-    let mut columns = vec![format!("{group} AS metric_group")];
-    for metric in metrics.iter().copied() {
-        if !matches!(metric, MetricName::AvgLatency | MetricName::AvgTtft) {
-            columns.push(metric.sql().to_string());
-        }
-    }
-    format!(
-        "SELECT {} FROM records{} GROUP BY 1",
-        columns.join(", "),
-        where_sql
-    )
-}
-
-fn group_expression(group_by: &str) -> &'static str {
-    match group_by {
-        "apikey" => "COALESCE(NULLIF(ApiKey, ''), 'Unknown')",
-        "ip" => "COALESCE(NULLIF(IP, ''), 'Unknown')",
-        "type" => "COALESCE(NULLIF(Type, ''), 'Unknown')",
-        "backend" => "COALESCE(NULLIF(Backend, ''), 'Unknown')",
-        "client" => "COALESCE(NULLIF(ClientName, ''), 'Unknown')",
-        "status" => "COALESCE(CAST(Status AS TEXT), 'Unknown')",
-        "hour" => "COALESCE(strftime('%H:00', TimeMs/1000, 'unixepoch', 'localtime'), 'Unknown')",
-        _ => "COALESCE(NULLIF(Model, ''), 'Unknown')",
-    }
-}
-
-fn shard_is_complete(
-    shard: &crate::handlers::analysis_api::shards::ShardInput,
-    from: i64,
-    to: i64,
-) -> bool {
-    shard.is_active && shard.active_month_covered(from, to)
+fn shard_is_complete(shard: &ShardInput, from: i64, to: i64, now: i64) -> bool {
+    shard.is_active && to >= now && shard.active_month_covered(from, to)
         || !shard.is_active
             && shard.min_ms.is_some_and(|min| min >= from)
             && shard.max_ms.is_some_and(|max| max <= to)
 }
 
-fn metric_value(values: &HashMap<MetricName, f64>, metric: MetricName) -> f64 {
-    match metric {
-        MetricName::AvgLatency => {
-            average(values, MetricName::LatencySum, MetricName::LatencyCount).unwrap_or(0.0)
-        }
-        MetricName::AvgTtft => {
-            average(values, MetricName::TtftSum, MetricName::TtftCount).unwrap_or(0.0)
-        }
-        _ => values.get(&metric).copied().unwrap_or(0.0),
+fn archive_cache_key(job: &Job, sql: &str) -> Option<String> {
+    if !job.full {
+        return None;
     }
-}
-
-fn row_metric(row: &SqliteRow, alias: &str) -> f64 {
-    row.try_get::<f64, _>(alias)
-        .or_else(|_| row.try_get::<i64, _>(alias).map(|value| value as f64))
-        .unwrap_or(0.0)
-}
-
-fn average(values: &HashMap<MetricName, f64>, sum: MetricName, count: MetricName) -> Option<f64> {
-    let count = values.get(&count).copied().unwrap_or(0.0);
-    (count > 0.0).then(|| values.get(&sum).copied().unwrap_or(0.0) / count)
-}
-
-impl MetricName {
-    fn alias(self) -> &'static str {
-        match self {
-            Self::Requests => "requests",
-            Self::Success => "success",
-            Self::Errors => "errors",
-            Self::PromptTokens => "promptTokens",
-            Self::CompletionTokens => "completionTokens",
-            Self::TotalTokens => "totalTokens",
-            Self::LatencySum => "latencySum",
-            Self::LatencyCount => "latencyCount",
-            Self::MaxLatency => "maxLatency",
-            Self::TtftSum => "ttftSum",
-            Self::TtftCount => "ttftCount",
-            Self::AvgLatency => "avgLatency",
-            Self::AvgTtft => "avgTtft",
-        }
+    if job.shard.is_active {
+        return Some(format!(
+            "active:{}:{sql}:{:?}",
+            job.shard.active_month?, job.binds
+        ));
     }
-
-    fn sql(self) -> &'static str {
-        match self {
-            Self::Requests => "COUNT(CASE WHEN Status >= 200 THEN 1 END) AS requests",
-            Self::Success => "COALESCE(SUM(CASE WHEN Status >= 200 AND Status < 400 THEN 1 ELSE 0 END), 0) AS success",
-            Self::Errors => "COALESCE(SUM(CASE WHEN Status >= 400 THEN 1 ELSE 0 END), 0) AS errors",
-            Self::PromptTokens => "COALESCE(SUM(COALESCE(PromptTokens, 0)), 0) AS promptTokens",
-            Self::CompletionTokens => "COALESCE(SUM(COALESCE(CompletionTokens, 0)), 0) AS completionTokens",
-            Self::TotalTokens => "COALESCE(SUM(COALESCE(TotalTokens, 0)), 0) AS totalTokens",
-            Self::LatencySum => "COALESCE(SUM(LatencyMs), 0) AS latencySum",
-            Self::LatencyCount => "COUNT(LatencyMs) AS latencyCount",
-            Self::MaxLatency => "COALESCE(MAX(LatencyMs), 0) AS maxLatency",
-            Self::TtftSum => "COALESCE(SUM(TtftMs), 0) AS ttftSum",
-            Self::TtftCount => "COUNT(TtftMs) AS ttftCount",
-            Self::AvgLatency | Self::AvgTtft => "0 AS unusedMetric",
-        }
-    }
+    let path = job.shard.path.as_ref()?;
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    Some(format!(
+        "{}:{}:{}:{sql}:{:?}",
+        path.display(),
+        metadata.len(),
+        modified.as_nanos(),
+        job.binds
+    ))
 }
+
+#[cfg(test)]
+#[path = "metrics_engine_tests.rs"]
+mod tests;

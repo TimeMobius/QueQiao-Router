@@ -1,14 +1,20 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::state::app_state::AppState;
 
+#[path = "metrics_cache.rs"]
+mod metrics_cache;
 #[path = "metrics_engine.rs"]
 mod metrics_engine;
-use metrics_engine::execute_query;
+#[path = "metrics_result.rs"]
+mod metrics_result;
+#[path = "metrics_sql.rs"]
+mod metrics_sql;
+use metrics_engine::execute_queries;
 
 const MAX_QUERIES: usize = 8;
 const MAX_METRICS: usize = 16;
@@ -26,7 +32,7 @@ pub struct MetricQuery {
     pub from: Option<i64>,
     pub to: Option<i64>,
     #[serde(rename = "groupBy", default = "default_group_by")]
-    pub group_by: String,
+    pub group_by: GroupBy,
     pub metrics: Vec<MetricName>,
     #[serde(default)]
     pub filters: MetricFilters,
@@ -42,6 +48,22 @@ pub enum MetricPeriod {
     Week,
     Month,
     Year,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum GroupBy {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl GroupBy {
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Single(name) => vec![name],
+            Self::Multiple(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -72,10 +94,12 @@ pub enum MetricName {
     TtftCount,
     AvgLatency,
     AvgTtft,
+    SuccessRate,
+    ErrorRate,
 }
 
-fn default_group_by() -> String {
-    "model".to_string()
+fn default_group_by() -> GroupBy {
+    GroupBy::Single("model".to_string())
 }
 
 fn default_order_by() -> MetricName {
@@ -91,21 +115,9 @@ pub async fn metrics(
     Json(request): Json<MetricsRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     validate_request(&request)?;
-    let mut results = serde_json::Map::new();
-    let mut memo: HashMap<String, Value> = HashMap::new();
-    for query in &request.queries {
-        let mut memo_query = query.clone();
-        memo_query.id.clear();
-        let key = serde_json::to_string(&memo_query).map_err(internal)?;
-        let value = if let Some(cached) = memo.get(&key) {
-            cached.clone()
-        } else {
-            let value = execute_query(&app_state, query).await.map_err(internal)?;
-            memo.insert(key, value.clone());
-            value
-        };
-        results.insert(query.id.clone(), value);
-    }
+    let results = execute_queries(&app_state, &request.queries)
+        .await
+        .map_err(internal)?;
     Ok(Json(json!({"queries": results})))
 }
 
@@ -128,20 +140,17 @@ fn validate_request(request: &MetricsRequest) -> Result<(), (StatusCode, String)
         if unique_metrics.len() != query.metrics.len() {
             return Err(bad_request("metrics must not contain duplicates"));
         }
-        if query.metrics.contains(&MetricName::AvgLatency)
-            && !query.metrics.contains(&MetricName::LatencySum)
+        let names = query.group_by.names();
+        if names.is_empty()
+            || names.len() > 2
+            || names.len() == 2 && names[0] == names[1]
+            || names.iter().any(|name| {
+                !matches!(
+                    *name,
+                    "model" | "apikey" | "ip" | "type" | "backend" | "client" | "status" | "hour"
+                )
+            })
         {
-            return Err(bad_request("avgLatency requires latencySum"));
-        }
-        if query.metrics.contains(&MetricName::AvgTtft)
-            && !query.metrics.contains(&MetricName::TtftSum)
-        {
-            return Err(bad_request("avgTtft requires ttftSum"));
-        }
-        if !matches!(
-            query.group_by.as_str(),
-            "model" | "apikey" | "ip" | "type" | "backend" | "client" | "status" | "hour"
-        ) {
             return Err(bad_request("unsupported groupBy"));
         }
         if (query.from.is_some() || query.to.is_some()) && query.period.is_some() {
@@ -155,9 +164,6 @@ fn validate_request(request: &MetricsRequest) -> Result<(), (StatusCode, String)
         }
         if query.limit == 0 || query.limit > MAX_ITEMS {
             return Err(bad_request("limit must be between 1 and 10000"));
-        }
-        if !query.metrics.contains(&query.order_by) {
-            return Err(bad_request("orderBy must be included in metrics"));
         }
     }
     Ok(())
@@ -177,7 +183,7 @@ fn internal(error: impl std::fmt::Display) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_request, MetricName, MetricPeriod, MetricQuery, MetricsRequest};
+    use super::{validate_request, GroupBy, MetricName, MetricPeriod, MetricQuery, MetricsRequest};
 
     fn query(metrics: Vec<MetricName>) -> MetricQuery {
         MetricQuery {
@@ -185,7 +191,7 @@ mod tests {
             period: Some(MetricPeriod::Month),
             from: None,
             to: None,
-            group_by: "model".to_string(),
+            group_by: GroupBy::Single("model".to_string()),
             metrics,
             filters: Default::default(),
             order_by: MetricName::Requests,
@@ -206,6 +212,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_two_whitelisted_dimensions_and_rejects_duplicates() {
+        let mut grouped = query(vec![MetricName::Requests]);
+        grouped.group_by = GroupBy::Multiple(vec!["model".to_string(), "backend".to_string()]);
+        assert!(validate_request(&MetricsRequest {
+            queries: vec![grouped.clone()]
+        })
+        .is_ok());
+        grouped.group_by = GroupBy::Multiple(vec!["model".to_string(), "model".to_string()]);
+        assert!(validate_request(&MetricsRequest {
+            queries: vec![grouped]
+        })
+        .is_err());
+    }
+
+    #[test]
     fn rejects_duplicate_query_ids() {
         let mut second = query(vec![MetricName::Requests]);
         second.id = "q".to_string();
@@ -216,10 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn requires_base_metrics_for_average() {
+    fn average_can_be_requested_without_base_metrics() {
+        let mut query = query(vec![MetricName::AvgLatency]);
+        query.order_by = MetricName::AvgLatency;
         let request = MetricsRequest {
-            queries: vec![query(vec![MetricName::AvgLatency])],
+            queries: vec![query],
         };
-        assert!(validate_request(&request).is_err());
+        assert!(validate_request(&request).is_ok());
     }
 }
