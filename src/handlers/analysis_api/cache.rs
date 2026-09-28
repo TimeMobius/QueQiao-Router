@@ -1,4 +1,4 @@
-//! 缓存：15s TTL 的进程内结果缓存与统一错误响应构造。
+//! 缓存：30min TTL 的进程内结果缓存与统一错误响应构造。
 
 use axum::http::StatusCode;
 use once_cell::sync::Lazy;
@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use super::params::AnalysisParams;
 
-const CACHE_TTL: Duration = Duration::from_secs(15);
+const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const CACHE_MAX_ENTRIES: usize = 256;
 
-/// 15s TTL 的进程内结果缓存；键为规范化查询串，插入时清理过期项并设上限。
+/// 30min TTL 的进程内结果缓存；键为规范化查询串，插入时清理过期项并设上限。
 static CACHE: Lazy<Mutex<HashMap<String, (Instant, Value)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
