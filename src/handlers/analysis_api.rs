@@ -22,7 +22,7 @@ mod cache;
 mod errors_endpoint;
 mod log_scan;
 mod params;
-mod shards;
+pub(crate) mod shards;
 mod sql;
 
 pub use analysis_endpoint::analysis;

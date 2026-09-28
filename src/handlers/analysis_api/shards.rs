@@ -1,5 +1,6 @@
 //! 分片查询（并发受限）：组装分片列表、按时间切片并发扫描。
 
+use chrono::TimeZone;
 use once_cell::sync::Lazy;
 use sqlx::sqlite::SqliteRow;
 use sqlx::SqlitePool;
@@ -21,9 +22,29 @@ static SHARD_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(SHARD_CONCURRENC
 
 /// 一次多分片查询的输入分片（只读归档或 active）。
 #[derive(Clone)]
-pub(super) struct ShardInput {
-    pub(super) id: String,
-    pub(super) pool: SqlitePool,
+pub(crate) struct ShardInput {
+    pub(crate) id: String,
+    pub(crate) pool: SqlitePool,
+    pub(crate) min_ms: Option<i64>,
+    pub(crate) max_ms: Option<i64>,
+    pub(crate) is_active: bool,
+}
+
+impl ShardInput {
+    pub(crate) fn active_month_covered(&self, from: i64, to: i64) -> bool {
+        if !self.is_active {
+            return false;
+        }
+        let now = chrono::Local::now().timestamp_millis();
+        let active_month = crate::db::rotation::yyyymm(chrono::Local::now());
+        let year = active_month / 100;
+        let month = (active_month % 100) as u32;
+        let month_start = chrono::Local
+            .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+            .single()
+            .map(|date| date.timestamp_millis());
+        month_start.is_some_and(|start| from <= start) && to >= now.saturating_sub(5_000)
+    }
 }
 
 async fn fetch(
@@ -34,6 +55,18 @@ async fn fetch(
     records_query::bind_all(sqlx::query(sql), binds)
         .fetch_all(pool)
         .await
+}
+
+pub(crate) async fn fetch_one_shard(
+    pool: &SqlitePool,
+    sql: &str,
+    binds: &[records_query::Bind],
+) -> Result<Vec<SqliteRow>, sqlx::Error> {
+    let _permit = SHARD_SEM
+        .acquire()
+        .await
+        .map_err(|error| sqlx::Error::Protocol(format!("shard query semaphore closed: {error}")))?;
+    fetch(pool, sql, binds).await
 }
 
 /// 等待一组已 spawn 的查询任务并收集结果。
@@ -163,7 +196,7 @@ pub(super) async fn distinct_count_across_shards(
 }
 
 /// 组装分片列表：active 恒在首位，命中候选归档追加在后。
-pub(super) async fn collect_shards(
+pub(crate) async fn collect_shards(
     app_state: &Arc<AppState>,
     from: i64,
     to: i64,
@@ -177,11 +210,17 @@ pub(super) async fn collect_shards(
     shards.push(ShardInput {
         id: ACTIVE_SHARD.to_string(),
         pool: active,
+        min_ms: None,
+        max_ms: None,
+        is_active: true,
     });
     for c in &candidates {
         shards.push(ShardInput {
             id: c.id.clone(),
             pool: c.pool.clone(),
+            min_ms: c.min_ms,
+            max_ms: c.max_ms,
+            is_active: false,
         });
     }
     shards
