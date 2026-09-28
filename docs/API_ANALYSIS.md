@@ -1,6 +1,6 @@
 # 分析 API（只读）
 
-监控面板分析页背后的只读聚合接口，均为 **GET**、返回 JSON。数据来源分两类：
+监控面板分析页背后的只读聚合接口，返回 JSON；原有分析接口为 **GET**，轻量指标接口为 **POST**。数据来源分两类：
 
 - **审计库**：active `record.db` + 命中的月度归档 `record_YYYYMM.db`。捕获写入了 DB 的
   请求——成功（2xx/3xx）与**流式断开**（499/502）。
@@ -90,78 +90,6 @@
 }
 ```
 
-## `POST /dashboard/api/metrics`
-
-通用轻量聚合接口。客户端在一次 POST 中提交多个独立查询；每个查询只执行请求的指标，
-相同分组与筛选的指标会合并到一条 SQL，避免轮询完整分析接口时重复扫描。
-
-请求体：
-
-```json
-{
-  "queries": [
-    {
-      "id": "week",
-      "period": "week",
-      "groupBy": "model",
-      "metrics": ["requests", "success", "errors"],
-      "orderBy": "requests",
-      "limit": 100
-    },
-    {
-      "id": "month",
-      "period": "month",
-      "groupBy": "model",
-      "metrics": ["requests"]
-    }
-  ]
-}
-```
-
-`period` 支持 `week`、`month`、`year`，按服务器本地时区解析为本周期开始至当前时刻。
-也可以使用 `from`/`to` 传 epoch 毫秒；两种方式不能同时使用。一次最多 8 个 query，
-每个 query 最多 16 个指标，`limit` 最大 10000，`id` 必须唯一。
-
-支持的 `groupBy`：`model`、`apikey`、`ip`、`type`、`backend`、`client`、`status`、`hour`。
-
-支持的基础指标：
-
-| 指标 | 含义 |
-| :--- | :--- |
-| `requests` | `Status >= 200` 的请求数 |
-| `success` | `200 <= Status < 400` 的请求数 |
-| `errors` | `Status >= 400` 的请求数 |
-| `promptTokens` / `completionTokens` / `totalTokens` | Token 汇总 |
-| `latencySum` / `latencyCount` / `maxLatency` | 延迟汇总、有效值数量、最大值 |
-| `ttftSum` / `ttftCount` | 首字延迟汇总、有效值数量 |
-| `avgLatency` / `avgTtft` | 服务端根据对应 sum/count 计算平均值 |
-
-`avgLatency` 必须同时请求 `latencySum` 和 `latencyCount`；`avgTtft` 必须同时请求
-`ttftSum` 和 `ttftCount`。`orderBy` 必须是请求的指标之一（平均值除外）。
-
-响应：
-
-```json
-{
-  "queries": {
-    "month": {
-      "from": 1788192000000,
-      "to": 1790567702000,
-      "groupBy": "model",
-      "shards": ["active"],
-      "items": [
-        {"model": "Qwen3.8-27B", "requests": 8393}
-      ]
-    }
-  }
-}
-```
-
-统计执行会按分片选择查询方式：当前月份 active 库和请求范围完整覆盖的不可变归档
-直接整库聚合，不添加 `TimeMs` 条件；部分月份、短时间范围和其他边界分片保留精确的
-`TimeMs >= from AND TimeMs <= to` 过滤。该接口不会执行趋势、延迟直方图、错误日志扫描
-或 DISTINCT 统计，除非未来将对应指标加入白名单，因此适合周期模型报表。
-
 - `summary`：`success` 为审计库 `200 <= Status < 400`。**`errors = dbErrors + logErrors`**：
   `dbErrors` 为审计库 `Status >= 400`（含 499/422/无模型名）；`logErrors` 为错误日志中
   **带状态码**的条目（无状态码的 `STREAM_INTERRUPTED` 不计入）。**`requests = success +
@@ -184,6 +112,59 @@
 - 跨分片时 `models`/`ips` 不是把各分片 `COUNT(DISTINCT)` 相加（那会在跨月时重复
   计数），而是各分片取 `DISTINCT` 值后在 Rust 侧并集去重；单分片走 `COUNT(DISTINCT)`
   快路径。去重集合上限 10000，触顶时告警。
+
+---
+
+## `POST /dashboard/api/metrics`
+
+通用轻量聚合接口。客户端在一次 POST 中提交多个独立查询；每个查询只执行请求的指标，
+相同分片、筛选和分组所需的指标合并为一条 SQL。
+
+```json
+{
+  "queries": [
+    {"id":"week","period":"week","groupBy":"model","metrics":["requests","successRate"]},
+    {"id":"month","period":"month","groupBy":["model","backend"],"metrics":["requests"]},
+    {"id":"year","period":"year","groupBy":"model","metrics":["requests","promptTokens"]}
+  ]
+}
+```
+
+`period` 支持 `week`、`month`、`year`，按服务器本地时区解析本周期开始至当前时刻。
+也可传 `from`/`to`（含边界的 epoch 毫秒），不可与 `period` 混用；缺省是最近 7 天。
+一次最多 8 个 query，每个最多 16 个指标，`id` 唯一且最长 64 字符，`limit` 为 1~10000。
+`groupBy` 默认为 `model`，可传单个字符串或 1~2 个维度的数组：`model`、`apikey`、
+`ip`、`type`、`backend`、`client`、`status`、`hour`。`filters` 支持 `model`、`ip`、
+`apikey`、`type`、`backend`、`status`、`client`，语义与上面的 GET 筛选一致。
+两个维度时响应行包含两个维度字段；分组键在 SQL 中使用 JSON 数组以避免值中分隔符碰撞。
+
+| 指标 | 含义 |
+| :--- | :--- |
+| `requests` | `Status >= 200` 的请求数 |
+| `success` / `errors` | `200 <= Status < 400` / `Status >= 400` 的请求数 |
+| `promptTokens` / `completionTokens` / `totalTokens` | Token 汇总 |
+| `latencySum` / `latencyCount` / `maxLatency` | 时延和、有效值数量、最大值 |
+| `ttftSum` / `ttftCount` | 首字时延和、有效值数量 |
+| `avgLatency` / `avgTtft` | 跨分片合并后按 sum/count 算出的平均值 |
+| `successRate` / `errorRate` | 成功/错误数除以数据库请求数，0~1；无请求时为 null |
+
+衍生指标可以单独请求，计算所需的基础指标不会出现在响应中（除非显式请求）。
+`orderBy` 缺省为 `requests`，可选择任何指标，不要求它出现在 `metrics` 中；服务端在跨分片
+合并后排序，最后截取 `limit`。整数指标保持 `i64` 精度。响应格式：
+
+```json
+{"queries":{"month":{"from":1788192000000,"to":1790567702000,"groupBy":"model",
+"shards":["active"],"items":[{"model":"Qwen3.8-27B","requests":8393}]}}}
+```
+
+只在查询覆盖完整分片时省略时间边界：active 还需覆盖当前月起点并到达当前时刻，
+归档需由实际 `min_ms/max_ms` 证明完全包含；整库查询仍排除 `TimeMs=NULL` 的行。
+边界分片保留 `TimeMs >= from AND TimeMs <= to`。批量请求先获取一次候选分片，再对
+重复的分片/过滤/维度合并指标并只扫描一次。完整归档按文件大小及 mtime 缓存最多 1 小时；
+当前月整库结果最多缓存 30 秒；部分时间窗不跨请求缓存。缓存每进程最多 64 项。
+
+**数据口径**：本接口只统计数据库，不含错误日志；不做趋势、分位直方图或 DISTINCT 统计。
+这些指标继续使用 `GET /dashboard/api/analysis`，其成本和缓存策略不变。
 
 ---
 
@@ -239,7 +220,7 @@
 
 | 条件 | 索引 |
 | :--- | :--- |
-| `from` / `to` | `idx_records_time`（覆盖索引） |
+| `from` / `to` | `idx_records_time`（时间范围索引；聚合字段仍需读取数据行） |
 | `type` / `backend` / `apikey` | 等值索引 |
 | `model` / `ip` | 前缀范围索引（`COLLATE NOCASE`） |
 | `status` / `client` / `dimension` 分组 / `errors` | **无索引，扫描** |
@@ -249,10 +230,10 @@
 - **独立查询连接池**：分析/记录查询走 `query_pool`（16 连接），与请求日志写入的
   `db_pool`（10 连接）隔离，避免大表聚合占满连接后饿死写入。两者在数据库轮转时
   一并排空并重建。
-- **分片内时间切片并行**：趋势与维度查询把 `[from, to]` 切成最多 4 段连续闭区间
-  并发执行（`tokio::spawn`），再按可加语义归并；汇总与 DISTINCT 不切片（切片只会
-  放大开销）。全局并发由信号量 `SHARD_CONCURRENCY = 8` 封顶（跨所有分析请求共享），
-  单分片最多 4 路、跨 2 分片 8 路。`query_pool` 连接数足以覆盖该并发。
+- **分片内时间切片并行**：部分覆盖的分片在趋势/维度查询中把时间范围切成最多 4 段，
+  利用已有时间索引并发执行；完整覆盖的历史归档不切片也不做时间上下界比较，但仍排除
+  `TimeMs=NULL`。汇总、跨分片 DISTINCT 和分位直方图对完整归档也省略时间上下界，
+  对边界分片仍精确筛选。全局并发由 `SHARD_CONCURRENCY = 8` 封顶。
 - 结果带 **15s 进程内缓存**，键为规范化查询串；缓存有界（最多 256 条，插入时清理过期项）。
 - 趋势桶标签使用 SQLite `strftime(..., 'localtime')`，与服务器本地时区一致。
 - **不使用 WAL**：默认 `delete` journal 下读写提交仍互斥，长时间大范围扫描会短暂
