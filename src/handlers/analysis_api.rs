@@ -21,6 +21,7 @@ mod analysis_endpoint;
 mod cache;
 mod errors_endpoint;
 mod log_scan;
+mod optimized;
 mod params;
 pub(crate) mod shards;
 mod sql;

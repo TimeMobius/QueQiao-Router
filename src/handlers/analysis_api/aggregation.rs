@@ -323,9 +323,11 @@ mod tests {
         let shards = [ShardInput {
             id: ACTIVE_SHARD.to_string(),
             pool: pool.clone(),
+            path: None,
             min_ms: None,
             max_ms: None,
             is_active: true,
+            active_month: None,
         }];
         let params = AnalysisParams::default();
         let (from, to) = (0_i64, 10_000_000_i64);
@@ -407,9 +409,11 @@ mod tests {
         let shards = [ShardInput {
             id: ACTIVE_SHARD.to_string(),
             pool: pool.clone(),
+            path: None,
             min_ms: None,
             max_ms: None,
             is_active: true,
+            active_month: None,
         }];
         let rows = fetch_all_shards(&shards, &summary_sql(" WHERE 1=1"), &[])
             .await

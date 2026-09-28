@@ -8,7 +8,6 @@ use axum::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::handlers::records_api;
 use crate::state::app_state::AppState;
 
 use super::aggregation::{
@@ -17,14 +16,14 @@ use super::aggregation::{
 };
 use super::cache::{cache_get, cache_key, cache_put, internal};
 use super::log_scan::scan_error_logs;
+use super::optimized::fetch_optimized;
 use super::params::{
     clamp_page, clamp_page_size, clamp_top, dimension_expr, effective_interval, metric_value,
     order_metric, resolve_range, to_list_params, AnalysisParams, COUNT_CAP, DEFAULT_DIM_EXPR,
     DISTINCT_CAP, GROUP_CAP, LATENCY_COL, MAX_BUCKETS, TTFT_COL, UNKNOWN,
 };
 use super::shards::{
-    collect_shards, distinct_count_across_shards, fetch_all_shards, fetch_sliced,
-    skipped_archive_warning,
+    collect_shards, distinct_count_across_shards, fetch_sliced, skipped_archive_warning,
 };
 use super::sql::{dims_sql, latency_hist_sql, summary_sql, trend_sql};
 
@@ -69,8 +68,7 @@ async fn build_analysis(
     let shard_ids: Vec<String> = shards.iter().map(|s| s.id.clone()).collect();
 
     // 汇总
-    let (where_sql, binds) = records_api::build_filters(&to_list_params(p, from, to));
-    let summary_rows = fetch_all_shards(&shards, &summary_sql(&where_sql), &binds)
+    let summary_rows = fetch_optimized(&shards, p, from, to, summary_sql)
         .await
         .map_err(internal)?;
     let summaries: Vec<SummaryAgg> = summary_rows
@@ -81,11 +79,10 @@ async fn build_analysis(
 
     // 单分片时 COUNT(DISTINCT) 已精确；跨分片改为并集去重，避免重复计数。
     if shards.len() > 1 {
-        let (models, models_capped) =
-            distinct_count_across_shards(&shards, &where_sql, &binds, "Model")
-                .await
-                .map_err(internal)?;
-        let (ips, ips_capped) = distinct_count_across_shards(&shards, &where_sql, &binds, "IP")
+        let (models, models_capped) = distinct_count_across_shards(&shards, p, from, to, "Model")
+            .await
+            .map_err(internal)?;
+        let (ips, ips_capped) = distinct_count_across_shards(&shards, p, from, to, "IP")
             .await
             .map_err(internal)?;
         summary.models = models as i64;
@@ -251,12 +248,11 @@ async fn build_analysis(
         .collect();
 
     // 时延分位采用固定宽度直方图合并后近似；均值/最大来自精确聚合，无额外扫描放大。
-    let latency_hist =
-        fetch_all_shards(&shards, &latency_hist_sql(&where_sql, LATENCY_COL), &binds)
-            .await
-            .map_err(internal)?;
+    let latency_hist = fetch_optimized(&shards, p, from, to, |w| latency_hist_sql(w, LATENCY_COL))
+        .await
+        .map_err(internal)?;
     let latency_buckets = merge_histograms(&latency_hist);
-    let ttft_hist = fetch_all_shards(&shards, &latency_hist_sql(&where_sql, TTFT_COL), &binds)
+    let ttft_hist = fetch_optimized(&shards, p, from, to, |w| latency_hist_sql(w, TTFT_COL))
         .await
         .map_err(internal)?;
     let ttft_buckets = merge_histograms(&ttft_hist);

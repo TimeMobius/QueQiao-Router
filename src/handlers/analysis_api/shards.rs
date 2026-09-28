@@ -25,9 +25,11 @@ static SHARD_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(SHARD_CONCURRENC
 pub(crate) struct ShardInput {
     pub(crate) id: String,
     pub(crate) pool: SqlitePool,
+    pub(crate) path: Option<std::path::PathBuf>,
     pub(crate) min_ms: Option<i64>,
     pub(crate) max_ms: Option<i64>,
     pub(crate) is_active: bool,
+    pub(crate) active_month: Option<i32>,
 }
 
 impl ShardInput {
@@ -36,7 +38,12 @@ impl ShardInput {
             return false;
         }
         let now = chrono::Local::now().timestamp_millis();
-        let active_month = crate::db::rotation::yyyymm(chrono::Local::now());
+        let Some(active_month) = self.active_month else {
+            return false;
+        };
+        if active_month != crate::db::rotation::yyyymm(chrono::Local::now()) {
+            return false;
+        }
         let year = active_month / 100;
         let month = (active_month % 100) as u32;
         let month_start = chrono::Local
@@ -90,6 +97,7 @@ async fn join_queries(
 ///
 /// 这类查询切片不减少总扫描量，反而成倍放大查询开销，因此只在趋势/维度这类
 /// 大结果集上切片。
+#[cfg(test)]
 pub(super) async fn fetch_all_shards(
     shards: &[ShardInput],
     sql: &str,
@@ -159,6 +167,22 @@ where
     let slices = range_slices(from, to);
     let mut tasks = Vec::with_capacity(shards.len().saturating_mul(slices.len()));
     for shard in shards {
+        if !shard.is_active
+            && shard.min_ms.is_some_and(|min| min >= from)
+            && shard.max_ms.is_some_and(|max| max <= to)
+        {
+            let pool = shard.pool.clone();
+            let mut params = to_list_params(p, from, to);
+            params.from = None;
+            params.to = None;
+            let (mut where_sql, binds) = records_query::build_filters(&params);
+            where_sql.push_str(" AND TimeMs IS NOT NULL");
+            let sql = make_sql(&where_sql);
+            tasks.push(tokio::spawn(async move {
+                fetch_one_shard(&pool, &sql, &binds).await
+            }));
+            continue;
+        }
         for &(slice_from, slice_to) in &slices {
             let pool = shard.pool.clone();
             let (where_sql, binds) =
@@ -178,12 +202,15 @@ where
 /// 不切片：切片的 LIMIT 语义会破坏去重并放大开销。
 pub(super) async fn distinct_count_across_shards(
     shards: &[ShardInput],
-    where_sql: &str,
-    binds: &[records_query::Bind],
+    params: &AnalysisParams,
+    from: i64,
+    to: i64,
     column: &str,
 ) -> Result<(usize, bool), sqlx::Error> {
-    let rows =
-        fetch_all_shards(shards, &super::sql::distinct_sql(where_sql, column), binds).await?;
+    let rows = super::optimized::fetch_optimized(shards, params, from, to, |where_sql| {
+        super::sql::distinct_sql(where_sql, column)
+    })
+    .await?;
     let mut set: HashSet<String> = HashSet::new();
     for shard_rows in &rows {
         for row in shard_rows {
@@ -210,17 +237,25 @@ pub(crate) async fn collect_shards(
     shards.push(ShardInput {
         id: ACTIVE_SHARD.to_string(),
         pool: active,
+        path: None,
         min_ms: None,
         max_ms: None,
         is_active: true,
+        active_month: Some(
+            app_state
+                .active_yyyymm
+                .load(std::sync::atomic::Ordering::Acquire),
+        ),
     });
     for c in &candidates {
         shards.push(ShardInput {
             id: c.id.clone(),
             pool: c.pool.clone(),
+            path: Some(c.path.clone()),
             min_ms: c.min_ms,
             max_ms: c.max_ms,
             is_active: false,
+            active_month: None,
         });
     }
     shards
@@ -232,34 +267,9 @@ pub(super) fn skipped_archive_warning(skipped: usize) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::params::HOUR_MS;
-    use super::*;
+#[path = "shards_slice_tests.rs"]
+mod tests;
 
-    #[test]
-    fn range_slices_cover_endpoints_contiguously_without_overlap() {
-        let from = 1_000_000_i64;
-        let to = from + 30 * DAY_MS;
-        let slices = range_slices(from, to);
-        assert_eq!(slices.len(), 4);
-        assert_eq!(slices.first().unwrap().0, from);
-        assert_eq!(slices.last().unwrap().1, to);
-        for pair in slices.windows(2) {
-            assert_eq!(pair[1].0, pair[0].1 + 1, "slices must be gap-free");
-        }
-        for &(start, end) in &slices {
-            assert!(start <= end, "slice must be non-empty");
-        }
-        let covered: i64 = slices.iter().map(|(s, e)| e - s + 1).sum();
-        assert_eq!(covered, to - from + 1);
-    }
-
-    #[test]
-    fn range_slices_collapse_short_and_reversed_ranges() {
-        assert_eq!(range_slices(0, HOUR_MS), vec![(0, HOUR_MS)]);
-        assert_eq!(range_slices(0, DAY_MS - 1), vec![(0, DAY_MS - 1)]);
-        assert_eq!(range_slices(5, 5), vec![(5, 5)]);
-        assert_eq!(range_slices(10, 5), vec![(10, 5)]);
-        assert_eq!(range_slices(0, 2 * DAY_MS).len(), 2);
-    }
-}
+#[cfg(test)]
+#[path = "shards_full_tests.rs"]
+mod full_tests;
