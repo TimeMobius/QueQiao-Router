@@ -41,8 +41,8 @@ impl MetricValue {
 
 pub(super) type GroupRows = HashMap<String, HashMap<MetricName, MetricValue>>;
 
-const ARCHIVE_TTL: Duration = Duration::from_secs(3600);
-const ACTIVE_TTL: Duration = Duration::from_secs(30);
+const ARCHIVE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+const ACTIVE_TTL: Duration = Duration::from_secs(3600);
 const CAPACITY: usize = 64;
 static CACHE: Lazy<Mutex<HashMap<String, (Instant, bool, GroupRows)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -85,13 +85,20 @@ mod tests {
         insert(key.clone(), true, &rows);
         assert_eq!(get(&key), Some(rows.clone()));
         if let Ok(mut cache) = CACHE.lock() {
-            cache.get_mut(&key).unwrap().0 = Instant::now() - Duration::from_secs(31);
+            cache.get_mut(&key).unwrap().0 = Instant::now() - Duration::from_secs(3601);
         }
         assert!(get(&key).is_none());
         insert(key.clone(), false, &rows);
         if let Ok(mut cache) = CACHE.lock() {
-            cache.get_mut(&key).unwrap().0 = Instant::now() - Duration::from_secs(31);
+            cache.get_mut(&key).unwrap().0 =
+                Instant::now() - Duration::from_secs(7 * 24 * 3600 - 1);
         }
-        assert_eq!(get(&key), Some(rows));
+        assert_eq!(get(&key), Some(rows.clone()));
+        insert(key.clone(), false, &rows);
+        if let Ok(mut cache) = CACHE.lock() {
+            cache.get_mut(&key).unwrap().0 =
+                Instant::now() - Duration::from_secs(7 * 24 * 3600 + 1);
+        }
+        assert!(get(&key).is_none());
     }
 }
