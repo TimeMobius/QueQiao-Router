@@ -107,6 +107,17 @@ fn error_rate_is_derived_from_merged_request_counts() {
 }
 
 #[tokio::test]
+async fn integer_latency_sum_decodes_as_real_for_average() {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    let row = sqlx::query("SELECT CAST(5 AS INTEGER) AS latencySum")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let value = row_metric(&row, MetricName::LatencySum).unwrap();
+    assert_eq!(value, MetricValue::Real(5.0));
+}
+
+#[tokio::test]
 async fn completed_archive_uses_full_scan_only_when_bounds_fit() {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     let shard = ShardInput {

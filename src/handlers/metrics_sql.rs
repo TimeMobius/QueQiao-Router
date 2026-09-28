@@ -130,7 +130,7 @@ pub(super) fn metric_value(values: &HashMap<MetricName, MetricValue>, metric: Me
 pub(super) fn row_metric(row: &SqliteRow, metric: MetricName) -> Result<MetricValue, sqlx::Error> {
     match metric {
         MetricName::LatencySum | MetricName::MaxLatency | MetricName::TtftSum => {
-            row.try_get::<f64, _>(metric.alias()).map(MetricValue::Real)
+            real_or_int(row, metric.alias()).map(MetricValue::Real)
         }
         MetricName::AvgLatency
         | MetricName::AvgTtft
@@ -140,6 +140,13 @@ pub(super) fn row_metric(row: &SqliteRow, metric: MetricName) -> Result<MetricVa
             .try_get::<i64, _>(metric.alias())
             .map(MetricValue::Integer),
     }
+}
+
+/// SQLite 同一列在不同分片可能以 `REAL` 或 `INTEGER` 存储（如 `SUM(LatencyMs)`），
+/// 先按浮点读取，失败再按整数读取，避免整值列导致 `avgLatency` 解码失败。
+fn real_or_int(row: &SqliteRow, alias: &str) -> Result<f64, sqlx::Error> {
+    row.try_get::<f64, _>(alias)
+        .or_else(|_| row.try_get::<i64, _>(alias).map(|value| value as f64))
 }
 
 pub(super) fn average(
