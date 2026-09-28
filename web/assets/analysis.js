@@ -3,6 +3,7 @@
 
     var API = '/dashboard/api/analysis';
     var ERROR_API = API + '/errors';
+    var METRICS_API = '/dashboard/api/metrics';
     var PAGE_SIZE = 20;
     var ANOMALY_THRESHOLDS = { errorRateCritical: 5, p95Critical: 10000, errorRateIncreaseWarning: 100, requestsDecreaseWarning: 50, p95IncreaseWarning: 50 };
     var state = { page: 1, trendMode: 'requests', errorSource: 'db', seq: 0, chart: null, last: null, previous: null, anomalyDismissed: false };
@@ -33,6 +34,33 @@
         return p;
     }
     function analysisParams() { var p = sharedParams(); var interval = $('intervalSelect').value; if (interval) p.set('interval', interval); p.set('dimension', $('dimensionSelect').value); p.set('orderBy', $('orderSelect').value); p.set('page', String(state.page)); p.set('pageSize', String(PAGE_SIZE)); p.set('topLimit', '8'); return p; }
+    function metricsFilters() {
+        var filters = {};
+        [['model', 'modelInput'], ['apikey', 'apikeyInput'], ['ip', 'ipInput'], ['type', 'typeInput'], ['backend', 'backendInput'], ['client', 'clientInput']].forEach(function (pair) {
+            var value = $(pair[1]).value.trim();
+            if (value) filters[pair[0]] = value;
+        });
+        var status = $('statusInput').value.trim();
+        if (status && /^-?\d+$/.test(status)) filters.status = Number(status);
+        return filters;
+    }
+    function metricQuery(id, groupBy, metrics, orderBy, limit) {
+        var r = range();
+        return { id: id, from: r.from, to: r.to, groupBy: groupBy, metrics: metrics, orderBy: orderBy, limit: limit, filters: metricsFilters() };
+    }
+    function metricRequest(queries) {
+        return fetch(METRICS_API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ queries: queries }) }).then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        });
+    }
+    function metricItems(data, id, groupBy) {
+        var query = data && data.queries && data.queries[id];
+        return (query && query.items || []).map(function (item) {
+            var name = item[groupBy];
+            return { name: name === null || name === undefined ? 'Unknown' : String(name), requests: num(item.requests), success: num(item.success), errors: num(item.errors), promptTokens: num(item.promptTokens), completionTokens: num(item.completionTokens), totalTokens: num(item.totalTokens), avgLatencyMs: item.avgLatency == null ? null : num(item.avgLatency) };
+        });
+    }
     function compareEnabled() { return $('compareToggle').checked; }
     function previousParams(p) { var r = range(), duration = r.to - r.from, previous = new URLSearchParams(p.toString()); previous.set('from', String(r.from - duration)); previous.set('to', String(r.from)); return previous; }
     function hasValue(object, key) { return !!object && object[key] !== null && object[key] !== undefined && isFinite(Number(object[key])); }
@@ -85,11 +113,23 @@
     }
     function updateTrendSubtitle() { var subtitle = $('trendSubtitle'); if (!state.last || !state.previous || !compareEnabled()) { subtitle.textContent = '按时间聚合的成功与错误请求'; return; } subtitle.textContent = (state.last.trend || []).length === (state.previous.trend || []).length ? '按时间聚合的成功与错误请求' : '按时间聚合的成功与错误请求（上期桶数不同，按序号对齐）'; }
     function renderBackends(items) { var list = items || []; $('backendBody').innerHTML = list.length ? list.map(function (it) { var requests = num(it.requests), success = num(it.success), errors = num(it.errors), rate = requests > 0 ? success / requests * 100 : 0, cls = rate >= 99 ? 'ok' : (rate >= 95 ? 'warn' : 'bad'); return '<tr><td title="' + esc(it.name) + '">' + esc(it.name || '-') + '</td><td class="number" title="' + esc(full(requests)) + '">' + esc(compact(requests)) + '</td><td class="number"><span class="health-rate ' + cls + '">' + pct(rate) + '</span></td><td class="number" title="' + esc(full(errors)) + '">' + esc(compact(errors)) + '</td><td class="number">' + (it.avgLatencyMs == null ? '-' : esc(fmtMs(it.avgLatencyMs))) + '</td></tr>'; }).join('') : '<tr class="empty-row"><td colspan="5">暂无后端数据</td></tr>'; }
-    function loadBackends() { var p = sharedParams(); var interval = $('intervalSelect').value; if (interval) p.set('interval', interval); p.set('dimension', 'backend'); p.set('orderBy', 'requests'); p.set('page', '1'); p.set('pageSize', '50'); p.set('topLimit', '8'); return fetch(API + '?' + p.toString()).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }); }
+    function loadMetrics() {
+        var dimension = $('dimensionSelect').value;
+        var topDimension = $('topDimension').value;
+        var queries = [
+            metricQuery('dimensions', dimension, ['requests', 'success', 'errors', 'promptTokens', 'completionTokens', 'totalTokens'], $('orderSelect').value === 'tokens' ? 'totalTokens' : $('orderSelect').value, 10000),
+            metricQuery('top', topDimension, ['requests'], 'requests', 8),
+            metricQuery('backends', 'backend', ['requests', 'success', 'errors', 'avgLatency'], 'requests', 50)
+        ];
+        return metricRequest(queries).then(function (data) {
+            var dimensions = metricItems(data, 'dimensions', dimension);
+            var offset = (state.page - 1) * PAGE_SIZE;
+            return { dimensions: { items: dimensions.slice(offset, offset + PAGE_SIZE), total: dimensions.length, page: state.page, pageSize: PAGE_SIZE, totalExact: dimensions.length < 10000 }, top: metricItems(data, 'top', topDimension).map(function (item) { return { name: item.name, value: item.requests }; }), backends: metricItems(data, 'backends', 'backend') };
+        });
+    }
     function renderMeta(data) { $('queryMeta').textContent = data.from && data.to ? new Date(num(data.from)).toLocaleString() + ' 至 ' + new Date(num(data.to)).toLocaleString() : '最近 7 天'; $('shardMeta').textContent = '数据分片：' + ((data.shards || []).join(', ') || '--'); $('dimensionSubtitle').textContent = '按' + ($('dimensionSelect').selectedOptions[0] ? $('dimensionSelect').selectedOptions[0].textContent : '维度') + '统计'; }
     function loadErrors(seq) { var p = sharedParams(); p.set('source', state.errorSource); p.set('limit', '20'); return fetch(ERROR_API + '?' + p.toString()).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function (data) { if (seq === state.seq) renderErrors(data.items || []); return data; }); }
-    function loadTop() { var p = sharedParams(); var interval = $('intervalSelect').value; if (interval) p.set('interval', interval); p.set('dimension', $('topDimension').value); p.set('orderBy', 'requests'); p.set('page', '1'); p.set('pageSize', '1'); p.set('topLimit', '8'); return fetch(API + '?' + p.toString()).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }); }
-    function loadAnalysis() { var seq = ++state.seq, previousRequest; $('queryBtn').disabled = true; var p = analysisParams(); previousRequest = compareEnabled() ? fetch(API + '?' + previousParams(p).toString()).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).catch(function () { return null; }) : Promise.resolve(null); return Promise.all([fetch(API + '?' + p.toString()).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }), loadErrors(seq), loadTop(), loadBackends(), previousRequest]).then(function (results) { if (seq !== state.seq) return; var data = results[0], errorData = results[1], topData = results[2], backendData = results[3]; var warnings = (data.warnings || []).concat(errorData.warnings || []).concat(topData.warnings || []).concat(backendData.warnings || []); state.last = data; state.previous = results[4]; renderSummary(data.summary || {}, state.previous); renderWarnings(warnings); renderMeta(data); renderLatency((data.summary || {}).latency || {}); renderDimensions(data.dimensions || {}); renderTop(topData.top || []); renderBackends((backendData.dimensions || {}).items || []); renderAnomaly(data.summary || {}, state.previous); updateTrendSubtitle(); renderChart(); setUpdated(true); }).catch(function () { if (seq === state.seq) { renderWarnings(['加载分析数据失败，请稍后重试']); setUpdated(false); } }).then(function () { if (seq === state.seq) $('queryBtn').disabled = false; }); }
+    function loadAnalysis() { var seq = ++state.seq, previousRequest; $('queryBtn').disabled = true; var p = analysisParams(); previousRequest = compareEnabled() ? fetch(API + '?' + previousParams(p).toString()).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).catch(function () { return null; }) : Promise.resolve(null); return Promise.all([fetch(API + '?' + p.toString()).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }), loadErrors(seq), loadMetrics(), previousRequest]).then(function (results) { if (seq !== state.seq) return; var data = results[0], errorData = results[1], metricData = results[2]; var warnings = (data.warnings || []).concat(errorData.warnings || []); state.last = data; state.previous = results[3]; renderSummary(data.summary || {}, state.previous); renderWarnings(warnings); renderMeta(data); renderLatency((data.summary || {}).latency || {}); renderDimensions(metricData.dimensions); renderTop(metricData.top); renderBackends(metricData.backends); renderAnomaly(data.summary || {}, state.previous); updateTrendSubtitle(); renderChart(); setUpdated(true); }).catch(function () { if (seq === state.seq) { renderWarnings(['加载分析数据失败，请稍后重试']); setUpdated(false); } }).then(function () { if (seq === state.seq) $('queryBtn').disabled = false; }); }
     var FILTER_IDS = ['modelInput', 'apikeyInput', 'ipInput', 'typeInput', 'backendInput', 'statusInput', 'clientInput'];
     function syncClear(id) { var input = $(id); var btn = document.querySelector('[data-clear="' + id + '"]'); if (input && btn) btn.hidden = input.value.length === 0; }
     function syncAllClears() { FILTER_IDS.forEach(syncClear); }
