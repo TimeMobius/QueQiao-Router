@@ -6,6 +6,7 @@ pub mod error_log_api;
 pub mod extractors;
 pub mod log_utils;
 pub mod message_utils;
+pub mod metrics_api;
 pub mod model_handler;
 pub mod records_api;
 pub mod request_body;

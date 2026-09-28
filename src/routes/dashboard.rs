@@ -3,14 +3,14 @@ use axum::{
     extract::Path,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-use crate::handlers::{analysis_api, error_log_api, records_api};
+use crate::handlers::{analysis_api, error_log_api, metrics_api, records_api};
 use crate::state::app_state::AppState;
 
 /// 内嵌的监控面板静态资源（web/ 目录，编译进二进制）
@@ -28,6 +28,7 @@ pub fn dashboard_router() -> Router<Arc<AppState>> {
         .route("/api/records/facets", get(records_api::record_facets))
         .route("/api/analysis", get(analysis_api::analysis))
         .route("/api/analysis/errors", get(analysis_api::analysis_errors))
+        .route("/api/metrics", post(metrics_api::metrics))
         .route("/api/error-log", get(error_log_api::error_log_tail))
         .route("/api/records/:id", get(records_api::record_detail))
         .route("/*path", get(assets_handler))
