@@ -18,6 +18,7 @@
 
 - `GET /dashboard/api/analysis`
 - `GET /dashboard/api/analysis/errors`
+- `POST /dashboard/api/metrics`
 - `GET /dashboard/analysis` — 返回内嵌的 `analysis.html`
 
 ---
@@ -88,6 +89,78 @@
   "top": [{"name":"x","value":0}]
 }
 ```
+
+## `POST /dashboard/api/metrics`
+
+通用轻量聚合接口。客户端在一次 POST 中提交多个独立查询；每个查询只执行请求的指标，
+相同分组与筛选的指标会合并到一条 SQL，避免轮询完整分析接口时重复扫描。
+
+请求体：
+
+```json
+{
+  "queries": [
+    {
+      "id": "week",
+      "period": "week",
+      "groupBy": "model",
+      "metrics": ["requests", "success", "errors"],
+      "orderBy": "requests",
+      "limit": 100
+    },
+    {
+      "id": "month",
+      "period": "month",
+      "groupBy": "model",
+      "metrics": ["requests"]
+    }
+  ]
+}
+```
+
+`period` 支持 `week`、`month`、`year`，按服务器本地时区解析为本周期开始至当前时刻。
+也可以使用 `from`/`to` 传 epoch 毫秒；两种方式不能同时使用。一次最多 8 个 query，
+每个 query 最多 16 个指标，`limit` 最大 10000，`id` 必须唯一。
+
+支持的 `groupBy`：`model`、`apikey`、`ip`、`type`、`backend`、`client`、`status`、`hour`。
+
+支持的基础指标：
+
+| 指标 | 含义 |
+| :--- | :--- |
+| `requests` | `Status >= 200` 的请求数 |
+| `success` | `200 <= Status < 400` 的请求数 |
+| `errors` | `Status >= 400` 的请求数 |
+| `promptTokens` / `completionTokens` / `totalTokens` | Token 汇总 |
+| `latencySum` / `latencyCount` / `maxLatency` | 延迟汇总、有效值数量、最大值 |
+| `ttftSum` / `ttftCount` | 首字延迟汇总、有效值数量 |
+| `avgLatency` / `avgTtft` | 服务端根据对应 sum/count 计算平均值 |
+
+`avgLatency` 必须同时请求 `latencySum` 和 `latencyCount`；`avgTtft` 必须同时请求
+`ttftSum` 和 `ttftCount`。`orderBy` 必须是请求的指标之一（平均值除外）。
+
+响应：
+
+```json
+{
+  "queries": {
+    "month": {
+      "from": 1788192000000,
+      "to": 1790567702000,
+      "groupBy": "model",
+      "shards": ["active"],
+      "items": [
+        {"model": "Qwen3.8-27B", "requests": 8393}
+      ]
+    }
+  }
+}
+```
+
+统计执行会按分片选择查询方式：当前月份 active 库和请求范围完整覆盖的不可变归档
+直接整库聚合，不添加 `TimeMs` 条件；部分月份、短时间范围和其他边界分片保留精确的
+`TimeMs >= from AND TimeMs <= to` 过滤。该接口不会执行趋势、延迟直方图、错误日志扫描
+或 DISTINCT 统计，除非未来将对应指标加入白名单，因此适合周期模型报表。
 
 - `summary`：`success` 为审计库 `200 <= Status < 400`。**`errors = dbErrors + logErrors`**：
   `dbErrors` 为审计库 `Status >= 400`（含 499/422/无模型名）；`logErrors` 为错误日志中
