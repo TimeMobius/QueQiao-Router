@@ -1,9 +1,11 @@
 use std::fs;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{filter, fmt, EnvFilter, Layer};
+
+mod rolling_local;
+use rolling_local::LocalRollingFileAppender;
 
 /// 日志系统配置
 pub struct LogConfig {
@@ -34,39 +36,39 @@ pub fn init_logging(config: LogConfig) -> Vec<WorkerGuard> {
     let mut guards = Vec::new();
 
     // 创建通用日志的非阻塞写入器（INFO, WARNING等）
-    // 使用每日轮转
-    let general_file_appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .filename_prefix("info") // 改为 info
-        .filename_suffix("log")
-        .max_log_files(config.general_log_retention_days)
-        .build(&config.log_dir)
-        .expect("Failed to create general log appender");
+    // 使用每日轮转（按进程本地时区日期命名）
+    let general_file_appender = LocalRollingFileAppender::new(
+        &config.log_dir,
+        "info",
+        "log",
+        config.general_log_retention_days,
+    )
+    .expect("Failed to create general log appender");
 
     let (general_non_blocking, general_guard) =
         tracing_appender::non_blocking(general_file_appender);
     guards.push(general_guard);
 
-    // 创建错误日志的非阻塞写入器（每日轮转）
-    let error_file_appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY) // 每日轮转
-        .filename_prefix("error")
-        .filename_suffix("log")
-        .max_log_files(config.error_log_retention_days)
-        .build(&config.log_dir)
-        .expect("Failed to create error log appender");
+    // 创建错误日志的非阻塞写入器（每日轮转，按本地时区日期命名）
+    let error_file_appender = LocalRollingFileAppender::new(
+        &config.log_dir,
+        "error",
+        "log",
+        config.error_log_retention_days,
+    )
+    .expect("Failed to create error log appender");
 
     let (error_non_blocking, error_guard) = tracing_appender::non_blocking(error_file_appender);
     guards.push(error_guard);
 
-    // 创建 system 日志的非阻塞写入器
-    let system_file_appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .filename_prefix("system")
-        .filename_suffix("log")
-        .max_log_files(config.general_log_retention_days)
-        .build(&config.log_dir)
-        .expect("Failed to create system log appender");
+    // 创建 system 日志的非阻塞写入器（每日轮转，按本地时区日期命名）
+    let system_file_appender = LocalRollingFileAppender::new(
+        &config.log_dir,
+        "system",
+        "log",
+        config.general_log_retention_days,
+    )
+    .expect("Failed to create system log appender");
 
     let (system_non_blocking, system_guard) = tracing_appender::non_blocking(system_file_appender);
     guards.push(system_guard);
