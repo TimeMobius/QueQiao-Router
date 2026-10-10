@@ -122,6 +122,7 @@ docker run -d \
 | `RECD_PATH` | `sqlite:./record.db` | SQLite 数据库连接字符串；Docker 镜像默认为 `sqlite:./logs/record.db` |
 | `DB_ROTATION_CHECK_INTERVAL_SEC` | `60` | 数据库轮转检查间隔（秒） |
 | `RUST_LOG` | `info` | 日志级别 (`error`, `warn`, `info`, `debug`, `trace`) |
+| `TZ` | 镜像默认（通常为 UTC） | 日志文件名轮转与所有日志时间戳均跟随该时区；部署时应设为宿主机时区（如 `TZ=Asia/Shanghai`），或挂载 `-v /etc/localtime:/etc/localtime:ro` 自动跟随宿主机 |
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
 | `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时禁用遗留归档的一次性就地迁移，遗留归档被跳过 |
 

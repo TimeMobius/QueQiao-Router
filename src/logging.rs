@@ -7,6 +7,23 @@ use tracing_subscriber::{filter, fmt, EnvFilter, Layer};
 mod rolling_local;
 use rolling_local::LocalRollingFileAppender;
 
+/// 本地时区时间格式化器，用于 system / console 层。
+///
+/// 以 `%Y-%m-%d %H:%M:%S%.6f%:z` 渲染进程本地时间（含固定偏移，如 `+08:00`），
+/// 替代 tracing-subscriber 默认的 UTC RFC3339（`Z`）格式。
+/// 生产环境通过 `TZ` 环境变量提供宿主机时区。
+struct LocalFormatTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalFormatTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.6f%:z")
+        )
+    }
+}
+
 /// 日志系统配置
 pub struct LogConfig {
     pub log_dir: String,
@@ -119,11 +136,13 @@ pub fn init_logging(config: LogConfig) -> Vec<WorkerGuard> {
     let system_layer = fmt::layer()
         .with_writer(system_non_blocking)
         .with_ansi(false)
+        .with_timer(LocalFormatTime)
         .with_filter(system_env_filter);
 
     // 4. Console Layer: 全部显示 (保持默认行为，方便调试)
     let console_layer = fmt::layer()
         .with_writer(console_non_blocking)
+        .with_timer(LocalFormatTime)
         .with_filter(EnvFilter::from_default_env());
 
     // 构建订阅者

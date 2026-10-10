@@ -410,4 +410,29 @@ mod tests {
 
         cleanup(&dir);
     }
+
+    #[test]
+    fn local_format_time_renders_local_date_and_offset() {
+        use tracing_subscriber::fmt::time::FormatTime;
+
+        let mut output = String::new();
+        {
+            let mut writer = tracing_subscriber::fmt::format::Writer::new(&mut output);
+            super::super::LocalFormatTime
+                .format_time(&mut writer)
+                .expect("format_time");
+        }
+
+        let now = chrono::Local::now();
+        let expected_date = now.format("%Y-%m-%d").to_string();
+        let expected_offset = now.format("%:z").to_string();
+        assert!(
+            output.starts_with(&expected_date),
+            "timestamp must start with local date, got {output}"
+        );
+        assert!(
+            output.ends_with(&expected_offset),
+            "timestamp must end with local offset {expected_offset}, got {output}"
+        );
+    }
 }
