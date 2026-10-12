@@ -24,17 +24,47 @@ pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
     init_db_pool_with_url(&database_url).await
 }
 
+/// 运行期写池（审计落库）的统一配置，三个构建点（首次初始化、遗留迁移失败后新建、
+/// 迁移成功后重开）必须保持一致，由 `rotate_if_needed` 触发的轮转重建也走同一入口。
+///
+/// - `max_connections(1)`：SQLite 同一时刻只允许一个写者，DELETE 日志模式下多个写事务
+///   互相排队等文件锁只会放大 SQLITE_BUSY 与池耗尽（`pool timed out`）。写池因此收敛为
+///   单连接，把所有审计写入在进程内串行化（FIFO 排队），消除写-写锁竞争。
+/// - `busy_timeout` 由 sqlx 默认 5s 提升到 30s：写事务提交需要 EXCLUSIVE 锁，会被查询池
+///   持有 SHARED 锁的慢读（COUNT/FTS/facets 等）阻塞；宁可等它读完，也不要立刻报
+///   `database is locked` 丢掉审计记录。
+/// - `acquire_timeout` 由默认 30s 提升到 60s：单连接串行化后，突发流量下的落库任务在
+///   池层面排队，单个任务持有连接的时间 ≈ 一次写入 + 至多一次 30s 锁等待，超时必须
+///   放宽到足以排空典型突发，否则尾部任务仍会 `pool timed out`。
+const WRITE_POOL_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn write_pool_options() -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(WRITE_POOL_ACQUIRE_TIMEOUT)
+}
+
+fn write_pool_connect_options(
+    db_path: &str,
+    create_if_missing: bool,
+) -> Result<SqliteConnectOptions, sqlx::Error> {
+    Ok(SqliteConnectOptions::from_str(db_path)?
+        .create_if_missing(create_if_missing)
+        .busy_timeout(WRITE_POOL_BUSY_TIMEOUT))
+}
+
 async fn init_db_pool_with_url(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let db_path = database_url
         .strip_prefix("sqlite:")
         .unwrap_or(&database_url);
 
-    let options = SqliteConnectOptions::from_str(db_path)?.create_if_missing(true);
-
     // 连接前判断文件是否已存在：全新库（本次刚创建）必须走普通初始化，
     // 只有"已存在且仍是 V0 结构"的老库才需要阻塞式 legacy 数据迁移。
     let db_exists = std::path::Path::new(db_path).exists();
-    let mut pool = SqlitePool::connect_with(options).await?;
+    let mut pool = write_pool_options()
+        .connect_with(write_pool_connect_options(db_path, true)?)
+        .await?;
 
     // 兼容测试套件的 12 列基表；已有库不会重复创建。
     ensure_base_records_table(&pool).await?;
@@ -57,14 +87,15 @@ async fn init_db_pool_with_url(database_url: &str) -> Result<SqlitePool, sqlx::E
                 "Active database legacy migration failed for '{}': {}; quarantining and creating a fresh active database",
                 db_path, error
             );
-            let fresh_options = SqliteConnectOptions::from_str(db_path)?.create_if_missing(true);
-            pool = SqlitePool::connect_with(fresh_options).await?;
+            pool = write_pool_options()
+                .connect_with(write_pool_connect_options(db_path, true)?)
+                .await?;
             ensure_base_records_table(&pool).await?;
         } else {
             info!("Active database legacy migration completed.");
-            let reopened_options =
-                SqliteConnectOptions::from_str(db_path)?.create_if_missing(false);
-            pool = SqlitePool::connect_with(reopened_options).await?;
+            pool = write_pool_options()
+                .connect_with(write_pool_connect_options(db_path, false)?)
+                .await?;
         }
     }
 
@@ -188,6 +219,28 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>();
         assert!(!is_legacy_schema(&modern));
+    }
+
+    // 钉住写池单连接串行化：第二个 acquire 必须等第一个释放，
+    // 防止未来把 max_connections 改回多连接后重新引入写-写锁竞争。
+    #[tokio::test]
+    async fn write_pool_serializes_to_single_connection() {
+        let dir = temp_dir("write_pool_single_conn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.db");
+        let url = format!("sqlite:{}", path.display());
+        let pool = init_db_pool_with_url(&url).await.unwrap();
+
+        let first = pool.acquire().await.unwrap();
+        let second = pool.acquire();
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), second).await;
+        assert!(
+            waited.is_err(),
+            "second acquire must wait for the single write connection"
+        );
+        drop(first);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
