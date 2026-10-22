@@ -15,7 +15,9 @@ QueQiao-Router 是 Rust 实现的高性能大模型智能路由网关。
 
 ## 开发指令与约束
 
-> **铁律**: 严禁修改 QueQiao-Router-Tests 测试套件的任何代码。测试套件是项目质量的守护者，其代码不可更改。
+> **铁律**: 严禁修改 QueQiao-Router-Tests 测试套件的任何代码，其代码不可更改。
+>
+> **测试定位**: 本项目以 Rust 内部单元测试（`cargo test`）为**必需的**质量门禁。QueQiao-Router-Tests 是**可选的黑盒端到端验收工具**，仅在需要验证真实 HTTP/SSE 线格式、路由装配、故障转移、热重载等跨进程行为时手动运行，**不属于**日常开发或提交的硬性流程。
 
 1. **自主性**: 遇到问题时，优先通过在线搜索等方式独立解决，避免中断等待用户指令
 2. **范围限制**: 所有代码修改严格限制在当前指令目标的项目内
@@ -48,11 +50,18 @@ cd /mnt/data/Codes/GPT_API_gemini/QueQiao-Router && cargo build
 
 ---
 
-## 测试套件
+## 外部测试套件（可选工具）
 
 测试套件目录: `/mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests`
 
-### 环境设置
+> **性质**: 该套件为可选的端到端黑盒验收工具，不是必须执行的流程。日常开发与提交只需通过 `cargo fmt`、编译和 `cargo test`。仅在以下场景按需手动运行：
+> - 验证真实 HTTP / SSE 线格式（流式分帧、`[DONE]`、事件顺序）
+> - 验证路由与配置装配、故障转移、负载均衡、热重载等跨进程行为
+> - 发布前或重大改动后进行整体回归
+>
+> 若该套件与本项目当前行为不一致，**不要为其修改产品代码**；应先确认产品行为是否确实有误，再按需更新测试（该目录代码受上方铁律保护）。
+
+### 环境设置（仅首次或可选运行时需要）
 ```bash
 # 安装依赖
 apt-get update && apt-get install -y python3-pip python3.11-venv
@@ -64,7 +73,7 @@ python3 -m venv /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/.venv
 /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/.venv/bin/python3 -m pip install -r /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/requirements.txt
 ```
 
-### 测试运行
+### 测试运行（按需手动执行）
 **重要**: 运行测试套件前，必须先清理可能遗留的 `queqiao_router` 进程，避免端口冲突导致测试失败。
 
 ```bash
