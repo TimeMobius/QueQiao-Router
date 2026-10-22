@@ -3,10 +3,12 @@
 
 use axum::http::StatusCode;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use sqlx::{Row, Sqlite, SqlitePool};
+use serde_json::{json, Value as JsonValue};
+use std::sync::Arc;
 
 use crate::db::archive::ACTIVE_SHARD;
+use crate::db::engine::{DbError, Row, Value};
+use crate::db::store::AuditStore;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
@@ -66,23 +68,23 @@ pub(crate) fn format_cursor(time_ms: i64, id: i64, shard: Option<&str>) -> Strin
     }
 }
 
-pub(crate) fn text(row: &sqlx::sqlite::SqliteRow, name: &str) -> Option<String> {
-    row.try_get::<Option<String>, _>(name).ok().flatten()
+pub(crate) fn text(row: &Row, name: &str) -> Option<String> {
+    row.get_opt_string_by_name(name).ok().flatten()
 }
 
-pub(crate) fn int(row: &sqlx::sqlite::SqliteRow, name: &str) -> Option<i64> {
-    row.try_get::<Option<i64>, _>(name).ok().flatten()
+pub(crate) fn int(row: &Row, name: &str) -> Option<i64> {
+    row.get_opt_i64_by_name(name).ok().flatten()
 }
 
-fn real(row: &sqlx::sqlite::SqliteRow, name: &str) -> Option<f64> {
-    row.try_get::<Option<f64>, _>(name).ok().flatten()
+fn real(row: &Row, name: &str) -> Option<f64> {
+    row.get_opt_f64_by_name(name).ok().flatten()
 }
 
-fn flag(row: &sqlx::sqlite::SqliteRow, name: &str) -> bool {
+fn flag(row: &Row, name: &str) -> bool {
     int(row, name).unwrap_or(0) != 0
 }
 
-fn preview(row: &sqlx::sqlite::SqliteRow) -> Option<String> {
+fn preview(row: &Row) -> Option<String> {
     let raw = text(row, "PromptPreview")?;
     let mut chars = raw.chars();
     let head: String = chars.by_ref().take(200).collect();
@@ -93,7 +95,7 @@ fn preview(row: &sqlx::sqlite::SqliteRow) -> Option<String> {
     }
 }
 
-fn tokens(row: &sqlx::sqlite::SqliteRow) -> (i64, i64, i64) {
+fn tokens(row: &Row) -> (i64, i64, i64) {
     let prompt = int(row, "PromptTokens").unwrap_or(0);
     let completion = int(row, "CompletionTokens").unwrap_or(0);
     let mut total = int(row, "TotalTokens").unwrap_or(0);
@@ -103,7 +105,7 @@ fn tokens(row: &sqlx::sqlite::SqliteRow) -> (i64, i64, i64) {
     (prompt, completion, total)
 }
 
-pub(crate) fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> Value {
+pub(crate) fn row_to_item(row: &Row) -> JsonValue {
     let (prompt_tokens, completion_tokens, total_tokens) = tokens(row);
     json!({
         "id": int(row, "id").unwrap_or(0),
@@ -162,12 +164,6 @@ const DETAIL_COLS: &str = "id, Time, TimeMs, Type, Model, Status, Backend, IP, M
 
 const COUNT_CAP: i64 = 10_000;
 
-#[derive(Debug, Clone)]
-pub(crate) enum Bind {
-    Int(i64),
-    Text(String),
-}
-
 fn like_contains(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('%');
@@ -181,17 +177,20 @@ fn like_contains(value: &str) -> String {
     out
 }
 
-fn fts_phrase(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        if ch == '"' {
-            out.push('"');
-        }
-        out.push(ch);
+/// Build a Tantivy query with FTS5-compatible AND semantics.
+///
+/// FTS5 joins bare terms with AND; Tantivy's default is OR, so every term is
+/// quoted and explicitly joined with AND.
+fn fts_query(value: &str) -> String {
+    let terms: Vec<String> = value
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        return "\"\"".to_string();
     }
-    out.push('"');
-    out
+    terms.join(" AND ")
 }
 
 /// Upper bound for a prefix scan: appending the largest code point sorts after every
@@ -204,54 +203,54 @@ fn prefix_upper(value: &str) -> String {
     out
 }
 
-fn push_opt_text(sql: &mut String, binds: &mut Vec<Bind>, column: &str, value: Option<&String>) {
+fn push_opt_text(sql: &mut String, binds: &mut Vec<Value>, column: &str, value: Option<&String>) {
     if let Some(v) = value {
         if !v.is_empty() {
             sql.push_str(&format!(" AND {column} LIKE ? ESCAPE '\\'"));
-            binds.push(Bind::Text(like_contains(v)));
+            binds.push(Value::Text(like_contains(v)));
         }
     }
 }
 
-pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
+pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Value>) {
     let mut sql = String::from(" WHERE 1=1");
-    let mut binds: Vec<Bind> = Vec::new();
+    let mut binds: Vec<Value> = Vec::new();
 
     if let Some(v) = p.from {
         sql.push_str(" AND TimeMs >= ?");
-        binds.push(Bind::Int(v));
+        binds.push(Value::Integer(v));
     }
     if let Some(v) = p.to {
         sql.push_str(" AND TimeMs <= ?");
-        binds.push(Bind::Int(v));
+        binds.push(Value::Integer(v));
     }
     if let Some(v) = p.type_.as_ref().filter(|v| !v.is_empty()) {
         sql.push_str(" AND Type = ?");
-        binds.push(Bind::Text(v.clone()));
+        binds.push(Value::Text(v.clone()));
     }
     if let Some(v) = p.model.as_ref().filter(|v| !v.is_empty()) {
         sql.push_str(" AND Model COLLATE NOCASE >= ? AND Model COLLATE NOCASE < ?");
-        binds.push(Bind::Text(v.clone()));
-        binds.push(Bind::Text(prefix_upper(v)));
+        binds.push(Value::Text(v.clone()));
+        binds.push(Value::Text(prefix_upper(v)));
     }
     if let Some(v) = p.status {
         sql.push_str(" AND Status = ?");
-        binds.push(Bind::Int(v));
+        binds.push(Value::Integer(v));
     }
     if let Some(v) = p.backend.as_ref().filter(|v| !v.is_empty()) {
         sql.push_str(" AND Backend = ?");
-        binds.push(Bind::Text(v.clone()));
+        binds.push(Value::Text(v.clone()));
     }
     if let Some(v) = p.ip.as_ref().filter(|v| !v.is_empty()) {
         sql.push_str(" AND IP COLLATE NOCASE >= ? AND IP COLLATE NOCASE < ?");
-        binds.push(Bind::Text(v.clone()));
-        binds.push(Bind::Text(prefix_upper(v)));
+        binds.push(Value::Text(v.clone()));
+        binds.push(Value::Text(prefix_upper(v)));
     }
     if let Some(v) = p.client.as_ref().filter(|v| !v.is_empty()) {
         let pat = like_contains(v);
         sql.push_str(" AND (ClientName LIKE ? ESCAPE '\\' OR UserAgent LIKE ? ESCAPE '\\')");
-        binds.push(Bind::Text(pat.clone()));
-        binds.push(Bind::Text(pat));
+        binds.push(Value::Text(pat.clone()));
+        binds.push(Value::Text(pat));
     }
     push_opt_text(&mut sql, &mut binds, "SessionId", p.session_id.as_ref());
     push_opt_text(
@@ -263,7 +262,7 @@ pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
     push_opt_text(&mut sql, &mut binds, "RequestId", p.request_id.as_ref());
     if let Some(v) = p.apikey.as_ref().filter(|v| !v.is_empty()) {
         sql.push_str(" AND ApiKey = ?");
-        binds.push(Bind::Text(v.clone()));
+        binds.push(Value::Text(v.clone()));
     }
 
     let error_mode = p
@@ -278,50 +277,39 @@ pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Bind>) {
     if let Some(v) = p.q.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
         let char_count = v.chars().count();
         if char_count >= 3 {
-            sql.push_str(" AND id IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)");
-            binds.push(Bind::Text(fts_phrase(v)));
+            sql.push_str(
+                " AND fts_match(Prompt, RequestTail, Answer, Model, Status, Type, Backend, ?)",
+            );
+            binds.push(Value::Text(fts_query(v)));
         } else {
             let pat = like_contains(v);
             sql.push_str(
                 " AND (Prompt LIKE ? ESCAPE '\\' OR RequestTail LIKE ? ESCAPE '\\' OR Answer LIKE ? ESCAPE '\\')",
             );
-            binds.push(Bind::Text(pat.clone()));
-            binds.push(Bind::Text(pat.clone()));
-            binds.push(Bind::Text(pat));
+            binds.push(Value::Text(pat.clone()));
+            binds.push(Value::Text(pat.clone()));
+            binds.push(Value::Text(pat));
         }
     }
 
     (sql, binds)
 }
 
-fn with_cursor(sql: &mut String, binds: &mut Vec<Bind>, cursor: Option<&String>) -> bool {
+fn with_cursor(sql: &mut String, binds: &mut Vec<Value>, cursor: Option<&String>) -> bool {
     let Some(c) = cursor.and_then(|c| parse_cursor(c)) else {
         return false;
     };
     sql.push_str(" AND (TimeMs, id) < (?, ?)");
-    binds.push(Bind::Int(c.time_ms));
-    binds.push(Bind::Int(c.id));
+    binds.push(Value::Integer(c.time_ms));
+    binds.push(Value::Integer(c.id));
     true
-}
-
-pub(crate) fn bind_all<'q>(
-    mut query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    binds: &'q [Bind],
-) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
-    for b in binds {
-        query = match b {
-            Bind::Int(v) => query.bind(*v),
-            Bind::Text(v) => query.bind(v.as_str()),
-        };
-    }
-    query
 }
 
 /// 一次多分片查询的输入分片（只读归档或 active）。
 #[derive(Clone)]
 pub(crate) struct ShardInput {
     pub(crate) id: String,
-    pub(crate) pool: SqlitePool,
+    pub(crate) store: Arc<AuditStore>,
 }
 
 /// 跨分片数据查询：在单个分片上按时间倒序取 `limit + 1` 行，供全局归并。
@@ -330,42 +318,40 @@ pub(crate) struct ShardInput {
 /// `(TimeMs, id) < 游标 OR ((TimeMs, id) = 游标 AND shard < 游标分片)`
 /// 精确排除已返回的游标行，避免每个分片白占一个 `LIMIT` 名额导致的分页漏行。
 async fn query_shard(
-    pool: &SqlitePool,
+    store: &AuditStore,
     where_sql: &str,
-    binds: &[Bind],
+    binds: &[Value],
     cursor: Option<&CursorKey>,
     limit: i64,
     shard_id: &str,
-) -> Result<Vec<(i64, i64, String, Value)>, sqlx::Error> {
+) -> Result<Vec<(i64, i64, String, JsonValue)>, DbError> {
     let mut data_where = where_sql.to_string();
-    let mut data_binds: Vec<Bind> = binds.to_vec();
+    let mut data_binds: Vec<Value> = binds.to_vec();
     if let Some(c) = cursor {
         match c.shard.as_deref() {
             Some(cursor_shard) => {
                 let shard_less = i64::from(shard_id < cursor_shard);
                 data_where
                     .push_str(" AND ((TimeMs, id) < (?, ?) OR ((TimeMs, id) = (?, ?) AND ? = 1))");
-                data_binds.push(Bind::Int(c.time_ms));
-                data_binds.push(Bind::Int(c.id));
-                data_binds.push(Bind::Int(c.time_ms));
-                data_binds.push(Bind::Int(c.id));
-                data_binds.push(Bind::Int(shard_less));
+                data_binds.push(Value::Integer(c.time_ms));
+                data_binds.push(Value::Integer(c.id));
+                data_binds.push(Value::Integer(c.time_ms));
+                data_binds.push(Value::Integer(c.id));
+                data_binds.push(Value::Integer(shard_less));
             }
             None => {
                 data_where.push_str(" AND (TimeMs, id) < (?, ?)");
-                data_binds.push(Bind::Int(c.time_ms));
-                data_binds.push(Bind::Int(c.id));
+                data_binds.push(Value::Integer(c.time_ms));
+                data_binds.push(Value::Integer(c.id));
             }
         }
     }
-    data_binds.push(Bind::Int(limit + 1));
+    data_binds.push(Value::Integer(limit + 1));
 
     let data_sql = format!(
         "SELECT {LIST_COLS} FROM records{data_where} ORDER BY TimeMs DESC, id DESC LIMIT ?"
     );
-    let rows = bind_all(sqlx::query(&data_sql), &data_binds)
-        .fetch_all(pool)
-        .await?;
+    let rows = store.query(&data_sql, data_binds).await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -380,10 +366,10 @@ async fn query_shard(
 /// 跨分片列表查询：并发查询 active 与命中候选归档，按全局
 /// `(TimeMs DESC, id DESC, shard DESC)` 归并、分页，并汇总带上限的总数。
 pub(crate) async fn query_records_multi(
-    active: &SqlitePool,
+    active: &Arc<AuditStore>,
     archives: &[ShardInput],
     params: &ListParams,
-) -> Result<(Vec<Value>, Option<String>, i64, bool), sqlx::Error> {
+) -> Result<(Vec<JsonValue>, Option<String>, i64, bool), DbError> {
     let (where_sql, base_binds) = build_filters(params);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let cursor = params.cursor.as_deref().and_then(parse_cursor);
@@ -391,7 +377,7 @@ pub(crate) async fn query_records_multi(
     let mut all_shards: Vec<ShardInput> = Vec::with_capacity(archives.len() + 1);
     all_shards.push(ShardInput {
         id: ACTIVE_SHARD.to_string(),
-        pool: active.clone(),
+        store: active.clone(),
     });
     all_shards.extend(archives.iter().cloned());
 
@@ -399,18 +385,16 @@ pub(crate) async fn query_records_multi(
     let mut total_sum: i64 = 0;
     for shard in &all_shards {
         let mut count_binds = base_binds.clone();
-        count_binds.push(Bind::Int(COUNT_CAP));
-        let row = bind_all(sqlx::query(&count_sql), &count_binds)
-            .fetch_one(&shard.pool)
-            .await?;
-        total_sum = total_sum.saturating_add(row.try_get(0).unwrap_or(0));
+        count_binds.push(Value::Integer(COUNT_CAP));
+        let row = shard.store.query_one(&count_sql, count_binds).await?;
+        total_sum = total_sum.saturating_add(row.map(|r| r.get_i64(0).unwrap_or(0)).unwrap_or(0));
     }
     let total = total_sum.min(COUNT_CAP);
     let total_exact = total_sum < COUNT_CAP;
 
     let shard_futures = all_shards.iter().map(|shard| {
         query_shard(
-            &shard.pool,
+            &shard.store,
             &where_sql,
             &base_binds,
             cursor.as_ref(),
@@ -420,7 +404,7 @@ pub(crate) async fn query_records_multi(
     });
     let results = futures::future::join_all(shard_futures).await;
 
-    let mut rows: Vec<(i64, i64, String, Value)> = Vec::new();
+    let mut rows: Vec<(i64, i64, String, JsonValue)> = Vec::new();
     for result in results {
         rows.extend(result?);
     }
@@ -450,7 +434,7 @@ pub(crate) async fn query_records_multi(
         None
     };
 
-    let items: Vec<Value> = rows
+    let items: Vec<JsonValue> = rows
         .into_iter()
         .map(|(_, _, shard, mut value)| {
             if let Some(object) = value.as_object_mut() {
@@ -465,34 +449,30 @@ pub(crate) async fn query_records_multi(
 
 /// 单库列表查询：只查 active 连接池，行为与历史单库路径完全一致。
 pub(crate) async fn query_records_active(
-    pool: &SqlitePool,
+    store: &AuditStore,
     params: &ListParams,
-) -> Result<(Vec<Value>, Option<String>, i64, bool), sqlx::Error> {
+) -> Result<(Vec<JsonValue>, Option<String>, i64, bool), DbError> {
     let (where_sql, base_binds) = build_filters(params);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
 
     let mut count_binds = base_binds.clone();
-    count_binds.push(Bind::Int(COUNT_CAP));
+    count_binds.push(Value::Integer(COUNT_CAP));
     let count_sql = format!("SELECT COUNT(*) FROM (SELECT 1 FROM records{where_sql} LIMIT ?)");
-    let count_row = bind_all(sqlx::query(&count_sql), &count_binds)
-        .fetch_one(pool)
-        .await?;
-    let total: i64 = count_row.try_get(0).unwrap_or(0);
+    let count_row = store.query_one(&count_sql, count_binds).await?;
+    let total: i64 = count_row.map(|r| r.get_i64(0).unwrap_or(0)).unwrap_or(0);
     let total_exact = total < COUNT_CAP;
 
     let mut data_binds = base_binds;
     let mut data_where = where_sql;
     with_cursor(&mut data_where, &mut data_binds, params.cursor.as_ref());
-    data_binds.push(Bind::Int(limit + 1));
+    data_binds.push(Value::Integer(limit + 1));
     let data_sql = format!(
         "SELECT {LIST_COLS} FROM records{data_where} ORDER BY TimeMs DESC, id DESC LIMIT ?"
     );
 
-    let rows = bind_all(sqlx::query(&data_sql), &data_binds)
-        .fetch_all(pool)
-        .await?;
+    let rows = store.query(&data_sql, data_binds).await?;
 
-    let mut items: Vec<Value> = rows.iter().map(row_to_item).collect();
+    let mut items: Vec<JsonValue> = rows.iter().map(row_to_item).collect();
     let has_more = items.len() as i64 > limit;
     if has_more {
         items.pop();
@@ -512,13 +492,12 @@ pub(crate) async fn query_records_active(
 
 /// 在指定连接池上按 id 取详情行。
 pub(crate) async fn fetch_detail_row(
-    pool: &SqlitePool,
+    store: &AuditStore,
     id: i64,
-) -> Result<Option<sqlx::sqlite::SqliteRow>, (StatusCode, String)> {
+) -> Result<Option<Row>, (StatusCode, String)> {
     let sql = format!("SELECT {DETAIL_COLS} FROM records WHERE id = ?");
-    sqlx::query(&sql)
-        .bind(id)
-        .fetch_optional(pool)
+    store
+        .query_one(&sql, vec![Value::Integer(id)])
         .await
         .map_err(|e| {
             tracing::error!("record detail query failed: {e}");
@@ -530,34 +509,42 @@ pub(crate) async fn fetch_detail_row(
 }
 
 /// 在指定连接池上判断记录是否含压缩正文。
-pub(crate) async fn has_payload(pool: &SqlitePool, id: i64) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payloads WHERE record_id = ?")
-        .bind(id)
-        .fetch_one(pool)
+pub(crate) async fn has_payload(store: &AuditStore, id: i64) -> bool {
+    store
+        .query_one(
+            "SELECT COUNT(*) FROM payloads WHERE record_id = ?",
+            vec![Value::Integer(id)],
+        )
         .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.get_i64(0).ok())
         .unwrap_or(0)
         > 0
 }
 
 /// 单列 DISTINCT 取值（白名单列），供分面查询复用。
-async fn distinct_text(pool: &SqlitePool, column: &str) -> Vec<String> {
+async fn distinct_text(store: &AuditStore, column: &str) -> Vec<String> {
     let sql = format!(
         "SELECT DISTINCT {column} FROM records WHERE {column} IS NOT NULL AND {column} != '' ORDER BY {column} LIMIT 200"
     );
-    sqlx::query_scalar::<_, String>(&sql)
-        .fetch_all(pool)
+    store
+        .query(&sql, Vec::new())
         .await
         .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.get_opt_string(0).ok().flatten())
+        .collect()
 }
 
 /// 分面取值：models/types/backends/clients 四个 DISTINCT 列表。
 pub(crate) async fn query_facets(
-    pool: &SqlitePool,
+    store: &AuditStore,
 ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let models = distinct_text(pool, "Model").await;
-    let types = distinct_text(pool, "Type").await;
-    let backends = distinct_text(pool, "Backend").await;
-    let clients = distinct_text(pool, "ClientName").await;
+    let models = distinct_text(store, "Model").await;
+    let types = distinct_text(store, "Type").await;
+    let backends = distinct_text(store, "Backend").await;
+    let clients = distinct_text(store, "ClientName").await;
 
     (models, types, backends, clients)
 }
@@ -565,7 +552,6 @@ pub(crate) async fn query_facets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     #[test]
     fn cursor_roundtrip_two_and_three_fields() {
@@ -625,38 +611,24 @@ mod tests {
         ))
     }
 
-    async fn make_records_db(path: &std::path::Path) -> SqlitePool {
-        let url = format!("sqlite:{}", path.display());
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+    async fn make_records_db(path: &std::path::Path) -> Arc<AuditStore> {
+        AuditStore::open(path, false, std::time::Duration::from_secs(5))
+            .await
             .unwrap()
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await.unwrap();
-        sqlx::query(
-            "CREATE TABLE records (\
-                id INTEGER PRIMARY KEY, Time TEXT, TimeMs INTEGER, Type TEXT, Model TEXT, \
-                Status INTEGER, Backend TEXT, IP TEXT, Method TEXT, Endpoint TEXT, \
-                SessionId TEXT, ParentSessionId TEXT, RequestId TEXT, ClientName TEXT, \
-                ClientVersion TEXT, UserAgent TEXT, LatencyMs REAL, TtftMs REAL, \
-                UpstreamMs REAL, StreamMs REAL, PromptTokens INTEGER, CompletionTokens INTEGER, \
-                TotalTokens INTEGER, MessageCount INTEGER, SystemCount INTEGER, ToolCount INTEGER, \
-                AssistantCount INTEGER, ToolResultCount INTEGER, ImageCount INTEGER, Tool BOOLEAN, \
-                Multimodal BOOLEAN, RequestBytes INTEGER, ResponseBytes INTEGER, FinishReason TEXT, \
-                Error TEXT, RetryCount INTEGER, Prompt TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool
     }
 
-    async fn insert_record(pool: &SqlitePool, id: i64, time_ms: i64) {
-        sqlx::query("INSERT INTO records (id, Time, TimeMs, Model, Prompt) VALUES (?, ?, ?, ?, ?)")
-            .bind(id)
-            .bind("2026-08-01 00:00:00.000000")
-            .bind(time_ms)
-            .bind("test-model")
-            .bind("hello")
-            .execute(pool)
+    async fn insert_record(store: &AuditStore, id: i64, time_ms: i64) {
+        store
+            .execute(
+                "INSERT INTO records (id, Time, TimeMs, Model, Prompt) VALUES (?, ?, ?, ?, ?)",
+                vec![
+                    Value::Integer(id),
+                    Value::Text("2026-08-01 00:00:00.000000".to_string()),
+                    Value::Integer(time_ms),
+                    Value::Text("test-model".to_string()),
+                    Value::Text("hello".to_string()),
+                ],
+            )
             .await
             .unwrap();
     }
@@ -666,22 +638,20 @@ mod tests {
         let active_path = temp_db_path("active");
         let archive_path = temp_db_path("archive");
         let active = make_records_db(&active_path).await;
-        let archive_pool = make_records_db(&archive_path).await;
+        let archive_store = make_records_db(&archive_path).await;
 
-        // active 分片
         insert_record(&active, 5, 100).await;
         insert_record(&active, 3, 100).await;
         insert_record(&active, 9, 90).await;
         insert_record(&active, 1, 80).await;
-        // 归档分片：与 active 存在 (TimeMs,id) 重叠，覆盖全序与并列场景
-        insert_record(&archive_pool, 5, 100).await;
-        insert_record(&archive_pool, 7, 95).await;
-        insert_record(&archive_pool, 9, 90).await;
-        insert_record(&archive_pool, 2, 70).await;
+        insert_record(&archive_store, 5, 100).await;
+        insert_record(&archive_store, 7, 95).await;
+        insert_record(&archive_store, 9, 90).await;
+        insert_record(&archive_store, 2, 70).await;
 
         let archives = vec![ShardInput {
             id: "record_202608".to_string(),
-            pool: archive_pool.clone(),
+            store: archive_store.clone(),
         }];
 
         let params = ListParams {
@@ -696,7 +666,7 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert!(next.is_some());
 
-        let collect = |items: &[Value]| -> Vec<(i64, i64, String)> {
+        let collect = |items: &[JsonValue]| -> Vec<(i64, i64, String)> {
             items
                 .iter()
                 .map(|v| {
@@ -738,8 +708,15 @@ mod tests {
         assert_eq!(collected, expected);
 
         drop(active);
-        drop(archive_pool);
+        drop(archive_store);
         let _ = std::fs::remove_file(&active_path);
         let _ = std::fs::remove_file(&archive_path);
+    }
+
+    #[test]
+    fn fts_query_joins_terms_with_and() {
+        assert_eq!(fts_query("foo bar"), "\"foo\" AND \"bar\"");
+        assert_eq!(fts_query("a \"b\""), "\"a\" AND \"\"\"b\"\"\"");
+        assert_eq!(fts_query("   "), "\"\"");
     }
 }

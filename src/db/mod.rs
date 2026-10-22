@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use crate::config::types::Config;
 
 pub mod archive;
+pub mod engine;
 pub mod extract;
 pub mod legacy;
 pub mod payload;
@@ -14,6 +15,8 @@ pub mod records;
 pub mod records_query;
 pub mod rotation;
 pub mod schema;
+pub mod store;
+pub mod turso_schema;
 
 pub use rotation::{check_and_rotate, init_rotation_state, rotate_if_needed};
 
@@ -142,6 +145,17 @@ pub(crate) async fn migrate_database_or_quarantine(path: &Path) -> Result<(), sq
         )));
     }
     Ok(())
+}
+
+/// Map a legacy sqlx error into the engine error type, preserving busy/conflict
+/// classification so the archive scanner can distinguish "retry later" from
+/// "permanently broken".
+pub(crate) fn map_sqlx_error(error: sqlx::Error) -> engine::DbError {
+    if is_sqlite_retryable_error(&error) {
+        engine::DbError::Driver(turso::Error::Busy(error.to_string()))
+    } else {
+        engine::DbError::Shape(error.to_string())
+    }
 }
 
 pub(crate) fn is_sqlite_retryable_error(error: &sqlx::Error) -> bool {
@@ -323,6 +337,14 @@ mod tests {
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Open the active audit database with the v8 schema.
+pub async fn init_db() -> Result<std::sync::Arc<store::AuditStore>, engine::DbError> {
+    let path = resolve_db_path();
+    let db = store::AuditStore::open(&path, false, Duration::from_secs(30)).await?;
+    info!("Audit database at '{}' initialized (v8)", path.display());
+    Ok(db)
 }
 
 /// 解析 `RECD_PATH` 得到数据库文件路径（去掉 `sqlite:` 前缀）。

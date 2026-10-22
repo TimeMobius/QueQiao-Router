@@ -17,6 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 notify = "6.1"
 validator = { version = "0.16", features = ["derive"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros"] }
+turso = { version = "0.8.3", default-features = false, features = ["fts"] }
 tokio-stream = "0.1.17"
 futures = "0.3.31"
 rand = { version = "0.8.5", features = ["std_rng"] }

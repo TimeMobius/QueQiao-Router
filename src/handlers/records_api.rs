@@ -5,9 +5,10 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::SqlitePool;
 
 use crate::db::archive::ACTIVE_SHARD;
+use crate::db::engine::Row;
+use crate::db::store::AuditStore;
 // 查询引擎（过滤 DSL / 跨分片查询 / 详情行 / 分面统计）已下沉至 db 层，本模块只做薄封装。
 // `build_filters` 的 re-export 仅为 analysis_endpoint 的既有调用路径保留兼容。
 pub(crate) use crate::db::records_query::{build_filters, row_to_item, text, ListParams};
@@ -38,12 +39,12 @@ pub async fn list_records(
         return list_records_active(&app_state, &params).await;
     }
 
-    let active = app_state.query_pool.read().await.clone();
+    let active = app_state.active_db().await;
     let archives: Vec<ShardInput> = candidates
         .iter()
         .map(|shard| ShardInput {
             id: shard.id.clone(),
-            pool: shard.pool.clone(),
+            store: shard.store.clone(),
         })
         .collect();
 
@@ -70,10 +71,10 @@ async fn list_records_active(
     app_state: &Arc<AppState>,
     params: &ListParams,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let pool: tokio::sync::RwLockReadGuard<'_, SqlitePool> = app_state.query_pool.read().await;
+    let store = app_state.active_db().await;
 
     let (items, next_cursor, total, total_exact) =
-        query_records_active(&*pool, params).await.map_err(|e| {
+        query_records_active(&store, params).await.map_err(|e| {
             tracing::error!("records list query failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -90,9 +91,9 @@ async fn list_records_active(
 }
 
 /// 组装详情 JSON 的列表字段与明细字段（不含按需正文）。
-async fn build_detail_body(row: &sqlx::sqlite::SqliteRow, pool: &SqlitePool, id: i64) -> Value {
+async fn build_detail_body(row: &Row, store: &AuditStore, id: i64) -> Value {
     let mut body = row_to_item(row);
-    let payload = has_payload(pool, id).await;
+    let payload = has_payload(store, id).await;
     if let Some(object) = body.as_object_mut() {
         object.insert("prompt".to_string(), json!(text(row, "Prompt")));
         object.insert("requestTail".to_string(), json!(text(row, "RequestTail")));
@@ -105,8 +106,8 @@ async fn build_detail_body(row: &sqlx::sqlite::SqliteRow, pool: &SqlitePool, id:
 }
 
 /// 按需追加完整请求/响应/请求头（zstd 解压后明文）。
-async fn append_body_payload(pool: &SqlitePool, id: i64, body: &mut Value) {
-    let payload = crate::db::records::load_payload_from(pool, id).await;
+async fn append_body_payload(store: &AuditStore, id: i64, body: &mut Value) {
+    let payload = crate::db::records::load_payload_from(store, id).await;
     let (request, response, headers) = payload
         .map(|p| (p.request, p.response, p.headers))
         .unwrap_or_default();
@@ -130,32 +131,29 @@ pub async fn record_detail(
 
     // 显式指定分片：active 或某个归档，找不到分片即 404。
     if let Some(shard) = params.shard.as_deref() {
-        let (pool, shard_label) = if shard == ACTIVE_SHARD {
-            (
-                app_state.query_pool.read().await.clone(),
-                ACTIVE_SHARD.to_string(),
-            )
+        let (store, shard_label) = if shard == ACTIVE_SHARD {
+            (app_state.active_db().await, ACTIVE_SHARD.to_string())
         } else if let Some(archive) = app_state.archive_registry.get(shard).await {
-            (archive.pool.clone(), archive.id.clone())
+            (archive.store.clone(), archive.id.clone())
         } else {
             return Err((StatusCode::NOT_FOUND, "shard not found".to_string()));
         };
 
-        let Some(row) = fetch_detail_row(&pool, id).await? else {
+        let Some(row) = fetch_detail_row(&store, id).await? else {
             return Err((StatusCode::NOT_FOUND, "record not found".to_string()));
         };
-        let mut body = build_detail_body(&row, &pool, id).await;
+        let mut body = build_detail_body(&row, &store, id).await;
         if let Some(object) = body.as_object_mut() {
             object.insert("shard".to_string(), json!(shard_label));
         }
         if include_body {
-            append_body_payload(&pool, id, &mut body).await;
+            append_body_payload(&store, id, &mut body).await;
         }
         return Ok(Json(body));
     }
 
     // 未指定分片：先查 active，命中则保持既有行为（不附加 shard 字段）。
-    let active = app_state.query_pool.read().await.clone();
+    let active = app_state.active_db().await;
     if let Some(row) = fetch_detail_row(&active, id).await? {
         let mut body = build_detail_body(&row, &active, id).await;
         if include_body {
@@ -166,12 +164,9 @@ pub async fn record_detail(
 
     // active 未命中：在所有归档中按 id 唯一匹配。
     let shards = app_state.archive_registry.all_shards().await;
-    let mut hits: Vec<(
-        Arc<crate::db::archive::ArchiveShard>,
-        sqlx::sqlite::SqliteRow,
-    )> = Vec::new();
+    let mut hits: Vec<(Arc<crate::db::archive::ArchiveShard>, Row)> = Vec::new();
     for shard in &shards {
-        if let Some(row) = fetch_detail_row(&shard.pool, id).await? {
+        if let Some(row) = fetch_detail_row(&shard.store, id).await? {
             hits.push((shard.clone(), row));
         }
     }
@@ -180,12 +175,12 @@ pub async fn record_detail(
         0 => Err((StatusCode::NOT_FOUND, "record not found".to_string())),
         1 => {
             if let Some((shard, row)) = hits.into_iter().next() {
-                let mut body = build_detail_body(&row, &shard.pool, id).await;
+                let mut body = build_detail_body(&row, &shard.store, id).await;
                 if let Some(object) = body.as_object_mut() {
                     object.insert("shard".to_string(), json!(shard.id));
                 }
                 if include_body {
-                    append_body_payload(&shard.pool, id, &mut body).await;
+                    append_body_payload(&shard.store, id, &mut body).await;
                 }
                 return Ok(Json(body));
             }
@@ -205,9 +200,9 @@ pub async fn record_detail(
 pub async fn record_facets(
     State(app_state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let pool = app_state.query_pool.read().await;
+    let store = app_state.active_db().await;
 
-    let (models, types, backends, clients) = query_facets(&pool).await;
+    let (models, types, backends, clients) = query_facets(&store).await;
 
     Ok(Json(json!({
         "models": models,

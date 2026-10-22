@@ -1,21 +1,37 @@
 use super::*;
-use sqlx::Row;
+use crate::db::engine::Value;
+use crate::db::store::AuditStore;
+use std::time::Duration;
 
 #[tokio::test]
 async fn complete_archive_scans_once_and_partial_archive_keeps_time_filter() {
-    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-    sqlx::query("CREATE TABLE records (TimeMs INTEGER)")
-        .execute(&pool)
+    let path = std::env::temp_dir().join(format!(
+        "qq_shards_full_{}_{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = AuditStore::open(&path, false, Duration::from_secs(5))
         .await
         .unwrap();
-    sqlx::query("INSERT INTO records (TimeMs) VALUES (0), (NULL), (?)")
-        .bind(30 * DAY_MS)
-        .execute(&pool)
-        .await
-        .unwrap();
+    for time_ms in [0_i64, 30 * DAY_MS] {
+        store
+            .execute(
+                "INSERT INTO records (Time, TimeMs, Model) VALUES (?, ?, ?)",
+                vec![
+                    Value::Text("t".into()),
+                    Value::Integer(time_ms),
+                    Value::Text("m".into()),
+                ],
+            )
+            .await
+            .unwrap();
+    }
     let shard = ShardInput {
         id: "archive".to_string(),
-        pool,
+        store: store.clone(),
         path: None,
         min_ms: Some(0),
         max_ms: Some(30 * DAY_MS),
@@ -29,7 +45,7 @@ async fn complete_archive_scans_once_and_partial_archive_keeps_time_filter() {
         .await
         .unwrap();
     assert_eq!(full.len(), 1);
-    assert_eq!(full[0][0].get::<i64, _>("c"), 2);
+    assert_eq!(full[0][0].get_i64_by_name("c").unwrap(), 2);
 
     let partial = fetch_sliced(&[shard], &params, 1, 30 * DAY_MS, query)
         .await
@@ -38,8 +54,9 @@ async fn complete_archive_scans_once_and_partial_archive_keeps_time_filter() {
     assert_eq!(
         partial
             .iter()
-            .map(|rows| rows[0].get::<i64, _>("c"))
+            .map(|rows| rows[0].get_i64_by_name("c").unwrap())
             .sum::<i64>(),
         1
     );
+    let _ = std::fs::remove_file(&path);
 }

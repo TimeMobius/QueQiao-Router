@@ -1,7 +1,6 @@
 //! 行解析与合并：SQL 行 → 内部聚合结构，跨分片/切片可加合并与分位近似。
 
-use sqlx::sqlite::SqliteRow;
-use sqlx::Row;
+use crate::db::engine::Row;
 use std::collections::HashMap;
 
 use super::params::{LATENCY_BUCKET_CAP_MS, LATENCY_BUCKET_MS};
@@ -62,25 +61,19 @@ pub(super) type LogErrorKey = (
     Option<String>,
 );
 
-pub(super) fn col_i64(row: &SqliteRow, name: &str) -> i64 {
-    row.try_get::<Option<i64>, _>(name)
-        .ok()
-        .flatten()
-        .unwrap_or(0)
+pub(super) fn col_i64(row: &Row, name: &str) -> i64 {
+    row.get_opt_i64_by_name(name).ok().flatten().unwrap_or(0)
 }
 
-pub(super) fn col_text(row: &SqliteRow, name: &str) -> Option<String> {
-    row.try_get::<Option<String>, _>(name).ok().flatten()
+pub(super) fn col_text(row: &Row, name: &str) -> Option<String> {
+    row.get_opt_string_by_name(name).ok().flatten()
 }
 
-pub(super) fn col_f64(row: &SqliteRow, name: &str) -> f64 {
-    row.try_get::<Option<f64>, _>(name)
-        .ok()
-        .flatten()
-        .unwrap_or(0.0)
+pub(super) fn col_f64(row: &Row, name: &str) -> f64 {
+    row.get_opt_f64_by_name(name).ok().flatten().unwrap_or(0.0)
 }
 
-pub(super) fn metrics_from_row(row: &SqliteRow) -> Metrics {
+pub(super) fn metrics_from_row(row: &Row) -> Metrics {
     Metrics {
         requests: col_i64(row, "requests"),
         success: col_i64(row, "success"),
@@ -96,7 +89,7 @@ pub(super) fn metrics_from_row(row: &SqliteRow) -> Metrics {
     }
 }
 
-pub(super) fn summary_from_row(row: &SqliteRow) -> SummaryAgg {
+pub(super) fn summary_from_row(row: &Row) -> SummaryAgg {
     SummaryAgg {
         metrics: metrics_from_row(row),
         models: col_i64(row, "models"),
@@ -135,7 +128,7 @@ pub(super) fn merge_error_maps(maps: Vec<HashMap<DbErrorKey, i64>>) -> HashMap<D
 }
 
 /// 合并各分片的时延直方图（桶 → 计数求和），按桶升序返回。
-pub(super) fn merge_histograms(rows_per_shard: &[Vec<SqliteRow>]) -> Vec<(i64, i64)> {
+pub(super) fn merge_histograms(rows_per_shard: &[Vec<Row>]) -> Vec<(i64, i64)> {
     let mut map: HashMap<i64, i64> = HashMap::new();
     for rows in rows_per_shard {
         for row in rows {
@@ -184,8 +177,9 @@ mod tests {
     use super::super::sql::{dims_sql, errors_db_sql, latency_hist_sql, summary_sql, trend_sql};
     use super::*;
     use crate::db::archive::ACTIVE_SHARD;
-    use sqlx::SqlitePool;
-    use std::time::UNIX_EPOCH;
+    use crate::db::store::AuditStore;
+    use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn summary_merge_sums_counts_and_tokens_not_averages() {
@@ -279,7 +273,7 @@ mod tests {
         assert_eq!(merged.len(), 2);
     }
 
-    async fn temp_db(tag: &str) -> (std::path::PathBuf, SqlitePool) {
+    async fn temp_db(tag: &str) -> (std::path::PathBuf, Arc<AuditStore>) {
         let nanos = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -290,39 +284,29 @@ mod tests {
             tag,
             nanos
         ));
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await.unwrap();
-        sqlx::query(
-            "CREATE TABLE records (\
-                id INTEGER PRIMARY KEY, TimeMs INTEGER, Type TEXT, Model TEXT, Status INTEGER, \
-                Backend TEXT, IP TEXT, ClientName TEXT, UserAgent TEXT, ApiKey TEXT, \
-                PromptTokens INTEGER, CompletionTokens INTEGER, TotalTokens INTEGER, Error TEXT, \
-                LatencyMs REAL, TtftMs REAL)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        (path, pool)
+        let store = AuditStore::open(&path, false, Duration::from_secs(5))
+            .await
+            .unwrap();
+        (path, store)
     }
 
     #[tokio::test]
     async fn sql_queries_execute_and_aggregate_on_temp_db() {
-        let (path, pool) = temp_db("agg").await;
-        sqlx::query(
-            "INSERT INTO records (id, TimeMs, Type, Model, Status, Backend, IP, ClientName, \
-             UserAgent, ApiKey, PromptTokens, CompletionTokens, TotalTokens, Error, LatencyMs, TtftMs) \
-             VALUES (1, 3600000, 'chat', 'm1', 200, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 10, 5, 15, NULL, 120.0, 40.0), \
-                    (2, 7200000, 'chat', 'm1', 500, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 20, 8, 28, 'boom', 800.0, 30.0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let (path, store) = temp_db("agg").await;
+        store
+            .execute(
+                "INSERT INTO records (id, Time, TimeMs, Type, Model, Status, Backend, IP, ClientName, \
+                 UserAgent, ApiKey, PromptTokens, CompletionTokens, TotalTokens, Error, LatencyMs, TtftMs) \
+                 VALUES (1, '2026-01-01 00:00:00.000000', 3600000, 'chat', 'm1', 200, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 10, 5, 15, NULL, 120.0, 40.0), \
+                        (2, '2026-01-01 01:00:00.000000', 7200000, 'chat', 'm1', 500, 'b1', '1.1.1.1', 'c1', 'ua', 'k1', 20, 8, 28, 'boom', 800.0, 30.0)",
+                Vec::new(),
+            )
+            .await
+            .unwrap();
 
         let shards = [ShardInput {
             id: ACTIVE_SHARD.to_string(),
-            pool: pool.clone(),
+            store: store.clone(),
             path: None,
             min_ms: None,
             max_ms: None,
@@ -388,27 +372,28 @@ mod tests {
         assert_eq!(trend_total, 43);
         assert!(!trend_rows[0].is_empty());
 
-        drop(pool);
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn requests_equal_success_plus_all_errors() {
-        let (path, pool) = temp_db("counted").await;
-        sqlx::query(
-            "INSERT INTO records (id, TimeMs, Model, Status, Error, LatencyMs) VALUES \
-             (1, 1000, 'm1', 200, NULL, 10.0), \
-             (2, 2000, 'm1', 500, 'boom', 20.0), \
-             (3, 3000, 'm1', 499, 'user cancel', 30.0), \
-             (4, 4000, 'm1', 422, 'bad', 40.0), \
-             (5, 5000, '',    500, 'nomodel', 50.0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let (path, store) = temp_db("counted").await;
+        store
+            .execute(
+                "INSERT INTO records (id, Time, TimeMs, Model, Status, Error, LatencyMs) VALUES \
+                 (1, '2026-01-01 00:00:00.000000', 1000, 'm1', 200, NULL, 10.0), \
+                 (2, '2026-01-01 00:00:01.000000', 2000, 'm1', 500, 'boom', 20.0), \
+                 (3, '2026-01-01 00:00:02.000000', 3000, 'm1', 499, 'user cancel', 30.0), \
+                 (4, '2026-01-01 00:00:03.000000', 4000, 'm1', 422, 'bad', 40.0), \
+                 (5, '2026-01-01 00:00:04.000000', 5000, '',    500, 'nomodel', 50.0)",
+                Vec::new(),
+            )
+            .await
+            .unwrap();
         let shards = [ShardInput {
             id: ACTIVE_SHARD.to_string(),
-            pool: pool.clone(),
+            store: store.clone(),
             path: None,
             min_ms: None,
             max_ms: None,
@@ -424,11 +409,10 @@ mod tests {
                 .flat_map(|r| r.iter().map(summary_from_row))
                 .collect::<Vec<_>>(),
         );
-        // 请求总量 = 成功(1) + 所有带状态码错误(4)
         assert_eq!(merged.metrics.requests, 5);
         assert_eq!(merged.metrics.success, 1);
         assert_eq!(merged.metrics.errors, 4);
-        drop(pool);
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,6 +1,25 @@
 use super::super::metrics_cache::MetricValue;
 use super::*;
+use crate::db::store::AuditStore;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+async fn temp_store(tag: &str) -> (PathBuf, Arc<AuditStore>) {
+    let path = std::env::temp_dir().join(format!(
+        "qq_metrics_{}_{}_{}.db",
+        std::process::id(),
+        tag,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = AuditStore::open(&path, false, Duration::from_secs(5))
+        .await
+        .unwrap();
+    (path, store)
+}
 
 #[test]
 fn merges_counts_exactly_and_maximum_across_shards() {
@@ -108,21 +127,23 @@ fn error_rate_is_derived_from_merged_request_counts() {
 
 #[tokio::test]
 async fn integer_latency_sum_decodes_as_real_for_average() {
-    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-    let row = sqlx::query("SELECT CAST(5 AS INTEGER) AS latencySum")
-        .fetch_one(&pool)
+    let (path, store) = temp_store("latency").await;
+    let row = store
+        .query_one("SELECT CAST(5 AS INTEGER) AS latencySum", Vec::new())
         .await
+        .unwrap()
         .unwrap();
     let value = row_metric(&row, MetricName::LatencySum).unwrap();
     assert_eq!(value, MetricValue::Real(5.0));
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
 async fn completed_archive_uses_full_scan_only_when_bounds_fit() {
-    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    let (_path, store) = temp_store("bounds").await;
     let shard = ShardInput {
         id: "archive".to_string(),
-        pool,
+        store,
         path: None,
         min_ms: Some(10),
         max_ms: Some(20),
@@ -154,10 +175,10 @@ fn full_shard_still_excludes_rows_without_timestamp() {
 
 #[tokio::test]
 async fn period_queries_share_full_shard_even_with_different_metrics() {
-    let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+    let (_path, store) = temp_store("period").await;
     let shard = ShardInput {
         id: "active".to_string(),
-        pool,
+        store,
         path: None,
         min_ms: None,
         max_ms: None,
@@ -197,11 +218,11 @@ async fn archive_cache_key_changes_when_file_changes() {
             .as_nanos()
     ));
     std::fs::write(&path, b"initial").unwrap();
-    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    let (_db_path, store) = temp_store("cache").await;
     let job = Job {
         shard: ShardInput {
             id: "archive".to_string(),
-            pool,
+            store,
             path: Some(PathBuf::from(&path)),
             min_ms: Some(1),
             max_ms: Some(2),

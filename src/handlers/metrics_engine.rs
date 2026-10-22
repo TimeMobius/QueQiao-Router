@@ -1,11 +1,10 @@
 use chrono::Local;
 use serde_json::Value;
-use sqlx::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::db::records_query::Bind;
+use crate::db::engine::{DbError, Value as DbValue};
 use crate::handlers::analysis_api::shards::{collect_shards, fetch_one_shard, ShardInput};
 use crate::state::app_state::AppState;
 
@@ -26,7 +25,7 @@ struct Job {
     shard: ShardInput,
     full: bool,
     where_sql: String,
-    binds: Vec<Bind>,
+    binds: Vec<DbValue>,
     group: GroupBy,
     metrics: Vec<MetricName>,
     cache_key: Option<String>,
@@ -35,7 +34,7 @@ struct Job {
 pub(super) async fn execute_queries(
     app_state: &Arc<AppState>,
     queries: &[MetricQuery],
-) -> Result<serde_json::Map<String, Value>, sqlx::Error> {
+) -> Result<serde_json::Map<String, Value>, DbError> {
     let now = Local::now();
     let ranges: Vec<(i64, i64)> = queries
         .iter()
@@ -103,10 +102,10 @@ pub(super) async fn execute_queries(
             continue;
         }
         tasks.push(tokio::spawn(async move {
-            let rows = fetch_one_shard(&job.shard.pool, &sql, &job.binds).await?;
+            let rows = fetch_one_shard(&job.shard.store, &sql, &job.binds).await?;
             let mut groups = metrics_cache::GroupRows::new();
             for row in rows {
-                let name = row.try_get::<String, _>("metric_group")?;
+                let name = row.get_str_by_name("metric_group")?.to_string();
                 let entry = groups.entry(name).or_default();
                 for metric in &job.metrics {
                     if !matches!(
@@ -120,12 +119,12 @@ pub(super) async fn execute_queries(
                     }
                 }
             }
-            Ok::<_, sqlx::Error>((key, groups, job.cache_key, job.shard.is_active))
+            Ok::<_, DbError>((key, groups, job.cache_key, job.shard.is_active))
         }));
     }
     for task in futures::future::join_all(tasks).await {
         let (key, groups, cache_key, active) =
-            task.map_err(|error| sqlx::Error::Protocol(error.to_string()))??;
+            task.map_err(|error| DbError::Shape(error.to_string()))??;
         if let Some(cache_key) = cache_key {
             metrics_cache::insert(cache_key, active, &groups);
         }
@@ -145,7 +144,7 @@ pub(super) async fn execute_queries(
     Ok(output)
 }
 
-fn job_key(shard: &ShardInput, group: &GroupBy, where_sql: &str, binds: &[Bind]) -> String {
+fn job_key(shard: &ShardInput, group: &GroupBy, where_sql: &str, binds: &[DbValue]) -> String {
     format!("{}:{group:?}:{where_sql}:{binds:?}", shard.id)
 }
 

@@ -1,11 +1,12 @@
 use axum::http::HeaderMap;
 use chrono::Local;
 use serde_json::Value;
-use sqlx::Row;
 use std::sync::Arc;
 use tracing::error;
 
+use crate::db::engine::{DbError, Value as DbValue};
 use crate::db::extract::{extract_request, extract_response, header_meta};
+use crate::db::store::{opt_int, opt_real, opt_text, AuditStore};
 use crate::models::requests::{MessageContent, RequestPayload};
 use crate::state::app_state::AppState;
 
@@ -89,108 +90,123 @@ pub struct Record {
 }
 
 /// 记录请求到数据库
-pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<(), sqlx::Error> {
+pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<(), DbError> {
     crate::db::rotate_if_needed(app_state, record.time_ms).await;
-    let pool = app_state.db_pool.read().await;
+    let guard = app_state.db.read().await;
+    let store: &AuditStore = &guard;
     let req = crate::db::payload::compress(record.request.as_bytes());
     let resp = crate::db::payload::compress(record.response.as_bytes());
     let hdr = crate::db::payload::compress(record.headers.as_bytes());
 
-    let mut tx = pool.begin().await?;
-    let inserted = sqlx::query(
-        r#"
-        INSERT INTO records (
-            Time, TimeMs, IP, Method, Endpoint, Type, Model, Backend,
-            SessionId, ParentSessionId, RequestId, SessionAffinity, UserAgent, ClientName, ClientVersion, ApiKey,
-            Status, Error, RetryCount, FinishReason,
-            LatencyMs, TtftMs, UpstreamMs, StreamMs,
-            CompletionTokens, PromptTokens, TotalTokens, Tool, Multimodal,
-            RequestBytes, ResponseBytes, PromptBytes, RequestTailBytes, AnswerBytes,
-            MessageCount, SystemCount, ToolCount, AssistantCount, ToolResultCount, ImageCount,
-            Prompt, RequestTail, Answer, ToolNames
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?
+    let params = vec![
+        DbValue::Text(record.time),
+        DbValue::Integer(record.time_ms),
+        DbValue::Text(record.ip),
+        opt_text(record.method.as_deref()),
+        opt_text(record.endpoint.as_deref()),
+        DbValue::Text(record.r#type),
+        DbValue::Text(record.model),
+        opt_text(record.backend.as_deref()),
+        opt_text(record.session_id.as_deref()),
+        opt_text(record.parent_session_id.as_deref()),
+        opt_text(record.request_id.as_deref()),
+        opt_text(record.session_affinity.as_deref()),
+        opt_text(record.user_agent.as_deref()),
+        opt_text(record.client_name.as_deref()),
+        opt_text(record.client_version.as_deref()),
+        opt_text(record.api_key.as_deref()),
+        opt_int(record.status),
+        opt_text(record.error.as_deref()),
+        opt_int(record.retry_count),
+        opt_text(record.finish_reason.as_deref()),
+        opt_real(record.latency_ms),
+        opt_real(record.ttft_ms),
+        opt_real(record.upstream_ms),
+        opt_real(record.stream_ms),
+        DbValue::Integer(record.completion_tokens as i64),
+        DbValue::Integer(record.prompt_tokens as i64),
+        DbValue::Integer(record.total_tokens as i64),
+        DbValue::Integer(i64::from(record.tool)),
+        DbValue::Integer(i64::from(record.multimodal)),
+        DbValue::Integer(record.request_bytes),
+        DbValue::Integer(record.response_bytes),
+        DbValue::Integer(record.prompt_bytes),
+        DbValue::Integer(record.request_tail_bytes),
+        DbValue::Integer(record.answer_bytes),
+        DbValue::Integer(record.message_count),
+        DbValue::Integer(record.system_count),
+        DbValue::Integer(record.tool_count),
+        DbValue::Integer(record.assistant_count),
+        DbValue::Integer(record.tool_result_count),
+        DbValue::Integer(record.image_count),
+        DbValue::Text(record.prompt),
+        DbValue::Text(record.request_tail),
+        DbValue::Text(record.answer),
+        DbValue::Text(record.tool_names),
+    ];
+
+    let conn = store.write().await;
+    conn.begin_immediate().await?;
+    let result = async {
+        conn.execute(
+            r#"
+            INSERT INTO records (
+                Time, TimeMs, IP, Method, Endpoint, Type, Model, Backend,
+                SessionId, ParentSessionId, RequestId, SessionAffinity, UserAgent, ClientName, ClientVersion, ApiKey,
+                Status, Error, RetryCount, FinishReason,
+                LatencyMs, TtftMs, UpstreamMs, StreamMs,
+                CompletionTokens, PromptTokens, TotalTokens, Tool, Multimodal,
+                RequestBytes, ResponseBytes, PromptBytes, RequestTailBytes, AnswerBytes,
+                MessageCount, SystemCount, ToolCount, AssistantCount, ToolResultCount, ImageCount,
+                Prompt, RequestTail, Answer, ToolNames
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?
+            )
+            "#,
+            params,
         )
-        "#,
-    )
-    .bind(&record.time)
-    .bind(record.time_ms)
-    .bind(&record.ip)
-    .bind(record.method.as_deref())
-    .bind(record.endpoint.as_deref())
-    .bind(&record.r#type)
-    .bind(&record.model)
-    .bind(record.backend.as_deref())
-    .bind(record.session_id.as_deref())
-    .bind(record.parent_session_id.as_deref())
-    .bind(record.request_id.as_deref())
-    .bind(record.session_affinity.as_deref())
-    .bind(record.user_agent.as_deref())
-    .bind(record.client_name.as_deref())
-    .bind(record.client_version.as_deref())
-    .bind(record.api_key.as_deref())
-    .bind(record.status)
-    .bind(record.error.as_deref())
-    .bind(record.retry_count)
-    .bind(record.finish_reason.as_deref())
-    .bind(record.latency_ms)
-    .bind(record.ttft_ms)
-    .bind(record.upstream_ms)
-    .bind(record.stream_ms)
-    .bind(record.completion_tokens)
-    .bind(record.prompt_tokens)
-    .bind(record.total_tokens)
-    .bind(record.tool)
-    .bind(record.multimodal)
-    .bind(record.request_bytes)
-    .bind(record.response_bytes)
-    .bind(record.prompt_bytes)
-    .bind(record.request_tail_bytes)
-    .bind(record.answer_bytes)
-    .bind(record.message_count)
-    .bind(record.system_count)
-    .bind(record.tool_count)
-    .bind(record.assistant_count)
-    .bind(record.tool_result_count)
-    .bind(record.image_count)
-    .bind(&record.prompt)
-    .bind(&record.request_tail)
-    .bind(&record.answer)
-    .bind(&record.tool_names)
-    .execute(&mut *tx)
-    .await?;
+        .await?;
 
-    let record_id = inserted.last_insert_rowid();
-    sqlx::query(
-        r#"
-        INSERT INTO payloads (
-            record_id, codec, dict_id,
-            request, response, headers,
-            request_raw_len, response_raw_len, headers_raw_len
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(record_id)
-    .bind(&req.codec)
-    .bind(req.dict_id.as_deref())
-    .bind(&req.bytes)
-    .bind(&resp.bytes)
-    .bind(&hdr.bytes)
-    .bind(req.raw_len)
-    .bind(resp.raw_len)
-    .bind(hdr.raw_len)
-    .execute(&mut *tx)
-    .await?;
+        let record_id = conn.last_insert_rowid();
+        conn.execute(
+            r#"
+            INSERT INTO payloads (
+                record_id, codec, dict_id,
+                request, response, headers,
+                request_raw_len, response_raw_len, headers_raw_len
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            vec![
+                DbValue::Integer(record_id),
+                DbValue::Text(req.codec.clone()),
+                opt_text(req.dict_id.as_deref()),
+                DbValue::Blob(req.bytes.clone()),
+                DbValue::Blob(resp.bytes.clone()),
+                DbValue::Blob(hdr.bytes.clone()),
+                DbValue::Integer(req.raw_len),
+                DbValue::Integer(resp.raw_len),
+                DbValue::Integer(hdr.raw_len),
+            ],
+        )
+        .await?;
+        Ok::<(), DbError>(())
+    }
+    .await;
 
-    tx.commit().await?;
-    Ok(())
+    match result {
+        Ok(()) => conn.commit().await,
+        Err(error) => {
+            let _ = conn.rollback().await;
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -201,32 +217,35 @@ pub struct StoredPayload {
 }
 
 pub async fn load_payload(app_state: &Arc<AppState>, record_id: i64) -> Option<StoredPayload> {
-    let pool = app_state.db_pool.read().await;
-    load_payload_from(&pool, record_id).await
+    let store = app_state.active_db().await;
+    load_payload_from(&store, record_id).await
 }
 
-/// 在指定连接池上加载并解压记录正文（供跨月归档详情复用）。
-pub async fn load_payload_from(pool: &sqlx::SqlitePool, record_id: i64) -> Option<StoredPayload> {
-    let row = sqlx::query(
-        "SELECT codec, dict_id, request, response, headers FROM payloads WHERE record_id = ?",
-    )
-    .bind(record_id)
-    .fetch_optional(pool)
-    .await
-    .ok()??;
+/// 在指定库上加载并解压记录正文（供跨月归档详情复用）。
+pub async fn load_payload_from(store: &AuditStore, record_id: i64) -> Option<StoredPayload> {
+    let row = store
+        .query_one(
+            "SELECT codec, dict_id, request, response, headers FROM payloads WHERE record_id = ?",
+            vec![DbValue::Integer(record_id)],
+        )
+        .await
+        .ok()??;
 
-    let codec: String = row.get("codec");
-    let dict_id: Option<String> = row.get("dict_id");
-    let decode = |blob: Option<Vec<u8>>| -> String {
-        blob.and_then(|b| crate::db::payload::decompress(&codec, dict_id.as_deref(), &b))
+    let codec = row.get_str(0).ok()?.to_string();
+    let dict_id = row.get_opt_str(1).ok()?.map(str::to_string);
+    let decode = |idx: usize| -> String {
+        row.get_opt_blob(idx)
+            .ok()
+            .flatten()
+            .and_then(|b| crate::db::payload::decompress(&codec, dict_id.as_deref(), b))
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .unwrap_or_default()
     };
 
     Some(StoredPayload {
-        request: decode(row.get("request")),
-        response: decode(row.get("response")),
-        headers: decode(row.get("headers")),
+        request: decode(2),
+        response: decode(3),
+        headers: decode(4),
     })
 }
 

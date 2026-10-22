@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use super::{init_db_pool, init_query_pool, resolve_db_path};
+use super::resolve_db_path;
 use crate::state::app_state::AppState;
 
 /// 编码本地时间为 YYYYMM，例如 2026-09 -> 202609。
@@ -68,12 +68,13 @@ pub fn should_rotate(active_yyyymm: i32, now: DateTime<Local>) -> bool {
 
 /// 当前 record.db 中 MAX(TimeMs) 所属的本地月份；空表/无值返回 None。
 async fn current_data_yyyymm(app_state: &Arc<AppState>) -> Option<i32> {
-    let pool = app_state.db_pool.read().await;
-    let max: Option<i64> = sqlx::query_scalar("SELECT MAX(TimeMs) FROM records")
-        .fetch_one(&*pool)
+    let store = app_state.active_db().await;
+    let max: Option<i64> = store
+        .query_one("SELECT MAX(TimeMs) FROM records", Vec::new())
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .and_then(|row| row.get_opt_i64(0).ok().flatten());
     max.and_then(yyyymm_from_ms)
 }
 
@@ -116,49 +117,39 @@ async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
         );
     }
 
-    // 获取写锁以阻塞新的请求写入，安全完成轮转。
-    let mut pool_guard = app_state.db_pool.write().await;
-    // 与写池同序获取查询池写锁；关闭会等待在途查询归还连接后优雅排空。
-    let mut query_guard = app_state.query_pool.write().await;
-
-    // 关闭当前连接池以释放文件锁。
-    pool_guard.close().await;
-    query_guard.close().await;
-
-    match fs::rename(&db_path, &archive_path) {
-        Ok(_) => info!("Database archived successfully."),
-        Err(e) => {
-            error!("Failed to archive database: {}", e);
-        }
+    // 写锁会等待所有在途写入（它们持有读锁直到提交），并阻塞新的写入。
+    let mut guard = app_state.db.write().await;
+    if let Err(e) = guard.checkpoint_truncate().await {
+        warn!("WAL checkpoint before rotation failed: {e}");
     }
 
-    info!("Re-initializing database pool after rotation.");
-    let config = app_state.config_manager.get_config().await;
-    match init_db_pool(&config).await {
-        Ok(new_pool) => {
-            *pool_guard = new_pool;
+    if let Err(e) = fs::rename(&db_path, &archive_path) {
+        error!(
+            "Failed to archive database '{}' -> '{}': {}; keeping the active database",
+            db_path.display(),
+            archive_path.display(),
+            e
+        );
+        return;
+    }
+    info!("Database archived successfully.");
+
+    info!("Re-initializing audit database after rotation.");
+    match crate::db::init_db().await {
+        Ok(new_db) => {
+            *guard = new_db;
             let now_month = yyyymm(Local::now());
             app_state.active_yyyymm.store(now_month, Ordering::Release);
             app_state
                 .next_month_boundary_ms
                 .store(next_month_boundary_ms(now_month), Ordering::Release);
-            info!("Database pool re-initialized successfully.");
+            info!("Audit database re-initialized successfully.");
         }
         Err(e) => {
             error!(
-                "Failed to re-initialize database pool after rotation: {}",
+                "Failed to re-initialize audit database after rotation: {}",
                 e
             );
-        }
-    }
-
-    match init_query_pool().await {
-        Ok(new_query_pool) => {
-            *query_guard = new_query_pool;
-            info!("Query pool re-initialized successfully.");
-        }
-        Err(e) => {
-            error!("Failed to re-initialize query pool after rotation: {}", e);
         }
     }
 }

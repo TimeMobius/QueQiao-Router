@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use queqiao_router::{client, config, db, middleware, routes, state};
 
 use client::client_manager::ClientManager;
-use db::{check_and_rotate, init_db_pool, init_query_pool, init_rotation_state};
+use db::{check_and_rotate, init_db, init_rotation_state};
 use state::app_state::AppState;
 
 #[cfg(feature = "check-api-auth")]
@@ -48,23 +48,12 @@ fn main() {
         let config = config_manager.get_config().await;
         let client_manager = Arc::new(ClientManager::new(config.connection_pool));
 
-        // Initialize database pool
-        let db_pool = init_db_pool(&config)
+        let db = init_db()
             .await
-            .expect("Failed to initialize database pool");
-        println!("Database connection pool initialized.");
+            .expect("Failed to initialize audit database");
+        println!("Audit database initialized.");
 
-        let query_pool = init_query_pool()
-            .await
-            .expect("Failed to initialize query pool");
-        println!("Query connection pool initialized.");
-
-        let app_state = Arc::new(AppState::new(
-            config_manager,
-            client_manager,
-            db_pool,
-            query_pool,
-        ));
+        let app_state = Arc::new(AppState::new(config_manager, client_manager, db));
         println!("Application state constructed.");
 
         init_rotation_state(&app_state).await;

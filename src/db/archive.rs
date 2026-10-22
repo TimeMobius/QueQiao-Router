@@ -8,8 +8,10 @@
 //! 旧归档可能不带 `TimeMs` 列（`user_version=0` 的遗留库），扫描时应记录告警并
 //! 跳过，绝不能因此 panic 或影响 active 库的正常服务。
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+use crate::db::engine::DbError;
+use crate::db::store::AuditStore;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +35,7 @@ pub struct ArchiveShard {
     pub min_ms: Option<i64>,
     /// 该分片内 `TimeMs` 的最大值；空表为 None。
     pub max_ms: Option<i64>,
-    pub pool: SqlitePool,
+    pub store: Arc<AuditStore>,
 }
 
 /// 归档分片注册表；扫描结果缓存于内存，避免每次查询都重新打开连接。
@@ -128,7 +130,7 @@ impl ArchiveRegistry {
                         }
                     }
                     Err(e) => {
-                        let busy = crate::db::is_sqlite_retryable_error(&e);
+                        let busy = e.is_busy();
                         notices.push(format!(
                             "archive shard '{}' open failed: {}",
                             path.display(),
@@ -223,7 +225,7 @@ impl ArchiveRegistry {
                 (None, false)
             }
             Err(e) => {
-                let busy = crate::db::is_sqlite_retryable_error(&e);
+                let busy = e.is_busy();
                 notices.push(format!(
                     "archive shard '{}' open failed: {}",
                     path.display(),
@@ -328,11 +330,13 @@ fn archive_stem_for_path(path: &Path) -> Option<&str> {
     Some(stem)
 }
 
-/// 以只读单连接池打开归档；缺少 `TimeMs` 的遗留库返回 `Ok(None)` 并告警。
-async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard>, sqlx::Error> {
+/// 以只读方式打开归档；缺少 `TimeMs` 的遗留库返回 `Ok(None)` 并告警。
+async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard>, DbError> {
     let journal_path = PathBuf::from(format!("{}-journal", path.display()));
     if journal_path.exists() {
-        // NFS read-only SQLite opens cannot replay a hot rollback journal.
+        // Legacy archives can carry a hot rollback journal. A writable open is
+        // required on NFS to replay it; keep this on sqlx because the recovery
+        // semantics (and journal removal) are part of the legacy format.
         let options = SqliteConnectOptions::new()
             .filename(path)
             .read_only(false)
@@ -341,49 +345,45 @@ async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(5))
             .connect_with(options)
-            .await?;
+            .await
+            .map_err(crate::db::map_sqlx_error)?;
         sqlx::query("SELECT 1 FROM sqlite_master LIMIT 1")
             .fetch_optional(&pool)
-            .await?;
+            .await
+            .map_err(crate::db::map_sqlx_error)?;
         pool.close().await;
     }
 
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .read_only(true)
-        .create_if_missing(false);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect_with(options)
-        .await?;
+    let store = AuditStore::open(path, true, Duration::from_secs(5)).await?;
 
-    let columns = sqlx::query("PRAGMA table_info(records)")
-        .fetch_all(&pool)
+    let columns = store
+        .query("PRAGMA table_info(records)", Vec::new())
         .await?;
     let has_time_ms = columns
         .iter()
-        .any(|row| row.get::<String, _>("name") == "TimeMs");
+        .any(|row| row.get_opt_str(1).ok().flatten() == Some("TimeMs"));
     if !has_time_ms {
         warn!(
             "Legacy archive without TimeMs column detected: {}",
             path.display()
         );
-        pool.close().await;
         return Ok(None);
     }
 
-    let bounds: (Option<i64>, Option<i64>) =
-        sqlx::query_as("SELECT MIN(TimeMs), MAX(TimeMs) FROM records")
-            .fetch_one(&pool)
-            .await?;
+    let bounds = store
+        .query_one("SELECT MIN(TimeMs), MAX(TimeMs) FROM records", Vec::new())
+        .await?;
+    let (min_ms, max_ms) = match bounds {
+        Some(row) => (row.get_opt_i64(0)?, row.get_opt_i64(1)?),
+        None => (None, None),
+    };
 
     Ok(Some(ArchiveShard {
         id: id.to_string(),
         path: path.to_path_buf(),
-        min_ms: bounds.0,
-        max_ms: bounds.1,
-        pool,
+        min_ms,
+        max_ms,
+        store,
     }))
 }
 
@@ -533,10 +533,15 @@ mod tests {
         assert!(!Path::new(&format!("{}-journal", archive.display())).exists());
         let shard = registry.get("record_202603").await;
         assert!(shard.is_some());
-        let pool = &shard.as_ref().expect("archive should be registered").pool;
-        let recovered_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records")
-            .fetch_one(pool)
+        let recovered_rows = shard
+            .as_ref()
+            .expect("archive should be registered")
+            .store
+            .query_one("SELECT COUNT(*) FROM records", Vec::new())
             .await
+            .unwrap()
+            .unwrap()
+            .get_i64(0)
             .unwrap();
         assert_eq!(recovered_rows, 0);
 

@@ -2,13 +2,12 @@
 
 use chrono::TimeZone;
 use once_cell::sync::Lazy;
-use sqlx::sqlite::SqliteRow;
-use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::db::archive::ACTIVE_SHARD;
+use crate::db::engine::{DbError, Row, Value};
 use crate::db::records_query;
 use crate::state::app_state::AppState;
 
@@ -24,7 +23,7 @@ static SHARD_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(SHARD_CONCURRENC
 #[derive(Clone)]
 pub(crate) struct ShardInput {
     pub(crate) id: String,
-    pub(crate) pool: SqlitePool,
+    pub(crate) store: Arc<crate::db::store::AuditStore>,
     pub(crate) path: Option<std::path::PathBuf>,
     pub(crate) min_ms: Option<i64>,
     pub(crate) max_ms: Option<i64>,
@@ -55,25 +54,23 @@ impl ShardInput {
 }
 
 async fn fetch(
-    pool: &SqlitePool,
+    store: &crate::db::store::AuditStore,
     sql: &str,
-    binds: &[records_query::Bind],
-) -> Result<Vec<SqliteRow>, sqlx::Error> {
-    records_query::bind_all(sqlx::query(sql), binds)
-        .fetch_all(pool)
-        .await
+    binds: &[Value],
+) -> Result<Vec<Row>, DbError> {
+    store.query(sql, binds.to_vec()).await
 }
 
 pub(crate) async fn fetch_one_shard(
-    pool: &SqlitePool,
+    store: &crate::db::store::AuditStore,
     sql: &str,
-    binds: &[records_query::Bind],
-) -> Result<Vec<SqliteRow>, sqlx::Error> {
+    binds: &[Value],
+) -> Result<Vec<Row>, DbError> {
     let _permit = SHARD_SEM
         .acquire()
         .await
-        .map_err(|error| sqlx::Error::Protocol(format!("shard query semaphore closed: {error}")))?;
-    fetch(pool, sql, binds).await
+        .map_err(|error| DbError::Shape(format!("shard query semaphore closed: {error}")))?;
+    fetch(store, sql, binds).await
 }
 
 /// 等待一组已 spawn 的查询任务并收集结果。
@@ -81,13 +78,13 @@ pub(crate) async fn fetch_one_shard(
 /// 必须用 `tokio::spawn`：`join_all` 下 sqlx 的 SQLite 查询会在同一任务内串行执行
 /// （实测单请求 CPU ≈100%），spawn 后各查询才会落到独立的连接执行线程上。
 async fn join_queries(
-    tasks: Vec<tokio::task::JoinHandle<Result<Vec<SqliteRow>, sqlx::Error>>>,
-) -> Result<Vec<Vec<SqliteRow>>, sqlx::Error> {
+    tasks: Vec<tokio::task::JoinHandle<Result<Vec<Row>, DbError>>>,
+) -> Result<Vec<Vec<Row>>, DbError> {
     let mut out = Vec::with_capacity(tasks.len());
     for task in tasks {
         let rows = task
             .await
-            .map_err(|e| sqlx::Error::Protocol(format!("query task join failed: {e}")))??;
+            .map_err(|e| DbError::Shape(format!("query task join failed: {e}")))??;
         out.push(rows);
     }
     Ok(out)
@@ -101,17 +98,17 @@ async fn join_queries(
 pub(super) async fn fetch_all_shards(
     shards: &[ShardInput],
     sql: &str,
-    binds: &[records_query::Bind],
-) -> Result<Vec<Vec<SqliteRow>>, sqlx::Error> {
+    binds: &[Value],
+) -> Result<Vec<Vec<Row>>, DbError> {
     let tasks = shards
         .iter()
         .map(|s| {
-            let pool = s.pool.clone();
+            let store = s.store.clone();
             let sql = sql.to_string();
             let binds = binds.to_vec();
             tokio::spawn(async move {
                 let _permit = SHARD_SEM.acquire().await;
-                fetch(&pool, &sql, &binds).await
+                fetch(&store, &sql, &binds).await
             })
         })
         .collect();
@@ -160,7 +157,7 @@ pub(super) async fn fetch_sliced<F>(
     from: i64,
     to: i64,
     make_sql: F,
-) -> Result<Vec<Vec<SqliteRow>>, sqlx::Error>
+) -> Result<Vec<Vec<Row>>, DbError>
 where
     F: Fn(&str) -> String,
 {
@@ -171,7 +168,7 @@ where
             && shard.min_ms.is_some_and(|min| min >= from)
             && shard.max_ms.is_some_and(|max| max <= to)
         {
-            let pool = shard.pool.clone();
+            let store = shard.store.clone();
             let mut params = to_list_params(p, from, to);
             params.from = None;
             params.to = None;
@@ -179,18 +176,18 @@ where
             where_sql.push_str(" AND TimeMs IS NOT NULL");
             let sql = make_sql(&where_sql);
             tasks.push(tokio::spawn(async move {
-                fetch_one_shard(&pool, &sql, &binds).await
+                fetch_one_shard(&store, &sql, &binds).await
             }));
             continue;
         }
         for &(slice_from, slice_to) in &slices {
-            let pool = shard.pool.clone();
+            let store = shard.store.clone();
             let (where_sql, binds) =
                 records_query::build_filters(&to_list_params(p, slice_from, slice_to));
             let sql = make_sql(&where_sql);
             tasks.push(tokio::spawn(async move {
                 let _permit = SHARD_SEM.acquire().await;
-                fetch(&pool, &sql, &binds).await
+                fetch(&store, &sql, &binds).await
             }));
         }
     }
@@ -206,7 +203,7 @@ pub(super) async fn distinct_count_across_shards(
     from: i64,
     to: i64,
     column: &str,
-) -> Result<(usize, bool), sqlx::Error> {
+) -> Result<(usize, bool), DbError> {
     let rows = super::optimized::fetch_optimized(shards, params, from, to, |where_sql| {
         super::sql::distinct_sql(where_sql, column)
     })
@@ -232,11 +229,11 @@ pub(crate) async fn collect_shards(
         .archive_registry
         .candidates(Some(from), Some(to))
         .await;
-    let active = app_state.query_pool.read().await.clone();
+    let active = app_state.active_db().await;
     let mut shards = Vec::with_capacity(candidates.len() + 1);
     shards.push(ShardInput {
         id: ACTIVE_SHARD.to_string(),
-        pool: active,
+        store: active,
         path: None,
         min_ms: None,
         max_ms: None,
@@ -250,7 +247,7 @@ pub(crate) async fn collect_shards(
     for c in &candidates {
         shards.push(ShardInput {
             id: c.id.clone(),
-            pool: c.pool.clone(),
+            store: c.store.clone(),
             path: Some(c.path.clone()),
             min_ms: c.min_ms,
             max_ms: c.max_ms,

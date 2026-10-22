@@ -1,11 +1,9 @@
 use chrono::{Datelike, Local, TimeZone};
-use sqlx::sqlite::SqliteRow;
-use sqlx::Row;
 use std::collections::HashMap;
 
 use super::metrics_cache::MetricValue;
 use super::{GroupBy, MetricName, MetricPeriod, MetricQuery};
-use crate::db::records_query::Bind;
+use crate::db::engine::{DbError, Row, Value};
 use crate::handlers::records_api;
 
 pub(super) fn resolve_query_range(query: &MetricQuery, now: chrono::DateTime<Local>) -> (i64, i64) {
@@ -38,7 +36,7 @@ pub(super) fn build_filters(
     from: i64,
     to: i64,
     full_shard: bool,
-) -> (String, Vec<Bind>) {
+) -> (String, Vec<Value>) {
     let params = records_api::ListParams {
         from: (!full_shard).then_some(from),
         to: (!full_shard).then_some(to),
@@ -127,7 +125,7 @@ pub(super) fn metric_value(values: &HashMap<MetricName, MetricValue>, metric: Me
     }
 }
 
-pub(super) fn row_metric(row: &SqliteRow, metric: MetricName) -> Result<MetricValue, sqlx::Error> {
+pub(super) fn row_metric(row: &Row, metric: MetricName) -> Result<MetricValue, DbError> {
     match metric {
         MetricName::LatencySum | MetricName::MaxLatency | MetricName::TtftSum => {
             real_or_int(row, metric.alias()).map(MetricValue::Real)
@@ -136,17 +134,16 @@ pub(super) fn row_metric(row: &SqliteRow, metric: MetricName) -> Result<MetricVa
         | MetricName::AvgTtft
         | MetricName::SuccessRate
         | MetricName::ErrorRate => Ok(MetricValue::Real(0.0)),
-        _ => row
-            .try_get::<i64, _>(metric.alias())
-            .map(MetricValue::Integer),
+        _ => Ok(MetricValue::Integer(
+            row.get_opt_i64_by_name(metric.alias())?.unwrap_or(0),
+        )),
     }
 }
 
-/// SQLite 同一列在不同分片可能以 `REAL` 或 `INTEGER` 存储（如 `SUM(LatencyMs)`），
-/// 先按浮点读取，失败再按整数读取，避免整值列导致 `avgLatency` 解码失败。
-fn real_or_int(row: &SqliteRow, alias: &str) -> Result<f64, sqlx::Error> {
-    row.try_get::<f64, _>(alias)
-        .or_else(|_| row.try_get::<i64, _>(alias).map(|value| value as f64))
+/// SQLite 同一列在不同分片可能以 `REAL` 或 `INTEGER` 存储（如 `SUM(LatencyMs)`）；
+/// the engine accessor widens integers to f64.
+fn real_or_int(row: &Row, alias: &str) -> Result<f64, DbError> {
+    Ok(row.get_opt_f64_by_name(alias)?.unwrap_or(0.0))
 }
 
 pub(super) fn average(
