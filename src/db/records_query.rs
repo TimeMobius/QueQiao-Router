@@ -308,7 +308,7 @@ pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Value>) {
 
     if let Some(v) = p.q.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
         let char_count = v.chars().count();
-        if char_count >= 3 {
+        if char_count >= 2 {
             sql.push_str(" AND fts_match(SearchText, ?)");
             binds.push(Value::Text(fts_query(v)));
             for term in v.split_whitespace().filter(|term| !term.is_empty()) {
@@ -316,13 +316,8 @@ pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Value>) {
                 binds.push(Value::Text(term.to_lowercase()));
             }
         } else {
-            let pat = like_contains(v);
-            sql.push_str(
-                " AND (Prompt LIKE ? ESCAPE '\\' OR RequestTail LIKE ? ESCAPE '\\' OR Answer LIKE ? ESCAPE '\\')",
-            );
-            binds.push(Value::Text(pat.clone()));
-            binds.push(Value::Text(pat.clone()));
-            binds.push(Value::Text(pat));
+            sql.push_str(" AND SearchText LIKE ? ESCAPE '\\'");
+            binds.push(Value::Text(like_contains(v)));
         }
     }
 
