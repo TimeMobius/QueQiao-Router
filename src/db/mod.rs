@@ -17,6 +17,7 @@ pub mod rotation;
 pub mod schema;
 pub mod store;
 pub mod turso_schema;
+pub mod writer;
 
 pub use rotation::{check_and_rotate, init_rotation_state, rotate_if_needed};
 

@@ -12,4 +12,5 @@ pub mod records_api;
 pub mod request_body;
 pub mod responses_stream_handler;
 pub mod stream_handler;
+pub mod test_api;
 pub mod thinking_transformer;

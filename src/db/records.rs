@@ -89,27 +89,111 @@ pub struct Record {
     pub response: String,
 }
 
-/// 记录请求到数据库
+/// 记录请求到数据库（入有界队列，由单写任务批量提交）
 pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<(), DbError> {
     crate::db::rotate_if_needed(app_state, record.time_ms).await;
-    let guard = app_state.db.read().await;
-    let store: &AuditStore = &guard;
-    let req = crate::db::payload::compress(record.request.as_bytes());
-    let resp = crate::db::payload::compress(record.response.as_bytes());
-    let hdr = crate::db::payload::compress(record.headers.as_bytes());
-    let search_text = format!(
-        "{}\n{}\n{}",
-        record.prompt, record.request_tail, record.answer
-    );
+    let request = crate::db::payload::compress(record.request.as_bytes());
+    let response = crate::db::payload::compress(record.response.as_bytes());
+    let headers = crate::db::payload::compress(record.headers.as_bytes());
+    let item = crate::db::writer::AuditItem {
+        record,
+        request,
+        response,
+        headers,
+    };
+    if app_state.audit_writer.enqueue(item).await {
+        Ok(())
+    } else {
+        Err(DbError::Shape(
+            "audit write queue is full; record dropped".to_string(),
+        ))
+    }
+}
 
-    let params = vec![
-        DbValue::Text(record.time),
+fn search_text(record: &Record) -> String {
+    build_search_text(&record.prompt, &record.request_tail, &record.answer)
+}
+
+/// Concatenated text used by the FTS index.
+///
+/// `AUDIT_FTS_PROMPT_BYTES` / `_TAIL_BYTES` / `_ANSWER_BYTES` bound each field
+/// (0 disables the cap); `AUDIT_FTS_MAX_BYTES` adds a global cap. Indexing the
+/// full prompt/answer is the dominant write cost on large audit rows.
+pub fn build_search_text(prompt: &str, request_tail: &str, answer: &str) -> String {
+    static LIMITS: once_cell::sync::Lazy<FtsLimits> =
+        once_cell::sync::Lazy::new(FtsLimits::from_env);
+    let limits = &*LIMITS;
+    let prompt = head_bytes(prompt, limits.prompt);
+    let tail = tail_bytes(request_tail, limits.tail);
+    let answer = head_bytes(answer, limits.answer);
+    let mut text = format!("{prompt}\n{tail}\n{answer}");
+    if limits.global > 0 && text.len() > limits.global {
+        let mut end = limits.global;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+struct FtsLimits {
+    prompt: usize,
+    tail: usize,
+    answer: usize,
+    global: usize,
+}
+
+impl FtsLimits {
+    fn from_env() -> Self {
+        Self {
+            prompt: env_bytes("AUDIT_FTS_PROMPT_BYTES", 512),
+            tail: env_bytes("AUDIT_FTS_TAIL_BYTES", 512),
+            answer: env_bytes("AUDIT_FTS_ANSWER_BYTES", 512),
+            global: env_bytes("AUDIT_FTS_MAX_BYTES", 0),
+        }
+    }
+}
+
+fn env_bytes(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn head_bytes(value: &str, limit: usize) -> &str {
+    if limit == 0 || value.len() <= limit {
+        return value;
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn tail_bytes(value: &str, limit: usize) -> &str {
+    if limit == 0 || value.len() <= limit {
+        return value;
+    }
+    let mut start = value.len() - limit;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
+pub(crate) fn record_params(record: &Record, id: i64) -> Vec<DbValue> {
+    vec![
+        DbValue::Integer(id),
+        DbValue::Text(record.time.clone()),
         DbValue::Integer(record.time_ms),
-        DbValue::Text(record.ip),
+        DbValue::Text(record.ip.clone()),
         opt_text(record.method.as_deref()),
         opt_text(record.endpoint.as_deref()),
-        DbValue::Text(record.r#type),
-        DbValue::Text(record.model),
+        DbValue::Text(record.r#type.clone()),
+        DbValue::Text(record.model.clone()),
         opt_text(record.backend.as_deref()),
         opt_text(record.session_id.as_deref()),
         opt_text(record.parent_session_id.as_deref()),
@@ -143,75 +227,31 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
         DbValue::Integer(record.assistant_count),
         DbValue::Integer(record.tool_result_count),
         DbValue::Integer(record.image_count),
-        DbValue::Text(record.prompt),
-        DbValue::Text(record.request_tail),
-        DbValue::Text(record.answer),
-        DbValue::Text(record.tool_names),
-        DbValue::Text(search_text),
-    ];
+        DbValue::Text(record.prompt.clone()),
+        DbValue::Text(record.request_tail.clone()),
+        DbValue::Text(record.answer.clone()),
+        DbValue::Text(record.tool_names.clone()),
+        DbValue::Text(search_text(record)),
+    ]
+}
 
-    let conn = store.write().await;
-    conn.begin_immediate().await?;
-    let result = async {
-        conn.execute(
-            r#"
-            INSERT INTO records (
-                Time, TimeMs, IP, Method, Endpoint, Type, Model, Backend,
-                SessionId, ParentSessionId, RequestId, SessionAffinity, UserAgent, ClientName, ClientVersion, ApiKey,
-                Status, Error, RetryCount, FinishReason,
-                LatencyMs, TtftMs, UpstreamMs, StreamMs,
-                CompletionTokens, PromptTokens, TotalTokens, Tool, Multimodal,
-                RequestBytes, ResponseBytes, PromptBytes, RequestTailBytes, AnswerBytes,
-                MessageCount, SystemCount, ToolCount, AssistantCount, ToolResultCount, ImageCount,
-                Prompt, RequestTail, Answer, ToolNames, SearchText
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
-            )
-            "#,
-            params,
-        )
-        .await?;
-
-        let record_id = conn.last_insert_rowid();
-        conn.execute(
-            r#"
-            INSERT INTO payloads (
-                record_id, codec, dict_id,
-                request, response, headers,
-                request_raw_len, response_raw_len, headers_raw_len
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            vec![
-                DbValue::Integer(record_id),
-                DbValue::Text(req.codec.clone()),
-                opt_text(req.dict_id.as_deref()),
-                DbValue::Blob(req.bytes.clone()),
-                DbValue::Blob(resp.bytes.clone()),
-                DbValue::Blob(hdr.bytes.clone()),
-                DbValue::Integer(req.raw_len),
-                DbValue::Integer(resp.raw_len),
-                DbValue::Integer(hdr.raw_len),
-            ],
-        )
-        .await?;
-        Ok::<(), DbError>(())
-    }
-    .await;
-
-    match result {
-        Ok(()) => conn.commit().await,
-        Err(error) => {
-            let _ = conn.rollback().await;
-            Err(error)
-        }
-    }
+pub(crate) fn payload_params(
+    record_id: i64,
+    request: &crate::db::payload::Compressed,
+    response: &crate::db::payload::Compressed,
+    headers: &crate::db::payload::Compressed,
+) -> Vec<DbValue> {
+    vec![
+        DbValue::Integer(record_id),
+        DbValue::Text(request.codec.clone()),
+        opt_text(request.dict_id.as_deref()),
+        DbValue::Blob(request.bytes.clone()),
+        DbValue::Blob(response.bytes.clone()),
+        DbValue::Blob(headers.bytes.clone()),
+        DbValue::Integer(request.raw_len),
+        DbValue::Integer(response.raw_len),
+        DbValue::Integer(headers.raw_len),
+    ]
 }
 
 #[derive(Debug, Default)]

@@ -1,6 +1,7 @@
 use crate::client::client_manager::ClientManager;
 use crate::config::config_manager::ConfigManager;
 use crate::db::store::AuditStore;
+use crate::db::writer::AuditWriter;
 use crate::services::dispatcher::DispatcherService;
 use crate::services::models_cache::ModelsCache;
 use chrono::Local;
@@ -15,6 +16,7 @@ pub struct AppState {
     /// Active audit database. Rotation swaps the `Arc`; writers hold the read
     /// guard for the duration of a write so rotation cannot rename mid-write.
     pub db: RwLock<Arc<AuditStore>>,
+    pub audit_writer: Arc<AuditWriter>,
     pub db_rotation_lock: Mutex<()>,
     pub models_cache: ModelsCache,
     pub archive_registry: Arc<crate::db::archive::ArchiveRegistry>,
@@ -27,6 +29,7 @@ impl AppState {
         config_manager: Arc<ConfigManager>,
         client_manager: Arc<ClientManager>,
         db: Arc<AuditStore>,
+        audit_writer: Arc<AuditWriter>,
     ) -> Self {
         let dispatcher_service =
             DispatcherService::new(config_manager.clone(), client_manager.clone());
@@ -39,6 +42,7 @@ impl AppState {
             client_manager,
             dispatcher_service,
             db: RwLock::new(db),
+            audit_writer,
             db_rotation_lock: Mutex::new(()),
             models_cache: ModelsCache::new(),
             archive_registry,

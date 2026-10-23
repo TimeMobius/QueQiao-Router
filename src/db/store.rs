@@ -132,9 +132,8 @@ impl AuditStore {
     /// periodic checkpoint task.
     pub async fn checkpoint_truncate(&self) -> Result<(), DbError> {
         let conn = self.write().await;
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.query("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
             .await?;
-        conn.cacheflush()?;
         Ok(())
     }
 }
@@ -179,3 +178,36 @@ pub async fn pragma_i64(conn: &DbConn, name: &str) -> Result<i64, DbError> {
 
 // Re-export commonly used engine items so call sites import one module.
 pub use engine::{DbError as StoreError, Row as StoreRow};
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::db::engine::Value;
+
+    #[tokio::test]
+    async fn checkpoint_truncate_succeeds() {
+        let path = std::env::temp_dir().join(format!(
+            "qq-checkpoint-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = AuditStore::open(&path, false, Duration::from_secs(5))
+            .await
+            .unwrap();
+        store
+            .execute(
+                "INSERT INTO records (Time, TimeMs, Model) VALUES (?, ?, ?)",
+                vec![
+                    Value::Text("x".into()),
+                    Value::Integer(1),
+                    Value::Text("m".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        store.checkpoint_truncate().await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+}

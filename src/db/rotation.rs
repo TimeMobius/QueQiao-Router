@@ -117,10 +117,11 @@ async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
         );
     }
 
-    // 写锁会等待所有在途写入（它们持有读锁直到提交），并阻塞新的写入。
-    let mut guard = app_state.db.write().await;
-    if let Err(e) = guard.checkpoint_truncate().await {
-        warn!("WAL checkpoint before rotation failed: {e}");
+    let old_store = app_state.active_db().await;
+    let writer = app_state.audit_writer.clone();
+    if let Err(e) = writer.seal().await {
+        error!("Failed to seal audit writer before rotation: {e}");
+        return;
     }
 
     if let Err(e) = fs::rename(&db_path, &archive_path) {
@@ -130,6 +131,9 @@ async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
             archive_path.display(),
             e
         );
+        if let Err(resume_error) = writer.resume(old_store).await {
+            error!("Failed to resume audit writer after failed rotation: {resume_error}");
+        }
         return;
     }
     info!("Database archived successfully.");
@@ -137,13 +141,18 @@ async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
     info!("Re-initializing audit database after rotation.");
     match crate::db::init_db().await {
         Ok(new_db) => {
-            *guard = new_db;
-            let now_month = yyyymm(Local::now());
-            app_state.active_yyyymm.store(now_month, Ordering::Release);
-            app_state
-                .next_month_boundary_ms
-                .store(next_month_boundary_ms(now_month), Ordering::Release);
-            info!("Audit database re-initialized successfully.");
+            *app_state.db.write().await = new_db.clone();
+            match writer.resume(new_db).await {
+                Ok(()) => {
+                    let now_month = yyyymm(Local::now());
+                    app_state.active_yyyymm.store(now_month, Ordering::Release);
+                    app_state
+                        .next_month_boundary_ms
+                        .store(next_month_boundary_ms(now_month), Ordering::Release);
+                    info!("Audit database re-initialized successfully.");
+                }
+                Err(e) => error!("Failed to resume audit writer after rotation: {e}"),
+            }
         }
         Err(e) => {
             error!(

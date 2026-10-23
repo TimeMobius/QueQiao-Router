@@ -31,7 +31,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .allow_origin(Any)
         .allow_headers(Any);
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health::health_check))
         .route("/favicon.ico", get(favicon_redirect))
         .route("/v1/models", get(models::get_models))
@@ -53,7 +53,13 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             post(audio::handle_audio_translation),
         )
         .merge(create_metrics_router())
-        .nest("/dashboard", dashboard::dashboard_router())
+        .nest("/dashboard", dashboard::dashboard_router());
+
+    if std::env::var("ENABLE_TEST_API").as_deref() == Ok("1") {
+        router = router.nest("/internal/test", crate::handlers::test_api::test_router());
+    }
+
+    router
         .layer(cors)
         .layer(axum_middleware::from_fn(metrics_middleware))
         .with_state(app_state)

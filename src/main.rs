@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use queqiao_router::{client, config, db, middleware, routes, state};
 
 use client::client_manager::ClientManager;
+use db::writer::{AuditWriter, WriterConfig};
 use db::{check_and_rotate, init_db, init_rotation_state};
 use state::app_state::AppState;
 
@@ -20,6 +21,26 @@ mod check_api_auth {
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
 
 fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -51,9 +72,17 @@ fn main() {
         let db = init_db()
             .await
             .expect("Failed to initialize audit database");
-        println!("Audit database initialized.");
+        let audit_writer = AuditWriter::start(db.clone(), WriterConfig::default())
+            .await
+            .expect("Failed to start audit writer");
+        println!("Audit database and writer initialized.");
 
-        let app_state = Arc::new(AppState::new(config_manager, client_manager, db));
+        let app_state = Arc::new(AppState::new(
+            config_manager,
+            client_manager,
+            db,
+            audit_writer,
+        ));
         println!("Application state constructed.");
 
         init_rotation_state(&app_state).await;
@@ -114,11 +143,14 @@ fn main() {
         let listener = TcpListener::bind(addr).await.unwrap();
         println!("listening on {}", addr);
         tracing::info!("listening on {}", addr);
+        let shutdown_state = app_state.clone();
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+        shutdown_state.audit_writer.shutdown().await;
     });
 }
