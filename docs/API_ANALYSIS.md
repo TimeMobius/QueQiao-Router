@@ -235,7 +235,7 @@
   `TimeMs=NULL`。汇总、跨分片 DISTINCT 和分位直方图对完整归档也省略时间上下界，
   对边界分片仍精确筛选。全局并发由 `SHARD_CONCURRENCY = 8` 封顶。
 - 结果带 **30min 进程内缓存**，键为规范化查询串；缓存有界（最多 256 条，插入时清理过期项）。
-- 趋势桶标签使用 SQLite `strftime(..., 'localtime')`，与服务器本地时区一致。
+- 趋势桶标签使用 Turso 兼容的 `strftime(..., 'localtime')`，与服务器本地时区一致。
 - **不使用 WAL**：默认 `delete` journal 下读写提交仍互斥，长时间大范围扫描会短暂
   阻塞日志写入的提交（`busy_timeout` 内等待）。NFS 上不可启用 WAL，因此大范围分析
   建议避开写入高峰。

@@ -1,4 +1,5 @@
 use axum::{
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -13,7 +14,8 @@ pub fn create_metrics_router() -> Router<Arc<AppState>> {
     Router::new().route("/metrics", get(metrics_endpoint))
 }
 
-async fn metrics_endpoint() -> Response {
+async fn metrics_endpoint(State(app_state): State<Arc<AppState>>) -> Response {
+    crate::metrics::db_writer::update(&app_state.audit_writer.snapshot());
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
 

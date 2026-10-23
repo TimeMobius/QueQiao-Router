@@ -8,7 +8,7 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
 
 项目的核心目标是把多个异构的模型服务统一成一个稳定、可观测、易运维的访问层。它可以集中管理 OpenAI、Azure、Anthropic、DeepSeek、vLLM、Llama.cpp 等不同类型的后端，并通过 OpenAI 兼容接口、Anthropic Messages API 以及部分 vLLM/Rerank 接口对外提供服务。后端可以使用关键字匹配或精确匹配接收指定模型请求，也可以配置权重、确定性路由和故障转移策略。
 
-一次请求通常会经过以下链路：HTTP API 接收与校验 → 请求预处理和参数合并 → 后端选择与故障转移 → 上游请求转发 → 流式或非流式响应转换 → 指标上报与审计记录。对于流式响应，网关能够在保持 SSE 传输的同时累计 usage、推理内容和工具调用信息，并将完整结果异步写入 SQLite，方便后续排查和统计。
+一次请求通常会经过以下链路：HTTP API 接收与校验 → 请求预处理和参数合并 → 后端选择与故障转移 → 上游请求转发 → 流式或非流式响应转换 → 指标上报与审计记录。对于流式响应，网关能够在保持 SSE 传输的同时累计 usage、推理内容和工具调用信息，并将完整结果异步写入 Turso 审计库，方便后续排查和统计。
 
 除了请求转发，QueQiao-Router 还提供思考格式归一化、消息清洗、多模态请求转发、配置热加载、Prometheus 指标和按月轮转的审计存储。因此，它适合用作个人或团队的统一模型入口，也适合部署在内部模型集群、多个云厂商后端或需要逐步迁移模型服务的生产环境中。
 
@@ -43,7 +43,7 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
 - **全接口 Metrics 覆盖**: `/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/completions` 均有独立的 Token 用量和延迟指标上报。
 - **流式审计**: 即使是 SSE 流式响应，也能完整记录 Token 消耗 (`usage`)、推理过程 (`reasoning_content`) 和工具调用 (`tool_calls`)。
 - **Token 统计**: 兼容 OpenAI 标准 `stream_options` 与 Anthropic `input_tokens`/`output_tokens`，自动归一化已支持的上游 Token 统计格式。
-- **请求回放**: 完整的请求体和响应体（包括流式拼接后的结果）异步写入 SQLite 数据库，支持按月自动轮转归档。
+- **请求回放**: 完整的请求体和响应体（包括流式拼接后的结果）异步写入 Turso 审计库，支持按月自动轮转归档。
 - **统一错误日志**: 无论上游返回何种错误格式，网关层统一标准化错误响应，确保日志与客户端接收到的错误信息完全一致 (422/500)。
 - **Prometheus 监控**: 内置 `/metrics` 端点，提供请求总数、活跃请求数、成功率、延迟直方图等关键指标。
 
@@ -110,7 +110,7 @@ docker run -d \
   ghcr.io/timemobius/queqiao-router:b626
 ```
 
-> **数据库路径说明**: 源码默认 `RECD_PATH=sqlite:./record.db`（数据库文件在运行目录），而 Docker 镜像默认设为 `sqlite:./logs/record.db`（写入挂载的 logs 卷）。若使用 Docker，建议将 logs 目录挂载为主机持久化路径，或显式设置 `RECD_PATH` 环境变量指向挂载路径，避免容器重启后数据丢失。
+> **数据库路径说明**: 源码默认 `RECD_PATH=./record.db`（数据库文件在运行目录，兼容 `sqlite:` 前缀），而 Docker 镜像默认设为 `sqlite:./logs/record.db`（写入挂载的 logs 卷）。若使用 Docker，建议将 logs 目录挂载为主机持久化路径，或显式设置 `RECD_PATH` 环境变量指向挂载路径，避免容器重启后数据丢失。
 
 ---
 
@@ -119,8 +119,13 @@ docker run -d \
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `SERVER_PORT` | `8000` | 服务监听端口 |
-| `RECD_PATH` | `sqlite:./record.db` | SQLite 数据库连接字符串；Docker 镜像默认为 `sqlite:./logs/record.db` |
+| `RECD_PATH` | `sqlite:./record.db` | 审计库路径（兼容 `sqlite:` 前缀）；Docker 镜像默认为 `sqlite:./logs/record.db` |
 | `DB_ROTATION_CHECK_INTERVAL_SEC` | `60` | 数据库轮转检查间隔（秒） |
+| `DB_FTS_OPTIMIZE_INTERVAL_SEC` | `21600` | FTS `OPTIMIZE INDEX` 间隔（秒）；0 关闭 |
+| `AUDIT_BATCH_SIZE` | `200` | 审计写批次行数 |
+| `AUDIT_QUEUE_CAPACITY` | `10000` | 审计写队列容量 |
+| `AUDIT_FTS_PROMPT_BYTES` / `_TAIL_BYTES` / `_ANSWER_BYTES` | `512` | 检索索引每段截断字节；0 为全文（详见 `docs/WRITE_BATCHING.md`） |
+| `ENABLE_TEST_API` | `false` | 启用 `/internal/test/*`（仅测试环境） |
 | `RUST_LOG` | `info` | 日志级别 (`error`, `warn`, `info`, `debug`, `trace`) |
 | `TZ` | 镜像默认（通常为 UTC） | 日志文件名轮转与所有日志时间戳均跟随该时区；部署时应设为宿主机时区（如 `TZ=Asia/Shanghai`），或挂载 `-v /etc/localtime:/etc/localtime:ro` 自动跟随宿主机 |
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
@@ -264,7 +269,7 @@ cargo test
 本项目已在代码层面做了深度优化 (SIMD, Rayon, 异步流式处理)，建议在生产环境配置以下参数：
 
 - **文件描述符**: 确保宿主机 `ulimit -n` 大于 65535。
-- **数据库**: `record.db` (SQLite) 应置于高性能 SSD 上以避免 I/O 瓶颈。
+- **数据库**: `record.db`（Turso）应置于高性能 SSD 上以避免 I/O 瓶颈。
 - **日志级别**: 设置 `RUST_LOG=info` 以获取关键审计信息，`error` 仅记录故障。
 - **连接池**: reqwest 客户端已内置 TCP keepalive（30s）、空闲连接存活（15s）、每 host 最大空闲连接数（64），并可通过顶层 `connection_pool` 配置项调整这些参数（修改后需重启服务，共享 HTTP 客户端仅在启动时构建一次）。
 
@@ -277,14 +282,14 @@ cargo test
   - `error*.log`: 错误请求访问日志（包含请求体，仅在 4xx/5xx 时记录）
   - `system*.log`: 系统运行日志（受 `RUST_LOG` 控制）
 - **日志保留**: info/system 日志默认保留 10 天，error 日志默认保留 30 天。
-- **数据库**: SQLite 文件路径由 `RECD_PATH` 控制（见环境变量）。完整审计数据（IP、请求体、响应体、Token 统计）异步写入数据库，支持按月自动轮转。
+- **数据库**: Turso 数据库文件路径由 `RECD_PATH` 控制（见环境变量）。完整审计数据（IP、请求体、响应体、Token 统计）异步写入数据库，支持按月自动轮转。
 - **Token 脱敏**: 正常日志中 Token 仅显示前 8 字符；设置 `LOG_FULL_TOKEN_ON_ERROR=true` 后错误日志记录完整 Token 以便排查。
 
 ---
 
 ## 📚 接口与数据库文档
 
-对外模型接口、面板日志检索接口、日志分析接口，以及 SQLite 审计库的表结构与索引，集中
+对外模型接口、面板日志检索接口、日志分析接口，以及 Turso 审计库的表结构与索引，集中
 存放在本仓库的 `docs/` 目录（随代码一起提交），入口见其中的 `README.md`。本 README 只
 保留功能、部署与配置介绍。
 

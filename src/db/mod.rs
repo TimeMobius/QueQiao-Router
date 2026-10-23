@@ -1,10 +1,8 @@
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{info, warn};
-
-use crate::config::types::Config;
 
 pub mod archive;
 pub mod engine;
@@ -21,94 +19,6 @@ pub mod turso_schema;
 pub mod writer;
 
 pub use rotation::{check_and_rotate, init_rotation_state, rotate_if_needed};
-
-/// 初始化数据库连接池
-pub async fn init_db_pool(_config: &Config) -> Result<SqlitePool, sqlx::Error> {
-    let database_url =
-        std::env::var("RECD_PATH").unwrap_or_else(|_| "sqlite:./record.db".to_string());
-    init_db_pool_with_url(&database_url).await
-}
-
-/// 运行期写池（审计落库）的统一配置，三个构建点（首次初始化、遗留迁移失败后新建、
-/// 迁移成功后重开）必须保持一致，由 `rotate_if_needed` 触发的轮转重建也走同一入口。
-///
-/// - `max_connections(1)`：SQLite 同一时刻只允许一个写者，DELETE 日志模式下多个写事务
-///   互相排队等文件锁只会放大 SQLITE_BUSY 与池耗尽（`pool timed out`）。写池因此收敛为
-///   单连接，把所有审计写入在进程内串行化（FIFO 排队），消除写-写锁竞争。
-/// - `busy_timeout` 由 sqlx 默认 5s 提升到 30s：写事务提交需要 EXCLUSIVE 锁，会被查询池
-///   持有 SHARED 锁的慢读（COUNT/FTS/facets 等）阻塞；宁可等它读完，也不要立刻报
-///   `database is locked` 丢掉审计记录。
-/// - `acquire_timeout` 由默认 30s 提升到 60s：单连接串行化后，突发流量下的落库任务在
-///   池层面排队，单个任务持有连接的时间 ≈ 一次写入 + 至多一次 30s 锁等待，超时必须
-///   放宽到足以排空典型突发，否则尾部任务仍会 `pool timed out`。
-const WRITE_POOL_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
-const WRITE_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
-
-fn write_pool_options() -> SqlitePoolOptions {
-    SqlitePoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(WRITE_POOL_ACQUIRE_TIMEOUT)
-}
-
-fn write_pool_connect_options(
-    db_path: &str,
-    create_if_missing: bool,
-) -> Result<SqliteConnectOptions, sqlx::Error> {
-    Ok(SqliteConnectOptions::from_str(db_path)?
-        .create_if_missing(create_if_missing)
-        .busy_timeout(WRITE_POOL_BUSY_TIMEOUT))
-}
-
-async fn init_db_pool_with_url(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let db_path = database_url
-        .strip_prefix("sqlite:")
-        .unwrap_or(&database_url);
-
-    // 连接前判断文件是否已存在：全新库（本次刚创建）必须走普通初始化，
-    // 只有"已存在且仍是 V0 结构"的老库才需要阻塞式 legacy 数据迁移。
-    let db_exists = std::path::Path::new(db_path).exists();
-    let mut pool = write_pool_options()
-        .connect_with(write_pool_connect_options(db_path, true)?)
-        .await?;
-
-    // 兼容测试套件的 12 列基表；已有库不会重复创建。
-    ensure_base_records_table(&pool).await?;
-
-    let existing = schema::table_columns(&pool, "records").await?;
-
-    // V0 遗留活跃库（缺 TimeMs）：迁移成功才继续使用原文件；失败则隔离原文件，
-    // 让服务用全新 active 库启动，避免容器因同一个坏库无限重启阻塞。
-    if db_exists && is_legacy_schema(&existing) {
-        info!(
-            "Active database '{}' is V0 (no TimeMs); running blocking legacy migration...",
-            db_path
-        );
-        pool.close().await;
-        if let Err(error) = migrate_database_or_quarantine(Path::new(db_path)).await {
-            if is_sqlite_retryable_error(&error) {
-                return Err(error);
-            }
-            warn!(
-                "Active database legacy migration failed for '{}': {}; quarantining and creating a fresh active database",
-                db_path, error
-            );
-            pool = write_pool_options()
-                .connect_with(write_pool_connect_options(db_path, true)?)
-                .await?;
-            ensure_base_records_table(&pool).await?;
-        } else {
-            info!("Active database legacy migration completed.");
-            pool = write_pool_options()
-                .connect_with(write_pool_connect_options(db_path, false)?)
-                .await?;
-        }
-    }
-
-    schema::migrate(&pool).await?;
-
-    info!("Database at '{}' initialized successfully", db_path);
-    Ok(pool)
-}
 
 pub(crate) async fn migrate_database_in_place(path: &Path) -> Result<(), sqlx::Error> {
     let path_str = path.to_string_lossy();
@@ -173,174 +83,6 @@ pub(crate) fn is_sqlite_retryable_error(error: &sqlx::Error) -> bool {
     }
 }
 
-async fn ensure_base_records_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Time TEXT,
-            IP TEXT,
-            Model TEXT,
-            Type TEXT,
-            CompletionTokens INTEGER,
-            PromptTokens INTEGER,
-            TotalTokens INTEGER,
-            Tool BOOLEAN,
-            Multimodal BOOLEAN,
-            Headers TEXT,
-            Request TEXT,
-            Response TEXT
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// V0 遗留 schema 判定：`records` 表缺少 `TimeMs` 列。
-/// 仅凭列判断不足以区分全新库与老 V0 库，调用方还需叠加文件存在性判断。
-fn is_legacy_schema(columns: &[String]) -> bool {
-    !columns.iter().any(|c| c == "TimeMs")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{init_db_pool_with_url, is_legacy_schema};
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use sqlx::Row;
-    use std::str::FromStr;
-
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        std::env::temp_dir().join(format!("qq_db_{}_{}_{}", std::process::id(), tag, nanos))
-    }
-
-    #[test]
-    fn legacy_schema_has_no_time_ms() {
-        let v0 = ["id", "Time", "IP", "Model", "Type", "Request", "Response"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        assert!(is_legacy_schema(&v0));
-    }
-
-    #[test]
-    fn modern_schema_has_time_ms() {
-        let modern = ["id", "Time", "TimeMs", "Prompt", "ApiKey"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        assert!(!is_legacy_schema(&modern));
-    }
-
-    // 钉住写池单连接串行化：第二个 acquire 必须等第一个释放，
-    // 防止未来把 max_connections 改回多连接后重新引入写-写锁竞争。
-    #[tokio::test]
-    async fn write_pool_serializes_to_single_connection() {
-        let dir = temp_dir("write_pool_single_conn");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("record.db");
-        let url = format!("sqlite:{}", path.display());
-        let pool = init_db_pool_with_url(&url).await.unwrap();
-
-        let first = pool.acquire().await.unwrap();
-        let second = pool.acquire();
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), second).await;
-        assert!(
-            waited.is_err(),
-            "second acquire must wait for the single write connection"
-        );
-        drop(first);
-        pool.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn quarantines_failed_active_migration_and_starts_fresh() {
-        let dir = temp_dir("active_quarantine");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("record.db");
-        let url = format!("sqlite:{}", path.display());
-        let options = SqliteConnectOptions::from_str(&url)
-            .unwrap()
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE records (Time TEXT PRIMARY KEY, IP TEXT, Model TEXT, Request TEXT, Response TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
-
-        let fresh = init_db_pool_with_url(&url).await.unwrap();
-        let columns = sqlx::query("PRAGMA table_info(records)")
-            .fetch_all(&fresh)
-            .await
-            .unwrap();
-        let names: Vec<String> = columns.iter().map(|row| row.get("name")).collect();
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&fresh)
-            .await
-            .unwrap();
-
-        assert!(path.exists());
-        assert!(dir.join("record.db.bak").exists());
-        assert!(names.iter().any(|name| name == "TimeMs"));
-        assert_eq!(version, crate::db::schema::SCHEMA_VERSION);
-
-        fresh.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn keeps_locked_archive_in_place() {
-        let dir = temp_dir("locked_archive");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("record_202608.db");
-        let url = format!("sqlite:{}", path.display());
-        let options = SqliteConnectOptions::from_str(&url)
-            .unwrap()
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE records (id INTEGER PRIMARY KEY, Time TEXT, Request TEXT, Response TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut transaction = pool.begin().await.unwrap();
-        sqlx::query("INSERT INTO records (Time, Request, Response) VALUES ('now', '{}', '{}')")
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-
-        let result = super::migrate_database_or_quarantine(&path).await;
-
-        let error = result.expect_err("the active transaction must hold a write lock");
-        assert!(super::is_sqlite_retryable_error(&error));
-        assert!(path.exists());
-        assert!(!dir.join("record_202608.db.bak").exists());
-
-        transaction.rollback().await.unwrap();
-        pool.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// Open the active audit database with the v8 schema.
 pub async fn init_db() -> Result<std::sync::Arc<store::AuditStore>, engine::DbError> {
     let path = resolve_db_path();
@@ -395,18 +137,56 @@ fn unique_backup_path(path: &Path) -> PathBuf {
     candidate
 }
 
-/// 为 dashboard 只读分析查询开第二个连接池，与写池分离，避免大表聚合占满
-/// 写池连接后饿死请求日志写入。
-///
-/// 不做 `read_only(true)`：只读连接无法在 NFS 上恢复热日志（hot journal）。
-/// 也不设置 `journal_mode`：默认 `delete` 下读写提交互斥，写池与查询池各自独立。
-pub async fn init_query_pool() -> Result<SqlitePool, sqlx::Error> {
-    let path = resolve_db_path();
-    let path_str = path.to_string_lossy();
-    let options = SqliteConnectOptions::from_str(&path_str)?.create_if_missing(false);
-    SqlitePoolOptions::new()
-        .max_connections(16)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect_with(options)
+#[cfg(test)]
+mod tests {
+    use super::migrate_database_or_quarantine;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("qq_db_{}_{}_{}", std::process::id(), tag, nanos))
+    }
+
+    #[tokio::test]
+    async fn keeps_locked_archive_in_place() {
+        let dir = temp_dir("locked_archive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record_202608.db");
+        let url = format!("sqlite:{}", path.display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE records (id INTEGER PRIMARY KEY, Time TEXT, Request TEXT, Response TEXT)",
+        )
+        .execute(&pool)
         .await
+        .unwrap();
+
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO records (Time, Request, Response) VALUES ('now', '{}', '{}')")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
+        let result = migrate_database_or_quarantine(&path).await;
+
+        let error = result.expect_err("the active transaction must hold a write lock");
+        assert!(super::is_sqlite_retryable_error(&error));
+        assert!(path.exists());
+        assert!(!dir.join("record_202608.db.bak").exists());
+
+        transaction.rollback().await.unwrap();
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

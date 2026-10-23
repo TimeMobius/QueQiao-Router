@@ -1,3 +1,4 @@
+use crate::db::engine::DbError;
 use crate::models::AccessLogMeta;
 use axum::{
     http::StatusCode,
@@ -25,7 +26,7 @@ pub fn build_error_body(message: &str, error_type: &str) -> Value {
 #[derive(Debug)]
 pub enum AppError {
     ReqwestError(reqwest::Error),
-    DatabaseError(sqlx::Error),
+    DatabaseError(DbError),
     ClientNotFound(String),
     UpstreamError(String),
     InvalidHeader(String),
@@ -128,8 +129,8 @@ impl From<reqwest::Error> for AppError {
     }
 }
 
-impl From<sqlx::Error> for AppError {
-    fn from(err: sqlx::Error) -> Self {
+impl From<DbError> for AppError {
+    fn from(err: DbError) -> Self {
         AppError::DatabaseError(err)
     }
 }

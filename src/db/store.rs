@@ -199,6 +199,12 @@ impl AuditStore {
         self.write().await.execute(sql, params).await
     }
 
+    /// Merge FTS segments after runtime writes; keeps query latency bounded.
+    pub async fn optimize_fts(&self) -> Result<(), DbError> {
+        let conn = self.write().await;
+        conn.execute_batch("OPTIMIZE INDEX").await
+    }
+
     /// Build the FTS index after a bulk load (deferred-FTS mode).
     pub async fn create_fts_index(&self) -> Result<(), DbError> {
         let conn = self.write().await;
@@ -285,6 +291,38 @@ mod checkpoint_tests {
             .await
             .unwrap();
         store.checkpoint_truncate().await.unwrap();
+        store.optimize_fts().await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_v7_without_touching_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "qq-probe-v7-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path, OpenOptions::default()).await.unwrap();
+        db.connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE records (id INTEGER PRIMARY KEY, Time TEXT, Headers TEXT);\
+                 PRAGMA user_version=7",
+            )
+            .await
+            .unwrap();
+        drop(db);
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(probe_schema(&path).await.unwrap(), SchemaKind::V7));
+        let error = match AuditStore::open(&path, false, Duration::from_secs(1)).await {
+            Ok(_) => panic!("writable open of a v7 database must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("v7"), "{error}");
+        assert_eq!(before, std::fs::read(&path).unwrap());
         let _ = std::fs::remove_file(&path);
     }
 }

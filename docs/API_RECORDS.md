@@ -25,8 +25,9 @@ metrics、不写访问日志，可安全频繁轮询。
 | `cursor` | string | — | 翻页游标，对客户端**不透明**：单月为 `"<TimeMs>:<id>"`，跨月为 `"<TimeMs>:<id>:<shard>"` |
 | `limit` | i64 | — | 每页条数，默认 50，范围 1–500 |
 
-`q` 按长度分支：**≥3 字符** 走 FTS5 trigram 子串索引（快）；**<3 字符** 退化为三列
-`LIKE '%x%'` 全表扫描，建议前端限制最少 3 字符，或同时附带 `from`/`to` 收窄范围。
+`q` 按长度分支：**≥2 字符** 走 Turso 单列 ngram FTS + `instr` 残余谓词；**1 字符** 走
+`SearchText LIKE '%x%'`。多词按空白切分后 AND。FTS 索引默认只覆盖每段 512 字节
+（`AUDIT_FTS_*`），完整正文仍保存在 `Prompt/RequestTail/Answer`；长尾词可设 0 关闭截断。
 
 ### ID 字段与请求头对应关系
 
@@ -174,10 +175,10 @@ UTC 偏移（含夏令时）回填为真实 epoch 毫秒，并把遗留明文 `R
 | `from` / `to` | `idx_records_time`（覆盖索引，兼顾倒序与统计） |
 | `type` / `backend` / `apikey` | 等值索引 |
 | `model` / `ip` | 前缀范围索引（`COLLATE NOCASE`） |
-| `q`（≥3 字） | FTS5 trigram |
-| `session_id` / `parent_session_id` / `request_id` / `client` / `status` / `q`（<3 字） | **无索引，扫描** |
+| `q`（≥2 字） | `records_fts`（ngram）+ `instr` 残余 |
+| `session_id` / `parent_session_id` / `request_id` / `client` / `status` / `q`（1 字） | **无索引，扫描** |
 
-- **前缀 ≠ 子串**：`model=pt` 不会命中 `gpt-4`；任意位置匹配请用 `q`（≥3 字）。
+- **前缀 ≠ 子串**：`model=pt` 不会命中 `gpt-4`；任意位置匹配请用 `q`（≥2 字）。
 - **`total` 是带上限的估算**，键集分页不依赖它；需要精确总数请自行带相同条件统计。
 - 前缀/范围条件会附加一次临时排序（范围扫描的固有代价），但候选集已被收窄，影响很小。
 - **详情接口返回完整明文 `apiKey`**（列表接口永不返回）。UI 默认脱敏需点击展开，接口本身

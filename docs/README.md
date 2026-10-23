@@ -10,7 +10,8 @@
 | [API_LLM.md](./API_LLM.md) | 对外模型接口（OpenAI 兼容、Anthropic Messages、vLLM 扩展） |
 | [API_RECORDS.md](./API_RECORDS.md) | 监控面板日志检索接口（`/dashboard/api/*`） |
 | [API_ANALYSIS.md](./API_ANALYSIS.md) | 日志聚合分析接口（`/dashboard/api/analysis*`） |
-| [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md) | SQLite 审计库表结构、索引、FTS、月度轮转与归档分片 |
+| [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md) | Turso v8 审计库：表结构、单列 ngram FTS、月度轮转与归档分片 |
+| [WRITE_BATCHING.md](./WRITE_BATCHING.md) | 审计写入批量化、吞吐数据、FTS 截断与维护参数 |
 
 ## 约定
 

@@ -129,6 +129,35 @@ fn main() {
             }
         });
 
+        let optimize_interval: u64 = std::env::var("DB_FTS_OPTIMIZE_INTERVAL_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(21_600);
+        if optimize_interval > 0 {
+            let optimize_state = app_state.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(optimize_interval));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let _lock = optimize_state.db_rotation_lock.lock().await;
+                    let store = optimize_state.active_db().await;
+                    let started = std::time::Instant::now();
+                    match store.optimize_fts().await {
+                        Ok(()) => tracing::info!(
+                            elapsed_ms =
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            "FTS index optimized"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, "FTS index optimization failed")
+                        }
+                    }
+                }
+            });
+        }
+
         let app = routes::create_router(app_state.clone()).layer(axum_middleware::from_fn(
             middleware::access_log::access_log_middleware,
         )); // Access Log 最外层
