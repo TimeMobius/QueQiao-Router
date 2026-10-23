@@ -50,6 +50,14 @@ fn main() {
         .unwrap();
 
     runtime.block_on(async {
+        if std::env::args().any(|arg| arg == "--migrate-db" || arg == "--verify-db") {
+            if let Err(error) = db::migrate::run_cli().await {
+                eprintln!("database migration failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+
         // Initialize tracing
         // 配置自定义的日志系统 (File + Console)
         let log_config = queqiao_router::logging::LogConfig::default();

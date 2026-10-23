@@ -10,6 +10,7 @@ pub mod archive;
 pub mod engine;
 pub mod extract;
 pub mod legacy;
+pub mod migrate;
 pub mod payload;
 pub mod records;
 pub mod records_query;
@@ -343,6 +344,22 @@ mod tests {
 /// Open the active audit database with the v8 schema.
 pub async fn init_db() -> Result<std::sync::Arc<store::AuditStore>, engine::DbError> {
     let path = resolve_db_path();
+    match migrate::detect_schema(&path).await? {
+        migrate::SchemaKind::V7 => {
+            return Err(engine::DbError::Shape(format!(
+                "legacy v7 audit database at '{}'; run: queqiao-router --migrate-db --from '{}' --to '{}.v8'",
+                path.display(),
+                path.display(),
+                path.display()
+            )))
+        }
+        migrate::SchemaKind::Newer(version) => {
+            return Err(engine::DbError::Shape(format!(
+                "audit database schema v{version} is newer than this binary (v8)"
+            )))
+        }
+        _ => {}
+    }
     let db = store::AuditStore::open(&path, false, Duration::from_secs(30)).await?;
     info!("Audit database at '{}' initialized (v8)", path.display());
     Ok(db)

@@ -110,6 +110,11 @@ pub async fn init_v8(conn: &DbConn) -> Result<(), DbError> {
 /// migration can load rows without per-row index maintenance and build it once.
 pub async fn init_v8_schema(conn: &DbConn, with_fts: bool) -> Result<(), DbError> {
     let version = pragma_i64(conn, "user_version").await?;
+    if version > SCHEMA_VERSION {
+        return Err(DbError::Shape(format!(
+            "audit database schema v{version} is newer than this binary (v{SCHEMA_VERSION})"
+        )));
+    }
     if version > 0 && version < SCHEMA_VERSION {
         return Err(DbError::Shape(format!(
             "legacy audit schema v{version} detected; run the v7 -> v8 migration instead of opening it directly"
@@ -120,15 +125,21 @@ pub async fn init_v8_schema(conn: &DbConn, with_fts: bool) -> Result<(), DbError
     if !existing.is_empty() {
         // v7 is identifiable by the dead compatibility columns.
         let mut has_headers = false;
+        let mut has_search = false;
         for row in &existing {
-            if row.get_opt_str(1)?.is_some_and(|name| name == "Headers") {
-                has_headers = true;
-                break;
+            if let Some(name) = row.get_opt_str(1)? {
+                has_headers |= name == "Headers";
+                has_search |= name == "SearchText";
             }
         }
         if has_headers {
             return Err(DbError::Shape(
                 "legacy v7 audit schema detected; run the v7 -> v8 migration".to_string(),
+            ));
+        }
+        if !has_search {
+            return Err(DbError::Shape(
+                "v8 audit database is missing SearchText; rebuild it with --migrate-db".to_string(),
             ));
         }
     }

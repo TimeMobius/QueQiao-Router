@@ -26,6 +26,63 @@ pub struct AuditStore {
     read_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaKind {
+    Empty,
+    V7,
+    V8,
+    Newer(i64),
+    Unknown,
+}
+
+/// Read-only schema probe. Never opens the file writable.
+pub async fn probe_schema(path: &Path) -> Result<SchemaKind, DbError> {
+    if !path.exists() {
+        return Ok(SchemaKind::Empty);
+    }
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return Ok(SchemaKind::Empty);
+    }
+    let db = Db::open(
+        path,
+        OpenOptions {
+            read_only: true,
+            index_method: true,
+            vacuum: false,
+            busy_timeout: Duration::from_secs(5),
+        },
+    )
+    .await?;
+    let conn = db.connect()?;
+    let version = pragma_i64(&conn, "user_version").await?;
+    let columns = conn.query("PRAGMA table_info(records)", Vec::new()).await?;
+    if columns.is_empty() {
+        return Ok(if version == 0 {
+            SchemaKind::Empty
+        } else {
+            SchemaKind::Unknown
+        });
+    }
+    let mut has_headers = false;
+    let mut has_search = false;
+    for row in &columns {
+        if let Some(name) = row.get_opt_str(1)? {
+            has_headers |= name == "Headers";
+            has_search |= name == "SearchText";
+        }
+    }
+    if has_headers {
+        return Ok(SchemaKind::V7);
+    }
+    if version > 8 {
+        return Ok(SchemaKind::Newer(version));
+    }
+    if has_search {
+        return Ok(SchemaKind::V8);
+    }
+    Ok(SchemaKind::Unknown)
+}
+
 impl AuditStore {
     /// Open a database. When writable, the v8 schema is created if the file is
     /// new; a legacy schema is rejected with a clear error instead of being
@@ -60,6 +117,26 @@ impl AuditStore {
             vacuum: false,
             busy_timeout,
         };
+        if !read_only && path.exists() {
+            match probe_schema(&path).await? {
+                SchemaKind::Empty | SchemaKind::V8 => {}
+                SchemaKind::V7 => {
+                    return Err(DbError::Shape(
+                        "legacy v7 audit database; run --migrate-db before opening it".to_string(),
+                    ))
+                }
+                SchemaKind::Newer(version) => {
+                    return Err(DbError::Shape(format!(
+                        "audit schema v{version} is newer than this binary"
+                    )))
+                }
+                SchemaKind::Unknown => {
+                    return Err(DbError::Shape(
+                        "unrecognized audit schema; refusing to open writable".to_string(),
+                    ))
+                }
+            }
+        }
         let db = Db::open(&path, opts).await?;
         let write_conn = db.connect()?;
 
