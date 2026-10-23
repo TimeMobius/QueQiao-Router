@@ -14,7 +14,12 @@ use crate::state::app_state::AppState;
 
 /// Per-upstream timeout for the `/v1/models` fetch (both TTL==0 and
 /// cache-leader refresh paths).
-const MODELS_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const MODELS_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on how long a follower waits for the leader's refresh. Slightly
+/// above `MODELS_FETCH_TIMEOUT` so a healthy leader always wins the race; the
+/// gap only matters if the refresh task itself is stuck.
+const LEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Short TTL used when re-serving a stale cached value after every upstream
 /// failed, so follow-up requests serve the stale value quickly and retry
@@ -224,7 +229,16 @@ pub async fn list_models(
 
     let (is_leader, inflight) = app_state.models_cache.begin_refresh(key);
     if !is_leader {
-        app_state.models_cache.wait_for_leader(key, &inflight).await;
+        let waited = tokio::time::timeout(
+            LEADER_WAIT_TIMEOUT,
+            app_state.models_cache.wait_for_leader(key, &inflight),
+        )
+        .await;
+        if waited.is_err() {
+            tracing::warn!(
+                "models refresh for generation {generation} did not finish within {LEADER_WAIT_TIMEOUT:?}; returning fallback"
+            );
+        }
         match app_state.models_cache.lookup(key) {
             CacheOutcome::Fresh(value) => return (StatusCode::OK, Json(value)),
             CacheOutcome::Empty => {
@@ -236,35 +250,50 @@ pub async fn list_models(
         return (StatusCode::BAD_GATEWAY, upstream_error_body());
     }
 
+    // The refresh runs in its own task so that dropping this handler future
+    // (client timeout / disconnect) neither cancels the upstream fetch nor
+    // strands the singleflight slot: the task owns the RAII guard and always
+    // releases the key, even on panic.
+    let cache = app_state.models_cache.clone();
+    let guard = cache.refresh_guard(key, inflight);
+    let clients = config.openai_clients.clone();
     let http_client = build_http_client();
     let key_str = credential_bytes.and_then(|b| String::from_utf8(b).ok());
-    let (aggregated, any_success) =
-        aggregate_models(&config.openai_clients, &http_client, key_str).await;
+    let ttl = Duration::from_secs(ttl_seconds);
 
-    if any_success {
-        app_state
-            .models_cache
-            .insert(key, aggregated.clone(), Duration::from_secs(ttl_seconds));
-        app_state.models_cache.end_refresh(key, &inflight);
-        return (StatusCode::OK, Json(aggregated));
-    }
+    let refresh: tokio::task::JoinHandle<Result<Value, ()>> = tokio::spawn(async move {
+        let _guard = guard;
+        let (aggregated, any_success) = aggregate_models(&clients, &http_client, key_str).await;
 
-    // All upstreams failed: never cache the empty aggregation.
-    tracing::warn!(
-        "all upstream /v1/models fetches failed for generation {generation}; serving stale cache or 502"
-    );
-    if let Some(previous) = app_state.models_cache.previous_value(key) {
-        // Stale fallback: re-insert with a short retry TTL so follow-up
-        // requests serve the stale value quickly and retry upstream at most
-        // every 30s.
-        app_state
-            .models_cache
-            .insert(key, previous.clone(), STALE_RETRY_TTL);
-        app_state.models_cache.end_refresh(key, &inflight);
-        return (StatusCode::OK, Json(previous));
+        if any_success {
+            cache.insert(key, aggregated.clone(), ttl);
+            return Ok(aggregated);
+        }
+
+        // All upstreams failed: never cache the empty aggregation.
+        tracing::warn!(
+            "all upstream /v1/models fetches failed for generation {generation}; serving stale cache or 502"
+        );
+        match cache.previous_value(key) {
+            Some(previous) => {
+                // Stale fallback: re-insert with a short retry TTL so follow-up
+                // requests serve the stale value quickly and retry upstream at
+                // most every 30s.
+                cache.insert(key, previous.clone(), STALE_RETRY_TTL);
+                Ok(previous)
+            }
+            None => Err(()),
+        }
+    });
+
+    match refresh.await {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)),
+        Ok(Err(())) => (StatusCode::BAD_GATEWAY, upstream_error_body()),
+        Err(join_err) => {
+            tracing::warn!("models refresh task for generation {generation} failed: {join_err}");
+            (StatusCode::BAD_GATEWAY, upstream_error_body())
+        }
     }
-    app_state.models_cache.end_refresh(key, &inflight);
-    (StatusCode::BAD_GATEWAY, upstream_error_body())
 }
 
 #[cfg(test)]

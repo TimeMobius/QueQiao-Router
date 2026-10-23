@@ -108,6 +108,22 @@ pub struct Inflight {
     done: std::sync::atomic::AtomicBool,
 }
 
+/// RAII owner of a singleflight leader slot.
+///
+/// Releases the slot on drop, so completion survives cancellation, panics and
+/// task aborts of whatever future happens to hold it.
+pub struct RefreshGuard {
+    cache: ModelsCache,
+    key: CacheKey,
+    inflight: Arc<Inflight>,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.cache.complete_refresh(self.key, &self.inflight);
+    }
+}
+
 /// Shared, cloneable, `Send + Sync` cache handle.
 #[derive(Clone)]
 pub struct ModelsCache {
@@ -198,12 +214,42 @@ impl ModelsCache {
 
     /// Mark a per-key refresh as complete and wake all waiters. The leader
     /// calls this exactly once before returning the final response.
+    ///
+    /// Prefer [`ModelsCache::refresh_guard`] in async code: a plain call can be
+    /// skipped when the leader's future is dropped (client disconnect), which
+    /// would leave the key permanently "in flight".
     pub fn end_refresh(&self, key: CacheKey, inflight: &Inflight) {
-        inflight
+        self.complete_refresh(key, inflight);
+    }
+
+    /// Shared completion logic for [`ModelsCache::end_refresh`] and
+    /// [`RefreshGuard::drop`]. Idempotent: waiters are only woken while the
+    /// flag is still `false`.
+    fn complete_refresh(&self, key: CacheKey, inflight: &Inflight) {
+        if inflight
             .done
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         inflight.notify.notify_waiters();
         self.inflight.remove(&key);
+    }
+
+    /// Build an RAII guard that releases this key's singleflight slot when
+    /// dropped.
+    ///
+    /// The leader must hold the guard inside the detached refresh task (not in
+    /// the HTTP handler future) so that a client disconnect cannot strand the
+    /// key: dropping the handler future merely drops the `JoinHandle`, while
+    /// the task keeps running and its guard always fires on completion, panic,
+    /// or abort.
+    pub fn refresh_guard(&self, key: CacheKey, inflight: Arc<Inflight>) -> RefreshGuard {
+        RefreshGuard {
+            cache: self.clone(),
+            key,
+            inflight,
+        }
     }
 
     /// Wait for the leader of `key` to call `end_refresh`. Returns once the
@@ -384,6 +430,66 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_guard_releases_slot_and_wakes_waiters_on_drop() {
+        let cache = ModelsCache::new();
+        let k = key(21);
+        let (is_leader, inflight) = cache.begin_refresh(k);
+        assert!(is_leader);
+        let guard = cache.refresh_guard(k, inflight);
+
+        let (is_follower_leader, follower_inflight) = cache.begin_refresh(k);
+        assert!(!is_follower_leader);
+
+        let waiter = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.wait_for_leader(k, &follower_inflight).await }
+        });
+        tokio::task::yield_now().await;
+
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("dropping the guard must wake the waiter")
+            .unwrap();
+
+        let (is_leader_again, _) = cache.begin_refresh(k);
+        assert!(
+            is_leader_again,
+            "the singleflight slot must be free after the guard is dropped"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_refresh_releases_key_when_caller_is_cancelled() {
+        let cache = ModelsCache::new();
+        let k = key(22);
+        let (_, inflight) = cache.begin_refresh(k);
+        let guard = cache.refresh_guard(k, inflight);
+
+        let task_cache = cache.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            task_cache.insert(k, json!({"upstream": true}), Duration::from_secs(60));
+        });
+
+        let (is_leader, follower_inflight) = cache.begin_refresh(k);
+        assert!(!is_leader);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            cache.wait_for_leader(k, &follower_inflight),
+        )
+        .await
+        .expect("a detached refresh must always release the key");
+
+        match cache.lookup(k) {
+            CacheOutcome::Fresh(v) => assert_eq!(v, json!({"upstream": true})),
+            other => panic!("unexpected outcome: {:?}", other),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
