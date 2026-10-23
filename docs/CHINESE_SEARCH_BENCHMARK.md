@@ -2,6 +2,11 @@
 
 测试日期：2026-10-23（UTC）。
 
+> 后续变更：P1 批量写默认将 `SearchText` 按字段截断为 512/512/512（见
+> `docs/WRITE_BATCHING.md`）。本报告的查询结果基于当时未截断的目标库；
+> 常见词计数不变，但超出截断范围的词不再命中。要复现全量索引，请将
+> `AUDIT_FTS_PROMPT_BYTES/TAIL_BYTES/ANSWER_BYTES` 设为 0 后重建目标库。
+
 ## 数据与环境
 
 - 源库原件：`/tmp/record.db`，SQLite schema v7，108,895 条审计记录。
