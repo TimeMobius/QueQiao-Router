@@ -97,6 +97,10 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
     let req = crate::db::payload::compress(record.request.as_bytes());
     let resp = crate::db::payload::compress(record.response.as_bytes());
     let hdr = crate::db::payload::compress(record.headers.as_bytes());
+    let search_text = format!(
+        "{}\n{}\n{}",
+        record.prompt, record.request_tail, record.answer
+    );
 
     let params = vec![
         DbValue::Text(record.time),
@@ -143,6 +147,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
         DbValue::Text(record.request_tail),
         DbValue::Text(record.answer),
         DbValue::Text(record.tool_names),
+        DbValue::Text(search_text),
     ];
 
     let conn = store.write().await;
@@ -158,7 +163,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
                 CompletionTokens, PromptTokens, TotalTokens, Tool, Multimodal,
                 RequestBytes, ResponseBytes, PromptBytes, RequestTailBytes, AnswerBytes,
                 MessageCount, SystemCount, ToolCount, AssistantCount, ToolResultCount, ImageCount,
-                Prompt, RequestTail, Answer, ToolNames
+                Prompt, RequestTail, Answer, ToolNames, SearchText
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?,
@@ -167,7 +172,7 @@ pub async fn log_request(app_state: &Arc<AppState>, record: Record) -> Result<()
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?
+                ?, ?, ?, ?, ?
             )
             "#,
             params,

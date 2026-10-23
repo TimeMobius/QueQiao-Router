@@ -179,18 +179,50 @@ fn like_contains(value: &str) -> String {
 
 /// Build a Tantivy query with FTS5-compatible AND semantics.
 ///
-/// FTS5 joins bare terms with AND; Tantivy's default is OR, so every term is
-/// quoted and explicitly joined with AND.
+/// FTS5 joins bare terms with AND; Tantivy's default is OR. Terms stay bare
+/// (quoting a multi-char term turns it into a phrase, which the ngram tokenizer
+/// does not treat as a substring); special characters are backslash-escaped.
 fn fts_query(value: &str) -> String {
     let terms: Vec<String> = value
         .split_whitespace()
         .filter(|term| !term.is_empty())
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .map(escape_fts_term)
         .collect();
     if terms.is_empty() {
-        return "\"\"".to_string();
+        return String::new();
     }
     terms.join(" AND ")
+}
+
+fn escape_fts_term(term: &str) -> String {
+    let mut out = String::with_capacity(term.len());
+    for ch in term.chars() {
+        if matches!(
+            ch,
+            '+' | '-'
+                | '&'
+                | '|'
+                | '!'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '^'
+                | '"'
+                | '~'
+                | '*'
+                | '?'
+                | ':'
+                | '\\'
+                | '/'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Upper bound for a prefix scan: appending the largest code point sorts after every
@@ -277,10 +309,12 @@ pub(crate) fn build_filters(p: &ListParams) -> (String, Vec<Value>) {
     if let Some(v) = p.q.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
         let char_count = v.chars().count();
         if char_count >= 3 {
-            sql.push_str(
-                " AND fts_match(Prompt, RequestTail, Answer, Model, Status, Type, Backend, ?)",
-            );
+            sql.push_str(" AND fts_match(SearchText, ?)");
             binds.push(Value::Text(fts_query(v)));
+            for term in v.split_whitespace().filter(|term| !term.is_empty()) {
+                sql.push_str(" AND instr(lower(SearchText), ?) > 0");
+                binds.push(Value::Text(term.to_lowercase()));
+            }
         } else {
             let pat = like_contains(v);
             sql.push_str(
@@ -715,8 +749,8 @@ mod tests {
 
     #[test]
     fn fts_query_joins_terms_with_and() {
-        assert_eq!(fts_query("foo bar"), "\"foo\" AND \"bar\"");
-        assert_eq!(fts_query("a \"b\""), "\"a\" AND \"\"\"b\"\"\"");
-        assert_eq!(fts_query("   "), "\"\"");
+        assert_eq!(fts_query("foo bar"), "foo AND bar");
+        assert_eq!(fts_query("a b:c"), "a AND b\\:c");
+        assert_eq!(fts_query("   "), "");
     }
 }

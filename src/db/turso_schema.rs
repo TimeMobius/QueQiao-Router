@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS records (
     Prompt TEXT,
     RequestTail TEXT,
     Answer TEXT,
-    ToolNames TEXT
+    ToolNames TEXT,
+    SearchText TEXT
 )
 "#;
 
@@ -88,13 +89,13 @@ pub const INDEX_DDL: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_records_ip_time ON records(IP, TimeMs)",
 ];
 
-/// Tantivy-backed FTS index with filter columns pushed down.
+/// Tantivy-backed FTS index over the concatenated searchable text.
 ///
-/// `fts_match(Prompt, RequestTail, Answer, Model, Status, Type, Backend, ?)`
-/// can then evaluate `Model:gpt-4 AND Status:200` without a post-filter scan.
+/// A single-column index is deliberate: Turso's ngram tokenizer only behaves as
+/// a substring matcher for a one-column index; multi-column indexes fall back
+/// to token matching. `SearchText` is `Prompt || '\n' || RequestTail || '\n' || Answer`.
 pub const FTS_DDL: &str = "CREATE INDEX IF NOT EXISTS records_fts ON records \
-    USING fts (Prompt, RequestTail, Answer, Model, Status, Type, Backend) \
-    WITH (tokenizer = 'ngram')";
+    USING fts (SearchText) WITH (tokenizer = 'ngram')";
 
 /// Create the v8 schema on a new database, or validate an existing v8 file.
 ///
@@ -102,6 +103,12 @@ pub const FTS_DDL: &str = "CREATE INDEX IF NOT EXISTS records_fts ON records \
 /// on it would leave the old FTS5 objects and dead columns in place. The
 /// explicit migration path creates a new file and copies rows.
 pub async fn init_v8(conn: &DbConn) -> Result<(), DbError> {
+    init_v8_schema(conn, true).await
+}
+
+/// Create the v8 schema. `with_fts = false` defers the Tantivy index so a bulk
+/// migration can load rows without per-row index maintenance and build it once.
+pub async fn init_v8_schema(conn: &DbConn, with_fts: bool) -> Result<(), DbError> {
     let version = pragma_i64(conn, "user_version").await?;
     if version > 0 && version < SCHEMA_VERSION {
         return Err(DbError::Shape(format!(
@@ -131,10 +138,16 @@ pub async fn init_v8(conn: &DbConn) -> Result<(), DbError> {
     for sql in INDEX_DDL {
         conn.execute_batch(sql).await?;
     }
-    conn.execute_batch(FTS_DDL).await?;
+    if with_fts {
+        create_fts(conn).await?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
         .await?;
     Ok(())
+}
+
+pub async fn create_fts(conn: &DbConn) -> Result<(), DbError> {
+    conn.execute_batch(FTS_DDL).await
 }
 
 #[cfg(test)]
@@ -160,12 +173,13 @@ mod tests {
         assert_eq!(pragma_i64(&conn, "user_version").await.unwrap(), 8);
 
         conn.execute(
-            "INSERT INTO records (Time, TimeMs, Model, Status, Prompt) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO records (Time, TimeMs, Model, Status, Prompt, SearchText) VALUES (?, ?, ?, ?, ?, ?)",
             vec![
                 Value::Text("2026-10-22 00:00:00.000000".into()),
                 Value::Integer(1),
                 Value::Text("gpt-4o".into()),
                 Value::Integer(200),
+                Value::Text("hello database".into()),
                 Value::Text("hello database".into()),
             ],
         )
@@ -174,7 +188,7 @@ mod tests {
 
         let rows = conn
             .query(
-                "SELECT id FROM records WHERE fts_match(Prompt, RequestTail, Answer, Model, Status, Type, Backend, ?)",
+                "SELECT id FROM records WHERE fts_match(SearchText, ?)",
                 vec![Value::Text("database".into())],
             )
             .await

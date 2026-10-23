@@ -35,6 +35,24 @@ impl AuditStore {
         read_only: bool,
         busy_timeout: Duration,
     ) -> Result<Arc<AuditStore>, DbError> {
+        Self::open_with_fts(path, read_only, busy_timeout, true).await
+    }
+
+    /// Open a writable database without the FTS index; call
+    /// [`AuditStore::create_fts_index`] after a bulk load.
+    pub async fn open_deferred_fts(
+        path: impl AsRef<Path>,
+        busy_timeout: Duration,
+    ) -> Result<Arc<AuditStore>, DbError> {
+        Self::open_with_fts(path, false, busy_timeout, false).await
+    }
+
+    async fn open_with_fts(
+        path: impl AsRef<Path>,
+        read_only: bool,
+        busy_timeout: Duration,
+        with_fts: bool,
+    ) -> Result<Arc<AuditStore>, DbError> {
         let path = path.as_ref().to_path_buf();
         let opts = OpenOptions {
             read_only,
@@ -46,7 +64,7 @@ impl AuditStore {
         let write_conn = db.connect()?;
 
         if !read_only {
-            crate::db::turso_schema::init_v8(&write_conn).await?;
+            crate::db::turso_schema::init_v8_schema(&write_conn, with_fts).await?;
         }
 
         let readers = ReaderPool::new(db.clone(), DEFAULT_MAX_READERS, Duration::from_secs(5));
@@ -102,6 +120,12 @@ impl AuditStore {
     /// Convenience: run one write statement on the serialized write connection.
     pub async fn execute(&self, sql: impl AsRef<str>, params: Vec<Value>) -> Result<u64, DbError> {
         self.write().await.execute(sql, params).await
+    }
+
+    /// Build the FTS index after a bulk load (deferred-FTS mode).
+    pub async fn create_fts_index(&self) -> Result<(), DbError> {
+        let conn = self.write().await;
+        crate::db::turso_schema::create_fts(&conn).await
     }
 
     /// Flush and truncate the WAL. Called before sealing a shard and by the
