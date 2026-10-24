@@ -109,12 +109,13 @@ curl 'http://127.0.0.1:8000/dashboard/api/records?limit=20&cursor=1789639720742:
 
 ### 遗留归档的一次性迁移
 
-扫描到不含 `TimeMs` 列的旧归档（`user_version=0` 的遗留库）时，网关会在首次扫描时
-**就地升级**该文件：补齐现代列与索引，`TimeMs` 依据本地墙钟文本 `Time` 结合当时的历史
-UTC 偏移（含夏令时）回填为真实 epoch 毫秒，并把遗留明文 `Request`/`Response` 映射到
-`Prompt`/`Answer` 以支持展示与检索。迁移在单个事务内完成，中断可安全重试且不会影响已
-现代归档。设置环境变量 `ARCHIVE_LEGACY_MIGRATION=skip` 可禁用迁移，此时遗留归档仍会被
-跳过、不参与检索；无法解析的时间戳保留为 NULL 隔离，并被时间范围查询排除。
+扫描到旧 SQLite 归档时，网关会自动升级到 Turso v8，再以只读方式注册；已有 v8 归档直接
+注册。更早版本复用原有正文提取逻辑：`TimeMs` 依据本地墙钟文本 `Time` 结合当时的历史 UTC
+偏移（含夏令时）回填，明文 `Request`/`Response` 转成预览和压缩 payload，之后统一生成
+`SearchText` 与新 FTS 索引。新文件验证通过后才替换原路径，同时保留备份。
+
+设置 `ARCHIVE_LEGACY_MIGRATION=skip` 可禁用旧归档升级，此时这些归档不参与查询；已升级的
+v8 归档不受影响。无法解析的时间戳保留为 NULL 隔离，并被时间范围查询排除。
 
 ---
 
