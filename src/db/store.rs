@@ -29,6 +29,7 @@ pub struct AuditStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaKind {
     Empty,
+    Legacy,
     V7,
     V8,
     Newer(i64),
@@ -55,30 +56,37 @@ pub async fn probe_schema(path: &Path) -> Result<SchemaKind, DbError> {
     .await?;
     let conn = db.connect()?;
     let version = pragma_i64(&conn, "user_version").await?;
+    if version > 8 {
+        return Ok(SchemaKind::Newer(version));
+    }
     let columns = conn.query("PRAGMA table_info(records)", Vec::new()).await?;
     if columns.is_empty() {
-        return Ok(if version == 0 {
+        let user_object = conn
+            .query_one(
+                "SELECT 1 FROM sqlite_master WHERE substr(name, 1, 7) <> 'sqlite_' LIMIT 1",
+                Vec::new(),
+            )
+            .await?;
+        return Ok(if version == 0 && user_object.is_none() {
             SchemaKind::Empty
         } else {
             SchemaKind::Unknown
         });
     }
-    let mut has_headers = false;
     let mut has_search = false;
     for row in &columns {
         if let Some(name) = row.get_opt_str(1)? {
-            has_headers |= name == "Headers";
             has_search |= name == "SearchText";
         }
     }
-    if has_headers {
+    if version == 7 {
         return Ok(SchemaKind::V7);
-    }
-    if version > 8 {
-        return Ok(SchemaKind::Newer(version));
     }
     if has_search {
         return Ok(SchemaKind::V8);
+    }
+    if version < 7 {
+        return Ok(SchemaKind::Legacy);
     }
     Ok(SchemaKind::Unknown)
 }
@@ -120,6 +128,12 @@ impl AuditStore {
         if !read_only && path.exists() {
             match probe_schema(&path).await? {
                 SchemaKind::Empty | SchemaKind::V8 => {}
+                SchemaKind::Legacy => {
+                    return Err(DbError::Shape(
+                        "legacy audit database; automatic startup migration is required"
+                            .to_string(),
+                    ))
+                }
                 SchemaKind::V7 => {
                     return Err(DbError::Shape(
                         "legacy v7 audit database; run --migrate-db before opening it".to_string(),
@@ -215,8 +229,17 @@ impl AuditStore {
     /// periodic checkpoint task.
     pub async fn checkpoint_truncate(&self) -> Result<(), DbError> {
         let conn = self.write().await;
-        conn.query("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
+        let rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
             .await?;
+        let status = rows
+            .first()
+            .ok_or_else(|| DbError::Shape("checkpoint returned no status".to_string()))?;
+        if status.get_i64(0)? != 0 || status.get_i64(1)? != status.get_i64(2)? {
+            return Err(DbError::Driver(turso::Error::Busy(
+                "checkpoint did not drain the WAL".to_string(),
+            )));
+        }
         Ok(())
     }
 }
@@ -261,6 +284,14 @@ pub async fn pragma_i64(conn: &DbConn, name: &str) -> Result<i64, DbError> {
 
 // Re-export commonly used engine items so call sites import one module.
 pub use engine::{DbError as StoreError, Row as StoreRow};
+
+#[cfg(test)]
+#[path = "store_probe_tests.rs"]
+mod probe_tests;
+
+#[cfg(test)]
+#[path = "store_checkpoint_tests.rs"]
+mod checkpoint_busy_tests;
 
 #[cfg(test)]
 mod checkpoint_tests {

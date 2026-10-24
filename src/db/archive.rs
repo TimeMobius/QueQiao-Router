@@ -120,11 +120,11 @@ impl ArchiveRegistry {
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
                 let mut notices: Vec<String> = Vec::new();
-                let (opened, busy) = match open_archive_shard(&path, &stem).await {
-                    Ok(Some(shard)) => (Some(shard), false),
+                let (opened, busy, quarantine) = match open_archive_shard(&path, &stem).await {
+                    Ok(Some(shard)) => (Some(shard), false, false),
                     Ok(None) => {
                         if migration_disabled {
-                            (None, false)
+                            (None, false, false)
                         } else {
                             Self::migrate_and_reopen(&path, &stem, &mut notices).await
                         }
@@ -136,10 +136,9 @@ impl ArchiveRegistry {
                             path.display(),
                             e
                         ));
-                        (None, busy)
+                        (None, busy, !busy)
                     }
                 };
-                let quarantine = opened.is_none() && !busy && !notices.is_empty();
                 (stem, path, opened, notices, quarantine, busy)
             }));
         }
@@ -205,24 +204,33 @@ impl ArchiveRegistry {
         path: &Path,
         stem: &str,
         notices: &mut Vec<String>,
-    ) -> (Option<ArchiveShard>, bool) {
-        if let Err(e) = crate::db::migrate_database_or_quarantine(path).await {
-            let busy = crate::db::is_sqlite_retryable_error(&e);
+    ) -> (Option<ArchiveShard>, bool, bool) {
+        if let Err(e) = crate::db::migrate::migrate_path_to_v8(path).await {
+            let busy = e.is_busy();
             notices.push(format!(
                 "Legacy archive migration failed for '{}': {}",
                 path.display(),
                 e
             ));
-            return (None, busy);
+            return (None, busy, false);
         }
         match open_archive_shard(path, stem).await {
-            Ok(Some(shard)) => (Some(shard), false),
+            Ok(Some(shard)) => {
+                if let Err(e) = crate::db::migrate::remove_sidecars(path) {
+                    notices.push(format!(
+                        "archive sidecar cleanup failed for '{}': {}",
+                        path.display(),
+                        e
+                    ));
+                }
+                (Some(shard), false, false)
+            }
             Ok(None) => {
                 notices.push(format!(
                     "Archive '{}' still lacks TimeMs after migration; skipping",
                     path.display()
                 ));
-                (None, false)
+                (None, false, false)
             }
             Err(e) => {
                 let busy = e.is_busy();
@@ -231,7 +239,7 @@ impl ArchiveRegistry {
                     path.display(),
                     e
                 ));
-                (None, busy)
+                (None, busy, false)
             }
         }
     }
@@ -347,11 +355,47 @@ async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard
             .connect_with(options)
             .await
             .map_err(crate::db::map_sqlx_error)?;
-        sqlx::query("SELECT 1 FROM sqlite_master LIMIT 1")
-            .fetch_optional(&pool)
-            .await
-            .map_err(crate::db::map_sqlx_error)?;
+        let recovery = async {
+            let mut connection = pool.acquire().await.map_err(crate::db::map_sqlx_error)?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await
+                .map_err(crate::db::map_sqlx_error)?;
+            sqlx::query("SELECT 1 FROM sqlite_master LIMIT 1")
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(crate::db::map_sqlx_error)?;
+            if journal_path.exists() {
+                std::fs::remove_file(&journal_path).map_err(|error| {
+                    DbError::Shape(format!(
+                        "archive rollback journal cleanup failed for '{}': {error}",
+                        journal_path.display()
+                    ))
+                })?;
+            }
+            sqlx::query("ROLLBACK")
+                .execute(&mut *connection)
+                .await
+                .map_err(crate::db::map_sqlx_error)?;
+            Ok::<(), DbError>(())
+        }
+        .await;
         pool.close().await;
+        recovery?;
+    }
+
+    match crate::db::store::probe_schema(path).await? {
+        crate::db::store::SchemaKind::V8 => {}
+        crate::db::store::SchemaKind::Newer(version) => {
+            return Err(DbError::Shape(format!(
+                "archive schema v{version} is newer than this binary"
+            )))
+        }
+        crate::db::store::SchemaKind::V7 | crate::db::store::SchemaKind::Legacy => return Ok(None),
+        crate::db::store::SchemaKind::Empty => return Ok(None),
+        crate::db::store::SchemaKind::Unknown => {
+            return Err(DbError::Shape("unrecognized archive schema".to_string()))
+        }
     }
 
     let store = AuditStore::open(path, true, Duration::from_secs(5)).await?;
@@ -529,7 +573,7 @@ mod tests {
         registry.ensure_scanned().await;
 
         assert!(archive.exists());
-        assert!(!dir.join("record_202603.db.bak").exists());
+        assert!(dir.join("record_202603.db.bak").exists());
         assert!(!Path::new(&format!("{}-journal", archive.display())).exists());
         let shard = registry.get("record_202603").await;
         assert!(shard.is_some());
@@ -608,11 +652,14 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
+        let journal = std::path::PathBuf::from(format!("{}-journal", archive.display()));
+        let journal_before_scan = std::fs::read(&journal).unwrap();
 
         let registry = ArchiveRegistry::new(dir.join("record.db"));
         registry.ensure_scanned().await;
 
         assert!(archive.exists());
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before_scan);
         assert!(!dir.join("record_202603.db.bak").exists());
         assert_eq!(registry.skipped_count().await, 1);
         assert!(!registry.failed.lock().await.contains("record_202603"));

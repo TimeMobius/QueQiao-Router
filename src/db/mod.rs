@@ -1,14 +1,13 @@
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 
 pub mod archive;
 pub mod engine;
 pub mod extract;
 pub mod legacy;
 pub mod migrate;
+pub(crate) mod migrate_verify;
 pub mod payload;
 pub mod records;
 pub mod records_query;
@@ -19,45 +18,6 @@ pub mod turso_schema;
 pub mod writer;
 
 pub use rotation::{check_and_rotate, init_rotation_state, rotate_if_needed};
-
-pub(crate) async fn migrate_database_in_place(path: &Path) -> Result<(), sqlx::Error> {
-    let path_str = path.to_string_lossy();
-    let options = SqliteConnectOptions::from_str(&path_str)?
-        .read_only(false)
-        .create_if_missing(false);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect_with(options)
-        .await?;
-    let result = legacy::migrate_archive(&pool).await;
-    pool.close().await;
-    result
-}
-
-pub(crate) async fn migrate_database_or_quarantine(path: &Path) -> Result<(), sqlx::Error> {
-    if let Err(error) = migrate_database_in_place(path).await {
-        if is_sqlite_retryable_error(&error) {
-            return Err(error);
-        }
-        let quarantined = quarantine_database(path).map_err(|quarantine_error| {
-            sqlx::Error::Protocol(format!(
-                "database migration failed: {error}; quarantine failed: {quarantine_error}"
-            ))
-        })?;
-        warn!(
-            "Failed database quarantined: '{}' -> '{}': {}",
-            path.display(),
-            quarantined.display(),
-            error
-        );
-        return Err(sqlx::Error::Protocol(format!(
-            "database migration failed; quarantined as '{}'",
-            quarantined.display()
-        )));
-    }
-    Ok(())
-}
 
 /// Map a legacy sqlx error into the engine error type, preserving busy/conflict
 /// classification so the archive scanner can distinguish "retry later" from
@@ -87,20 +47,18 @@ pub(crate) fn is_sqlite_retryable_error(error: &sqlx::Error) -> bool {
 pub async fn init_db() -> Result<std::sync::Arc<store::AuditStore>, engine::DbError> {
     let path = resolve_db_path();
     match migrate::detect_schema(&path).await? {
-        migrate::SchemaKind::V7 => {
-            return Err(engine::DbError::Shape(format!(
-                "legacy v7 audit database at '{}'; run: queqiao-router --migrate-db --from '{}' --to '{}.v8'",
-                path.display(),
-                path.display(),
-                path.display()
-            )))
+        migrate::SchemaKind::V7 | migrate::SchemaKind::Legacy => {
+            migrate::migrate_path_to_v8(&path).await?;
         }
         migrate::SchemaKind::Newer(version) => {
             return Err(engine::DbError::Shape(format!(
                 "audit database schema v{version} is newer than this binary (v8)"
             )))
         }
-        _ => {}
+        migrate::SchemaKind::V8 => {
+            migrate::migrate_path_to_v8(&path).await?;
+        }
+        migrate::SchemaKind::Empty | migrate::SchemaKind::Unknown => {}
     }
     let db = store::AuditStore::open(&path, false, Duration::from_secs(30)).await?;
     info!("Audit database at '{}' initialized (v8)", path.display());
@@ -126,11 +84,15 @@ pub(crate) fn quarantine_database(path: &Path) -> std::io::Result<PathBuf> {
     Ok(backup)
 }
 
-fn unique_backup_path(path: &Path) -> PathBuf {
+pub(crate) fn unique_backup_path(path: &Path) -> PathBuf {
     let base = PathBuf::from(format!("{}.bak", path.display()));
     let mut candidate = base.clone();
     let mut suffix = 1u32;
-    while candidate.exists() {
+    while candidate.exists()
+        || ["-journal", "-wal", "-shm"]
+            .iter()
+            .any(|sidecar| PathBuf::from(format!("{}{}", candidate.display(), sidecar)).exists())
+    {
         candidate = PathBuf::from(format!("{}.{}", base.display(), suffix));
         suffix = suffix.saturating_add(1);
     }
@@ -139,7 +101,6 @@ fn unique_backup_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::migrate_database_or_quarantine;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
 
@@ -178,10 +139,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = migrate_database_or_quarantine(&path).await;
+        let result = crate::db::migrate::migrate_path_to_v8(&path).await;
 
         let error = result.expect_err("the active transaction must hold a write lock");
-        assert!(super::is_sqlite_retryable_error(&error));
+        assert!(error.is_busy());
         assert!(path.exists());
         assert!(!dir.join("record_202608.db.bak").exists());
 
@@ -190,3 +151,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod migration_tests;
