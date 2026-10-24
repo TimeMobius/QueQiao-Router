@@ -13,8 +13,8 @@ pub const SCHEMA_VERSION: i64 = 8;
 pub const RECORDS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS records (
     id INTEGER PRIMARY KEY,
-    Time TEXT NOT NULL,
-    TimeMs INTEGER NOT NULL,
+    Time TEXT,
+    TimeMs INTEGER,
     IP TEXT,
     Method TEXT,
     Endpoint TEXT,
