@@ -112,6 +112,10 @@ docker run -d \
 
 > **数据库路径说明**: 源码默认 `RECD_PATH=./record.db`（数据库文件在运行目录，兼容 `sqlite:` 前缀），而 Docker 镜像默认设为 `sqlite:./logs/record.db`（写入挂载的 logs 卷）。若使用 Docker，建议将 logs 目录挂载为主机持久化路径，或显式设置 `RECD_PATH` 环境变量指向挂载路径，避免容器重启后数据丢失。
 
+> **旧库自动升级**: 保持原有 `RECD_PATH`，更新镜像并启动即可。网关自动将旧 SQLite 审计库迁移到
+> Turso v8，验证通过后保留 `.bak` 备份并切换到原路径；首次启动会等待迁移完成，无需手动运行
+> `--migrate-db`。请为新库和备份预留磁盘空间。详细流程见 [数据库文档](docs/DATABASE_SCHEMA.md)。
+
 ---
 
 ## ⚙️ 环境变量
@@ -129,7 +133,7 @@ docker run -d \
 | `RUST_LOG` | `info` | 日志级别 (`error`, `warn`, `info`, `debug`, `trace`) |
 | `TZ` | 镜像默认（通常为 UTC） | 日志文件名轮转与所有日志时间戳均跟随该时区；部署时应设为宿主机时区（如 `TZ=Asia/Shanghai`），或挂载 `-v /etc/localtime:/etc/localtime:ro` 自动跟随宿主机 |
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
-| `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时禁用遗留归档的一次性就地迁移，遗留归档被跳过 |
+| `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时跳过旧 SQLite 归档的自动升级；v8 归档照常查询 |
 
 ---
 
@@ -228,7 +232,7 @@ openai_clients:
 ## 🛠️ 本地编译与开发
 
 ### 环境要求
-- Rust 1.75+
+- Rust 1.89+（自动迁移使用标准库文件锁；当前验证版本为 1.91.1）
 - C 编译器 (gcc/clang)
 
 ### 编译 Release 版本
