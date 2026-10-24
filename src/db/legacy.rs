@@ -59,7 +59,8 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
     if has_legacy_body {
         loop {
             let rows = sqlx::query(
-                "SELECT id, Time, Type, Headers, Request, Response, Tool, Multimodal \
+                "SELECT id, Time, Type, Headers, Request, Response, Tool, Multimodal, \
+                 EXISTS(SELECT 1 FROM payloads WHERE record_id = records.id) AS HasPayload \
                  FROM records WHERE id > ? ORDER BY id LIMIT ?",
             )
             .bind(last_id)
@@ -71,6 +72,12 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
             }
             for row in &rows {
                 let id: i64 = row.get("id");
+                last_id = id;
+                // Intermediate versions already populated previews and payloads;
+                // their remaining plaintext columns can be empty compatibility fields.
+                if row.get::<bool, _>("HasPayload") {
+                    continue;
+                }
                 let time: Option<String> = row.try_get("Time").ok().flatten();
                 let type_label: Option<String> = row.try_get("Type").ok().flatten();
                 let headers: Option<String> = row.try_get("Headers").ok().flatten();
@@ -147,9 +154,10 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
                 let req_c = payload::compress(request.as_bytes());
                 let resp_c = payload::compress(response.as_bytes());
                 let hdr_c = payload::compress(headers.as_deref().unwrap_or("").as_bytes());
-                let payload_id: i64 = sqlx::query(
+                sqlx::query(
                     "INSERT INTO payloads (record_id, codec, dict_id, request, response, headers, \
-                     request_raw_len, response_raw_len, headers_raw_len) VALUES (?,?,?,?,?,?,?,?,?)",
+                     request_raw_len, response_raw_len, headers_raw_len) VALUES (?,?,?,?,?,?,?,?,?) \
+                     ON CONFLICT(record_id) DO NOTHING",
                 )
                 .bind(id)
                 .bind(&req_c.codec)
@@ -161,11 +169,13 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
                 .bind(resp_c.raw_len)
                 .bind(hdr_c.raw_len)
                 .execute(&mut *tx)
-                .await?
-                .last_insert_rowid();
+                .await?;
+                let payload_id = id;
 
                 sqlx::query(
-                    "UPDATE records SET TimeMs = ?, Prompt = ?, RequestTail = ?, Answer = ?, \
+                    "UPDATE records SET TimeMs = COALESCE(TimeMs, ?), \
+                      Prompt = COALESCE(Prompt, ?), RequestTail = COALESCE(RequestTail, ?), \
+                      Answer = COALESCE(Answer, ?), \
                      ToolNames = ?, FinishReason = ?, Endpoint = ?, \
                      UserAgent = ?, ClientName = ?, ClientVersion = ?, ApiKey = ?, \
                      SessionId = ?, ParentSessionId = ?, RequestId = ?, SessionAffinity = ?, \
@@ -211,7 +221,6 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-                last_id = id;
             }
         }
     }
@@ -357,6 +366,10 @@ fn legacy_header_meta(headers_json: &str) -> HeaderMeta {
     }
     header_meta(&map)
 }
+
+#[cfg(test)]
+#[path = "legacy_preservation_tests.rs"]
+mod preservation_tests;
 
 #[cfg(test)]
 mod tests {
