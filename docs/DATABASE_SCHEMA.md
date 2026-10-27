@@ -194,7 +194,9 @@ USING fts (SearchText) WITH (tokenizer = 'ngram');
 - 生效范围：`/dashboard/api/analysis` 在**无筛选**且 `interval`/`dimension` 不是 `hour` 时读取该库；
   带筛选、按小时统计、或汇总不可用时自动回退原有扫描路径，结果保持一致。
   首尾不足一个本地自然日的区间会用原路径补扫，保证精确。
-- 空间：全量历史通常小于 10MB。`ANALYSIS_ROLLUP=off` 可全局关闭该加速。
+- 空间：全量历史通常只有几百 KB 到数 MB；构建结束会自动 checkpoint，数据落在主文件里。
+- 该文件与审计库一样是 Turso 格式，**不要用 sqlite3 直接打开**（进行中的连接会报 `database is locked`）。
+- `ANALYSIS_ROLLUP=off` 可全局关闭该加速。
 
 ---
 
