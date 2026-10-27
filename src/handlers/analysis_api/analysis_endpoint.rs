@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::state::app_state::AppState;
 
 use super::aggregation::{
-    col_text, merge_group_map, merge_histograms, merge_summaries, metrics_from_row, percentile_ms,
-    summary_from_row, Metrics, SummaryAgg,
+    col_i64, col_text, merge_group_map, merge_histogram_maps, merge_summaries, metrics_from_row,
+    percentile_ms, summary_from_row, Metrics, SummaryAgg,
 };
 use super::cache::{cache_get, cache_key, cache_put, internal};
 use super::log_scan::scan_error_logs;
@@ -22,6 +22,7 @@ use super::params::{
     order_metric, resolve_range, to_list_params, AnalysisParams, COUNT_CAP, DEFAULT_DIM_EXPR,
     DISTINCT_CAP, GROUP_CAP, LATENCY_COL, MAX_BUCKETS, TTFT_COL, UNKNOWN,
 };
+use super::rollup;
 use super::shards::{
     collect_shards, distinct_count_across_shards, fetch_sliced, skipped_archive_warning,
 };
@@ -67,48 +68,132 @@ async fn build_analysis(
     }
     let shard_ids: Vec<String> = shards.iter().map(|s| s.id.clone()).collect();
 
-    // 汇总
-    let summary_rows = fetch_optimized(&shards, p, from, to, summary_sql)
+    // 归档汇总快路径：无筛选且归档汇总有效时避免重复扫描；否则保持原扫描逻辑。
+    let rolled = rollup::analyse(&shards, p, from, to, &interval, dim, dim_expr)
         .await
         .map_err(internal)?;
-    let summaries: Vec<SummaryAgg> = summary_rows
-        .iter()
-        .flat_map(|rows| rows.iter().map(summary_from_row))
-        .collect();
+
+    let (summaries, per_shard_trend, per_shard_dims, latency_maps, ttft_maps, distinct) =
+        if let Some(data) = rolled {
+            warnings.extend(data.warnings.clone());
+            (
+                data.summaries,
+                data.trend,
+                data.dims,
+                data.latency_hist,
+                data.ttft_hist,
+                Some((
+                    data.distinct_models,
+                    data.distinct_ips,
+                    data.distinct_capped,
+                )),
+            )
+        } else {
+            // 汇总
+            let summary_rows = fetch_optimized(&shards, p, from, to, summary_sql)
+                .await
+                .map_err(internal)?;
+            let summaries: Vec<SummaryAgg> = summary_rows
+                .iter()
+                .flat_map(|rows| rows.iter().map(summary_from_row))
+                .collect();
+
+            // 趋势
+            let trend_rows = fetch_sliced(&shards, p, from, to, |w| trend_sql(&interval, w))
+                .await
+                .map_err(internal)?;
+            let per_shard_trend: Vec<Vec<(String, Metrics)>> = trend_rows
+                .iter()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|r| {
+                            (
+                                col_text(r, "label").unwrap_or_else(|| UNKNOWN.to_string()),
+                                metrics_from_row(r),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+
+            // 维度
+            let dim_rows = fetch_sliced(&shards, p, from, to, |w| {
+                dims_sql(w, dim_expr, GROUP_CAP + 1)
+            })
+            .await
+            .map_err(internal)?;
+            let per_shard_dims: Vec<Vec<(String, Metrics)>> = dim_rows
+                .iter()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|r| {
+                            (
+                                col_text(r, "name").unwrap_or_else(|| UNKNOWN.to_string()),
+                                metrics_from_row(r),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let mut latency_maps = Vec::with_capacity(per_shard_trend.len());
+            for rows in fetch_optimized(&shards, p, from, to, |w| latency_hist_sql(w, LATENCY_COL))
+                .await
+                .map_err(internal)?
+                .iter()
+            {
+                let mut map = std::collections::HashMap::new();
+                for row in rows {
+                    *map.entry(col_i64(row, "bucket")).or_insert(0) += col_i64(row, "c");
+                }
+                latency_maps.push(map);
+            }
+            let mut ttft_maps = Vec::with_capacity(per_shard_trend.len());
+            for rows in fetch_optimized(&shards, p, from, to, |w| latency_hist_sql(w, TTFT_COL))
+                .await
+                .map_err(internal)?
+                .iter()
+            {
+                let mut map = std::collections::HashMap::new();
+                for row in rows {
+                    *map.entry(col_i64(row, "bucket")).or_insert(0) += col_i64(row, "c");
+                }
+                ttft_maps.push(map);
+            }
+
+            (
+                summaries,
+                per_shard_trend,
+                per_shard_dims,
+                latency_maps,
+                ttft_maps,
+                None,
+            )
+        };
+
     let mut summary = merge_summaries(&summaries);
 
     // 单分片时 COUNT(DISTINCT) 已精确；跨分片改为并集去重，避免重复计数。
     if shards.len() > 1 {
-        let (models, models_capped) = distinct_count_across_shards(&shards, p, from, to, "Model")
-            .await
-            .map_err(internal)?;
-        let (ips, ips_capped) = distinct_count_across_shards(&shards, p, from, to, "IP")
-            .await
-            .map_err(internal)?;
-        summary.models = models as i64;
-        summary.ips = ips as i64;
-        if models_capped || ips_capped {
+        let (models, ips, capped) = match distinct {
+            Some(values) => values,
+            None => {
+                let (models, models_capped) =
+                    distinct_count_across_shards(&shards, p, from, to, "Model")
+                        .await
+                        .map_err(internal)?;
+                let (ips, ips_capped) = distinct_count_across_shards(&shards, p, from, to, "IP")
+                    .await
+                    .map_err(internal)?;
+                (models as i64, ips as i64, models_capped || ips_capped)
+            }
+        };
+        summary.models = models;
+        summary.ips = ips;
+        if capped {
             warnings.push(format!("distinct model/ip count capped at {DISTINCT_CAP}"));
         }
     }
-
-    // 趋势
-    let trend_rows = fetch_sliced(&shards, p, from, to, |w| trend_sql(&interval, w))
-        .await
-        .map_err(internal)?;
-    let per_shard_trend: Vec<Vec<(String, Metrics)>> = trend_rows
-        .iter()
-        .map(|rows| {
-            rows.iter()
-                .map(|r| {
-                    (
-                        col_text(r, "label").unwrap_or_else(|| UNKNOWN.to_string()),
-                        metrics_from_row(r),
-                    )
-                })
-                .collect()
-        })
-        .collect();
     let mut trend: Vec<(String, Metrics)> = merge_group_map(per_shard_trend).into_iter().collect();
     trend.sort_by(|a, b| a.0.cmp(&b.0));
     if trend.len() > MAX_BUCKETS as usize {
@@ -155,29 +240,15 @@ async fn build_analysis(
     }
 
     // 维度
-    let dim_rows = fetch_sliced(&shards, p, from, to, |w| {
-        dims_sql(w, dim_expr, GROUP_CAP + 1)
-    })
-    .await
-    .map_err(internal)?;
     let mut dim_capped = false;
-    let per_shard_dims: Vec<Vec<(String, Metrics)>> = dim_rows
-        .iter()
-        .map(|rows| {
-            let mut v: Vec<(String, Metrics)> = rows
-                .iter()
-                .map(|r| {
-                    (
-                        col_text(r, "name").unwrap_or_else(|| UNKNOWN.to_string()),
-                        metrics_from_row(r),
-                    )
-                })
-                .collect();
-            if v.len() > GROUP_CAP {
+    let per_shard_dims: Vec<Vec<(String, Metrics)>> = per_shard_dims
+        .into_iter()
+        .map(|mut values| {
+            if values.len() > GROUP_CAP {
                 dim_capped = true;
-                v.truncate(GROUP_CAP);
+                values.truncate(GROUP_CAP);
             }
-            v
+            values
         })
         .collect();
     let mut groups: Vec<(String, Metrics)> = merge_group_map(per_shard_dims).into_iter().collect();
@@ -248,14 +319,8 @@ async fn build_analysis(
         .collect();
 
     // 时延分位采用固定宽度直方图合并后近似；均值/最大来自精确聚合，无额外扫描放大。
-    let latency_hist = fetch_optimized(&shards, p, from, to, |w| latency_hist_sql(w, LATENCY_COL))
-        .await
-        .map_err(internal)?;
-    let latency_buckets = merge_histograms(&latency_hist);
-    let ttft_hist = fetch_optimized(&shards, p, from, to, |w| latency_hist_sql(w, TTFT_COL))
-        .await
-        .map_err(internal)?;
-    let ttft_buckets = merge_histograms(&ttft_hist);
+    let latency_buckets = merge_histogram_maps(&latency_maps);
+    let ttft_buckets = merge_histogram_maps(&ttft_maps);
 
     let db_errors = summary.metrics.errors;
     let log_errors = log_scan.total_error_entries;

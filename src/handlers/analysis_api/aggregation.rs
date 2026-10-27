@@ -127,15 +127,15 @@ pub(super) fn merge_error_maps(maps: Vec<HashMap<DbErrorKey, i64>>) -> HashMap<D
     out
 }
 
-/// 合并各分片的时延直方图（桶 → 计数求和），按桶升序返回。
-pub(super) fn merge_histograms(rows_per_shard: &[Vec<Row>]) -> Vec<(i64, i64)> {
-    let mut map: HashMap<i64, i64> = HashMap::new();
-    for rows in rows_per_shard {
-        for row in rows {
-            *map.entry(col_i64(row, "bucket")).or_insert(0) += col_i64(row, "c");
+/// 合并已按桶聚合的直方图（快路径使用），按桶升序返回。
+pub(super) fn merge_histogram_maps(maps: &[HashMap<i64, i64>]) -> Vec<(i64, i64)> {
+    let mut out: HashMap<i64, i64> = HashMap::new();
+    for map in maps {
+        for (bucket, count) in map {
+            *out.entry(*bucket).or_insert(0) += *count;
         }
     }
-    let mut buckets: Vec<(i64, i64)> = map.into_iter().collect();
+    let mut buckets: Vec<(i64, i64)> = out.into_iter().collect();
     buckets.sort_by_key(|entry| entry.0);
     buckets
 }
@@ -340,7 +340,15 @@ mod tests {
             fetch_all_shards(&shards, &latency_hist_sql(" WHERE 1=1", LATENCY_COL), &[])
                 .await
                 .unwrap();
-        let buckets = merge_histograms(&hist_rows);
+        let mut maps = Vec::new();
+        for rows in &hist_rows {
+            let mut map = HashMap::new();
+            for row in rows {
+                *map.entry(col_i64(row, "bucket")).or_insert(0) += col_i64(row, "c");
+            }
+            maps.push(map);
+        }
+        let buckets = merge_histogram_maps(&maps);
         assert_eq!(buckets.iter().map(|(_, count)| count).sum::<i64>(), 2);
         assert_eq!(percentile_ms(&buckets, 2, 0.99), Some(850.0));
 

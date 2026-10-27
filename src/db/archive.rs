@@ -250,10 +250,24 @@ impl ArchiveRegistry {
             "Archive shard registered: {} (TimeMs {:?}..{:?})",
             shard.id, shard.min_ms, shard.max_ms
         );
+        let audit_path = self.active_path.clone();
+        let shard_id = stem.to_string();
+        let path = shard.path.clone();
+        let store = shard.store.clone();
+        let (min_ms, max_ms) = (shard.min_ms, shard.max_ms);
         self.shards
             .write()
             .await
             .insert(stem.to_string(), Arc::new(shard));
+        tokio::spawn(async move {
+            if let Err(error) = crate::db::aggregate::ensure_for_shard(
+                audit_path, shard_id, path, store, min_ms, max_ms,
+            )
+            .await
+            {
+                warn!(%error, "archive rollup build skipped");
+            }
+        });
     }
 
     /// 返回时间范围与 `[from_ms, to_ms]` 相交的归档分片。

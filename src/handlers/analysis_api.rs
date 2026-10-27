@@ -11,6 +11,7 @@
 //! - `params`：查询参数结构与解析/白名单
 //! - `sql`：聚合 SQL 模板
 //! - `shards`：分片查询（并发受限）与时间切片
+//! - `rollup`：归档汇总快路径（不可用时回退扫描）
 //! - `aggregation`：行解析与跨分片可加合并
 //! - `cache`：进程内结果缓存与统一错误响应
 //! - `log_scan`：错误日志文件扫描
@@ -23,6 +24,7 @@ mod errors_endpoint;
 mod log_scan;
 mod optimized;
 mod params;
+mod rollup;
 pub(crate) mod shards;
 mod sql;
 
