@@ -715,6 +715,14 @@ async fn build(db: &Db, input: &BuildInput<'_>) -> Result<(i64, usize), DbError>
     match write {
         Ok(()) => {
             conn.execute_batch("COMMIT").await?;
+            // 构建完成后把 WAL 合并回主文件：派生库仍可安全删除，但备份/巡检时
+            // 不应只剩一个 4KB 的空壳。失败只记录日志，不影响已提交的数据。
+            if let Err(error) = conn
+                .query("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
+                .await
+            {
+                tracing::debug!(%error, "rollup checkpoint skipped");
+            }
             Ok((scanned, days.len()))
         }
         Err(error) => {
@@ -768,5 +776,8 @@ pub(crate) async fn forget(audit_path: &Path, shard_id: &str) -> Result<(), DbEr
         )
         .await?;
     }
+    let _ = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
+        .await;
     Ok(())
 }

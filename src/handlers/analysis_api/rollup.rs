@@ -683,6 +683,12 @@ mod tests {
     async fn matches_scan_for_aligned_and_partial_ranges() {
         let fixture = fixture("parity", 60).await;
         fixture.build().await;
+        // 构建完成应 checkpoint，主文件不能只剩 4KB 空壳。
+        let rollup_file = fixture.dir.join("audit_aggregates.db");
+        assert!(
+            std::fs::metadata(&rollup_file).unwrap().len() > 4096,
+            "rollup main file should hold data after checkpoint"
+        );
         let params = AnalysisParams::default();
 
         compare(&fixture, fixture.from, fixture.to, "day", "model").await;
