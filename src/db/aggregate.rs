@@ -250,6 +250,13 @@ async fn open_store(audit_path: &Path) -> Result<Arc<Db>, DbError> {
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
         .await?;
+    // 首次打开时合并上次进程遗留的 WAL，避免主文件长期停留在 4KB。
+    if let Err(error) = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
+        .await
+    {
+        tracing::debug!(%error, "rollup open checkpoint skipped");
+    }
     let db = Arc::new(db);
     let _ = STORE.set((path, db.clone()));
     Ok(db)
