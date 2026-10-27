@@ -333,6 +333,17 @@ impl Row {
         }
     }
 
+    pub fn get_opt_f64(&self, idx: usize) -> Result<Option<f64>, DbError> {
+        match self.value(idx)? {
+            Value::Null => Ok(None),
+            Value::Real(v) => Ok(Some(*v)),
+            Value::Integer(v) => Ok(Some(*v as f64)),
+            other => Err(DbError::Shape(format!(
+                "column {idx}: expected real/null, got {other:?}"
+            ))),
+        }
+    }
+
     pub fn get_str(&self, idx: usize) -> Result<&str, DbError> {
         match self.value(idx)? {
             Value::Text(v) => Ok(v.as_str()),

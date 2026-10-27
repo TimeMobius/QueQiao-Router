@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::info;
 
+pub(crate) mod aggregate;
 pub mod archive;
 pub mod engine;
 pub mod extract;
