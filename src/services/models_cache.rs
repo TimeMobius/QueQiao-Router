@@ -144,9 +144,8 @@ impl ModelsCache {
     }
 
     /// Build the cache key for a (generation, optional credential) pair.
-    /// The credential is the raw Authorization token (Bearer + body, or
-    /// `x-api-key` body) as bytes — never a Rust string slice around a
-    /// longer lifetime, since we only consume bytes here.
+    /// `credential` is the encoded set of upstream keys actually used for the
+    /// refresh, so callers with different effective keys never share an entry.
     pub fn fingerprint(&self, credential: Option<&[u8]>) -> CredentialFingerprint {
         CredentialFingerprint::from_bytes(&self.salt, credential)
     }
