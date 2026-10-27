@@ -183,6 +183,21 @@ USING fts (SearchText) WITH (tokenizer = 'ngram');
 
 ---
 
+## 派生汇总库 `audit_aggregates.db`
+
+与审计库同目录、由网关自动维护的**派生**文件，用于加速历史区间分析：
+
+- 内容：按「归档分片 × 本地自然日」预聚合的请求数、成功/错误数、Token、延迟与首字延迟的总和/计数/最大值/直方图，
+  以及 model/apikey/ip/type/backend/client/status 维度。
+- 生命周期：纯派生数据，可随时删除。扫描到归档或首次分析时后台重建；文件指纹（大小、修改时间、时间范围、
+  schema 版本）不匹配会自动重建。构建失败只记录日志，不影响查询。
+- 生效范围：`/dashboard/api/analysis` 在**无筛选**且 `interval`/`dimension` 不是 `hour` 时读取该库；
+  带筛选、按小时统计、或汇总不可用时自动回退原有扫描路径，结果保持一致。
+  首尾不足一个本地自然日的区间会用原路径补扫，保证精确。
+- 空间：全量历史通常小于 10MB。`ANALYSIS_ROLLUP=off` 可全局关闭该加速。
+
+---
+
 ## 轮转与归档
 
 - 文件名：`record_YYYYMM.db` 或 `record_YYYYMM_<unix秒>.db`。

@@ -134,6 +134,7 @@ docker run -d \
 | `TZ` | 镜像默认（通常为 UTC） | 日志文件名轮转与所有日志时间戳均跟随该时区；部署时应设为宿主机时区（如 `TZ=Asia/Shanghai`），或挂载 `-v /etc/localtime:/etc/localtime:ro` 自动跟随宿主机 |
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
 | `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时跳过旧 SQLite 归档的自动升级；v8 归档照常查询 |
+| `ANALYSIS_ROLLUP` | 开启 | 历史分析读取 `audit_aggregates.db` 预聚合；设为 `off` 时全部走原始扫描（用于对照与排查） |
 
 ---
 
