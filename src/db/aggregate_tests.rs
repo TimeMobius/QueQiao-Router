@@ -100,7 +100,15 @@ async fn active_rollup_accumulates_only_new_rows() {
     .await;
 
     ensure_active(&audit_path, "active", &store).await.unwrap();
-    assert!(active_caught_up(&audit_path, "active", &store).await);
+    assert!(
+        active_caught_up(
+            &audit_path,
+            "active",
+            &store,
+            next_local_day(day2).unwrap() - 1
+        )
+        .await
+    );
 
     let slice = read_active_slice(&audit_path, "active", day1, day2)
         .await
@@ -249,10 +257,65 @@ async fn active_rollup_is_not_ready_before_build() {
         Value::Null,
     )
     .await;
-    assert!(!active_caught_up(&audit_path, "active", &store).await);
+    assert!(
+        !active_caught_up(
+            &audit_path,
+            "active",
+            &store,
+            next_local_day(day).unwrap() - 1
+        )
+        .await
+    );
     assert!(
         read_active_slice(&audit_path, "active", day, next_local_day(day).unwrap())
             .await
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn active_rollup_is_ready_before_today_is_processed() {
+    let dir = temp_dir("ready-boundary");
+    let audit_path = dir.join("record.db");
+    let store = open_store(&dir, "record.db").await;
+    let yesterday = today_minus(1);
+    insert(
+        &store,
+        yesterday + 1000,
+        "m",
+        Value::Integer(200),
+        1,
+        Value::Null,
+        Value::Null,
+    )
+    .await;
+    ensure_active(&audit_path, "active", &store).await.unwrap();
+    insert(
+        &store,
+        today_minus(0) + 1000,
+        "m",
+        Value::Integer(200),
+        1,
+        Value::Null,
+        Value::Null,
+    )
+    .await;
+    assert!(
+        active_caught_up(
+            &audit_path,
+            "active",
+            &store,
+            next_local_day(yesterday).unwrap() - 1
+        )
+        .await
+    );
+    assert!(
+        !active_caught_up(
+            &audit_path,
+            "active",
+            &store,
+            next_local_day(today_minus(0)).unwrap() - 1
+        )
+        .await
     );
 }

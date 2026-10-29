@@ -74,7 +74,13 @@ pub(super) async fn analyse(
         if shard.is_active {
             if let Some((first_full, full_end)) = full_day_bounds(from, to) {
                 if full_end > first_full
-                    && aggregate::active_caught_up(&audit_path, &shard.id, &shard.store).await
+                    && aggregate::active_caught_up(
+                        &audit_path,
+                        &shard.id,
+                        &shard.store,
+                        full_end - 1,
+                    )
+                    .await
                 {
                     if let Some(slice) =
                         aggregate::read_active_slice(&audit_path, &shard.id, first_full, full_end)
@@ -213,6 +219,9 @@ pub(super) async fn analyse(
 }
 
 fn spawn_active_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
+    if !aggregate::claim_build_spawn(30_000) {
+        return;
+    }
     let shard_id = shard.id.clone();
     let store = shard.store.clone();
     tokio::spawn(async move {
@@ -858,7 +867,15 @@ mod tests {
         aggregate::ensure_active(&audit_path, "active", &fixture.store)
             .await
             .unwrap();
-        assert!(aggregate::active_caught_up(&audit_path, "active", &fixture.store).await);
+        assert!(
+            aggregate::active_caught_up(
+                &audit_path,
+                "active",
+                &fixture.store,
+                aggregate::next_local_day(fixture.days[1]).unwrap() - 1
+            )
+            .await
+        );
 
         let from = fixture.days[0];
         let to = aggregate::next_local_day(fixture.days[1]).unwrap() - 1;

@@ -100,6 +100,7 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS active_state (
         shard_id TEXT PRIMARY KEY,
         last_id INTEGER NOT NULL,
+        max_time_ms INTEGER NOT NULL DEFAULT 0,
         dev INTEGER NOT NULL DEFAULT 0,
         ino INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
@@ -255,6 +256,9 @@ async fn open_store(audit_path: &Path) -> Result<Arc<Db>, DbError> {
     for ddl in DDL {
         conn.execute_batch(ddl).await?;
     }
+    let _ = conn
+        .execute_batch("ALTER TABLE active_state ADD COLUMN max_time_ms INTEGER NOT NULL DEFAULT 0")
+        .await;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
         .await?;
     // 首次打开时合并上次进程遗留的 WAL，避免主文件长期停留在 4KB。
@@ -446,16 +450,26 @@ async fn read_range(
     Some(slice)
 }
 
-async fn active_state(db: &Db, shard_id: &str) -> Result<Option<(i64, (i64, i64))>, DbError> {
+struct ActiveState {
+    last_id: i64,
+    max_time_ms: i64,
+    identity: (i64, i64),
+}
+
+async fn active_state(db: &Db, shard_id: &str) -> Result<Option<ActiveState>, DbError> {
     let conn = db.connect()?;
     let row = conn
         .query_one(
-            "SELECT last_id, dev, ino FROM active_state WHERE shard_id = ?",
+            "SELECT last_id, max_time_ms, dev, ino FROM active_state WHERE shard_id = ?",
             vec![Value::Text(shard_id.to_string())],
         )
         .await?;
     match row {
-        Some(row) => Ok(Some((row.get_i64(0)?, (row.get_i64(1)?, row.get_i64(2)?)))),
+        Some(row) => Ok(Some(ActiveState {
+            last_id: row.get_i64(0)?,
+            max_time_ms: row.get_i64(1)?,
+            identity: (row.get_i64(2)?, row.get_i64(3)?),
+        })),
         None => Ok(None),
     }
 }
@@ -536,22 +550,41 @@ async fn max_record_id(store: &AuditStore) -> Result<i64, DbError> {
         .unwrap_or(0))
 }
 
-/// active 分片是否已按 `id` 追平当前库；未构建或落后时返回 false。
+/// active 分片是否已聚合到 `needed_ms`（通常为最后一个完整自然日的末尾）。
 pub(crate) async fn active_caught_up(
     audit_path: &Path,
     shard_id: &str,
     store: &AuditStore,
+    needed_ms: i64,
 ) -> bool {
     let Ok(db) = open_store(audit_path).await else {
         return false;
     };
-    let Ok(Some((last_id, _))) = active_state(&db, shard_id).await else {
+    let Ok(Some(state)) = active_state(&db, shard_id).await else {
         return false;
     };
-    let Ok(max_id) = max_record_id(store).await else {
+    if state.max_time_ms >= needed_ms {
+        return true;
+    }
+    let pending = store
+        .query(
+            "SELECT 1 FROM records WHERE id > ? AND TimeMs IS NOT NULL AND TimeMs <= ? LIMIT 1",
+            vec![Value::Integer(state.last_id), Value::Integer(needed_ms)],
+        )
+        .await;
+    matches!(pending, Ok(rows) if rows.is_empty())
+}
+
+/// 后台重建去抖：`min_interval_ms` 内只放行一次。
+pub(crate) fn claim_build_spawn(min_interval_ms: i64) -> bool {
+    static LAST_SPAWN_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = now_ms();
+    let last = LAST_SPAWN_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < min_interval_ms {
         return false;
-    };
-    max_id == last_id
+    }
+    LAST_SPAWN_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 async fn clear_shard(db: &Db, shard_id: &str) -> Result<(), DbError> {
@@ -602,6 +635,7 @@ async fn acquire_build_lock(audit_path: &Path) -> Result<std::fs::File, DbError>
 
 #[derive(Default)]
 struct Delta {
+    max_time_ms: i64,
     days: HashMap<i64, Acc>,
     dims: HashMap<(&'static str, i64, String), Acc>,
     distinct: HashSet<(&'static str, i64, String)>,
@@ -613,6 +647,7 @@ struct Delta {
 async fn scan_after(store: &AuditStore, last_id: i64) -> Result<Delta, DbError> {
     let mut delta = Delta {
         max_id: last_id,
+        max_time_ms: 0,
         ..Delta::default()
     };
     let mut cursor = last_id;
@@ -636,6 +671,7 @@ async fn scan_after(store: &AuditStore, last_id: i64) -> Result<Delta, DbError> 
             let Some(time_ms) = row.get_opt_i64(1)? else {
                 continue;
             };
+            delta.max_time_ms = delta.max_time_ms.max(time_ms);
             let Some(day_ms) = local_day_ms(time_ms) else {
                 continue;
             };
@@ -716,18 +752,23 @@ pub(crate) async fn ensure_active(
     let max_id = max_record_id(store).await?;
     let identity = file_identity(audit_path);
     let state = active_state(&db, shard_id).await?;
-    let mut last_id = state.map(|(last_id, _)| last_id).unwrap_or(0);
-    let rotated = state.is_some_and(|(_, stored)| stored != identity);
+    let mut last_id = state.as_ref().map(|state| state.last_id).unwrap_or(0);
+    let mut max_time_ms = state.as_ref().map(|state| state.max_time_ms).unwrap_or(0);
+    let rotated = state
+        .as_ref()
+        .is_some_and(|state| state.identity != identity);
     let stale_without_state = state.is_none() && shard_rollup_rows(&db, shard_id).await? > 0;
     if rotated || stale_without_state || max_id < last_id {
         clear_shard(&db, shard_id).await?;
         last_id = 0;
+        max_time_ms = 0;
     }
     if max_id == last_id {
         return Ok(());
     }
     let delta = scan_after(store, last_id).await?;
-    apply_deltas(&db, shard_id, &delta, max_id, identity).await
+    max_time_ms = max_time_ms.max(delta.max_time_ms);
+    apply_deltas(&db, shard_id, &delta, max_id, max_time_ms, identity).await
 }
 
 async fn apply_deltas(
@@ -735,6 +776,7 @@ async fn apply_deltas(
     shard_id: &str,
     delta: &Delta,
     max_id: i64,
+    max_time_ms: i64,
     identity: (i64, i64),
 ) -> Result<(), DbError> {
     let mut days: Vec<i64> = delta.days.keys().copied().collect();
@@ -930,10 +972,12 @@ async fn apply_deltas(
         )
         .await?;
         conn.execute(
-            "INSERT INTO active_state (shard_id, last_id, dev, ino, updated_at_ms) VALUES (?,?,?,?,?)",
+            "INSERT INTO active_state (shard_id, last_id, max_time_ms, dev, ino, updated_at_ms) \
+             VALUES (?,?,?,?,?,?)",
             vec![
                 Value::Text(shard_id.to_string()),
                 Value::Integer(max_id),
+                Value::Integer(max_time_ms),
                 Value::Integer(identity.0),
                 Value::Integer(identity.1),
                 Value::Integer(now_ms()),

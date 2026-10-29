@@ -252,7 +252,7 @@ async fn rollup_groups(
         return Ok(None);
     }
     let slice = if shard.is_active {
-        if !aggregate::active_caught_up(audit_path, &shard.id, &shard.store).await {
+        if !aggregate::active_caught_up(audit_path, &shard.id, &shard.store, full_end - 1).await {
             spawn_active_build(audit_path.to_path_buf(), shard);
             return Ok(None);
         }
@@ -305,6 +305,9 @@ async fn rollup_groups(
 }
 
 fn spawn_active_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
+    if !aggregate::claim_build_spawn(30_000) {
+        return;
+    }
     let shard_id = shard.id.clone();
     let store = shard.store.clone();
     tokio::spawn(async move {
