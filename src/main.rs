@@ -95,6 +95,15 @@ fn main() {
 
         init_rotation_state(&app_state).await;
 
+        // 启动时后台预热 active 分片的派生汇总；未完成前查询自动回退到扫描路径。
+        {
+            let state = app_state.clone();
+            tokio::spawn(async move {
+                let store = state.active_db().await;
+                db::warm_active_rollup(&store).await;
+            });
+        }
+
         // ============================================================================
         // 启动独立 Metrics Worker 线程
         // ============================================================================

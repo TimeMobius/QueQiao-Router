@@ -3,7 +3,7 @@
 //! 该库是**纯派生数据**：可随时删除，缺失或指纹不符时调用方回退到扫描路径。
 //! 文件与审计库同目录（Docker 只持久化 `logs/`），默认名 `audit_aggregates.db`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -97,6 +97,13 @@ const DDL: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_day_dim_lookup ON day_dim(shard_id, dim, day_ms)",
     "CREATE INDEX IF NOT EXISTS idx_day_distinct_lookup ON day_distinct(shard_id, dim, day_ms)",
     "CREATE INDEX IF NOT EXISTS idx_day_hist_lookup ON day_hist(shard_id, day_ms)",
+    "CREATE TABLE IF NOT EXISTS active_state (
+        shard_id TEXT PRIMARY KEY,
+        last_id INTEGER NOT NULL,
+        dev INTEGER NOT NULL DEFAULT 0,
+        ino INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms INTEGER NOT NULL
+    )",
 ];
 
 type RollupStore = (PathBuf, Arc<Db>);
@@ -319,6 +326,30 @@ pub(crate) async fn read_slice(
     if !valid(&db, shard_id, archive_path, min_ms, max_ms).await {
         return None;
     }
+    read_range(&db, shard_id, first_day, end_day_exclusive).await
+}
+
+/// 读取 active 分片在整日区间内的汇总；该分片的汇总尚未构建时返回 `None`。
+pub(crate) async fn read_active_slice(
+    audit_path: &Path,
+    shard_id: &str,
+    first_day: i64,
+    end_day_exclusive: i64,
+) -> Option<Slice> {
+    if end_day_exclusive <= first_day {
+        return Some(Slice::default());
+    }
+    let db = open_store(audit_path).await.ok()?;
+    active_state(&db, shard_id).await.ok()??;
+    read_range(&db, shard_id, first_day, end_day_exclusive).await
+}
+
+async fn read_range(
+    db: &Db,
+    shard_id: &str,
+    first_day: i64,
+    end_day_exclusive: i64,
+) -> Option<Slice> {
     let conn = db.connect().ok()?;
     let mut slice = Slice::default();
 
@@ -415,6 +446,527 @@ pub(crate) async fn read_slice(
     Some(slice)
 }
 
+async fn active_state(db: &Db, shard_id: &str) -> Result<Option<(i64, (i64, i64))>, DbError> {
+    let conn = db.connect()?;
+    let row = conn
+        .query_one(
+            "SELECT last_id, dev, ino FROM active_state WHERE shard_id = ?",
+            vec![Value::Text(shard_id.to_string())],
+        )
+        .await?;
+    match row {
+        Some(row) => Ok(Some((row.get_i64(0)?, (row.get_i64(1)?, row.get_i64(2)?)))),
+        None => Ok(None),
+    }
+}
+
+/// 完整自然日区间 `[first_full, full_end)`；无完整自然日时退化为 `(from, from)`。
+/// 是否启用派生汇总（`ANALYSIS_ROLLUP=off` 可关闭）。
+pub(crate) fn enabled() -> bool {
+    !std::env::var("ANALYSIS_ROLLUP")
+        .map(|value| value.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+}
+
+pub(crate) fn full_day_bounds(from: i64, to: i64) -> Option<(i64, i64)> {
+    let from_day = local_day_ms(from)?;
+    let first_full = if from == from_day {
+        from_day
+    } else {
+        next_local_day(from_day)?
+    };
+    let to_day = local_day_ms(to)?;
+    let to_day_end = next_local_day(to_day)?;
+    let full_end = if to + 1 >= to_day_end {
+        to_day_end
+    } else {
+        to_day
+    };
+    Some((first_full, full_end))
+}
+
+/// 完整日之外的边界窗口，必须逐段回扫原始库。
+pub(crate) fn correction_windows(
+    from: i64,
+    to: i64,
+    first_full: i64,
+    full_end: i64,
+) -> Vec<(i64, i64)> {
+    let mut windows = Vec::new();
+    if from < first_full {
+        windows.push((from, first_full - 1));
+    }
+    if full_end <= to {
+        windows.push((full_end, to));
+    }
+    windows
+}
+
+fn file_identity(path: &Path) -> (i64, i64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = fs::metadata(path) {
+            return (metadata.dev() as i64, metadata.ino() as i64);
+        }
+    }
+    (0, 0)
+}
+
+async fn shard_rollup_rows(db: &Db, shard_id: &str) -> Result<i64, DbError> {
+    let conn = db.connect()?;
+    let row = conn
+        .query_one(
+            "SELECT COUNT(*) FROM day_agg WHERE shard_id = ?",
+            vec![Value::Text(shard_id.to_string())],
+        )
+        .await?;
+    Ok(row
+        .and_then(|row| row.get_opt_i64(0).ok().flatten())
+        .unwrap_or(0))
+}
+
+async fn max_record_id(store: &AuditStore) -> Result<i64, DbError> {
+    let rows = store
+        .query("SELECT MAX(id) AS max_id FROM records", Vec::new())
+        .await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get_opt_i64(0).ok().flatten())
+        .unwrap_or(0))
+}
+
+/// active 分片是否已按 `id` 追平当前库；未构建或落后时返回 false。
+pub(crate) async fn active_caught_up(
+    audit_path: &Path,
+    shard_id: &str,
+    store: &AuditStore,
+) -> bool {
+    let Ok(db) = open_store(audit_path).await else {
+        return false;
+    };
+    let Ok(Some((last_id, _))) = active_state(&db, shard_id).await else {
+        return false;
+    };
+    let Ok(max_id) = max_record_id(store).await else {
+        return false;
+    };
+    max_id == last_id
+}
+
+async fn clear_shard(db: &Db, shard_id: &str) -> Result<(), DbError> {
+    let conn = db.connect()?;
+    for table in [
+        "day_agg",
+        "day_dim",
+        "day_hist",
+        "day_distinct",
+        "shard_meta",
+    ] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE shard_id = ?"),
+            vec![Value::Text(shard_id.to_string())],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn acquire_build_lock(audit_path: &Path) -> Result<std::fs::File, DbError> {
+    let lock_path = PathBuf::from(format!("{}.lock", rollup_path(audit_path).display()));
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| DbError::Shape(format!("cannot open rollup lock: {error}")))?;
+    let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(DbError::Driver(turso::Error::Busy(
+                        "rollup lock timed out".to_string(),
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(DbError::Shape(format!("cannot lock rollup: {error}")));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Delta {
+    days: HashMap<i64, Acc>,
+    dims: HashMap<(&'static str, i64, String), Acc>,
+    distinct: HashSet<(&'static str, i64, String)>,
+    hist: HashMap<(i64, &'static str), Vec<u32>>,
+    max_id: i64,
+    scanned: i64,
+}
+
+async fn scan_after(store: &AuditStore, last_id: i64) -> Result<Delta, DbError> {
+    let mut delta = Delta {
+        max_id: last_id,
+        ..Delta::default()
+    };
+    let mut cursor = last_id;
+    loop {
+        let rows = store
+            .query(
+                "SELECT id, TimeMs, Model, ApiKey, IP, Type, Backend, ClientName, Status, \
+                 PromptTokens, CompletionTokens, TotalTokens, LatencyMs, TtftMs \
+                 FROM records WHERE id > ? ORDER BY id LIMIT ?",
+                vec![Value::Integer(cursor), Value::Integer(BUILD_BATCH)],
+            )
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let id = row.get_i64(0)?;
+            cursor = id;
+            delta.max_id = delta.max_id.max(id);
+            delta.scanned += 1;
+            let Some(time_ms) = row.get_opt_i64(1)? else {
+                continue;
+            };
+            let Some(day_ms) = local_day_ms(time_ms) else {
+                continue;
+            };
+            let status = row.get_opt_i64(8)?;
+            let tokens = (
+                row.get_opt_i64(9)?.unwrap_or(0),
+                row.get_opt_i64(10)?.unwrap_or(0),
+                row.get_opt_i64(11)?.unwrap_or(0),
+            );
+            let latency = row.get_opt_f64(12)?;
+            let ttft = row.get_opt_f64(13)?;
+            delta
+                .days
+                .entry(day_ms)
+                .or_default()
+                .observe(status, tokens, latency, ttft);
+
+            for (name, column) in [
+                ("model", 2),
+                ("apikey", 3),
+                ("ip", 4),
+                ("type", 5),
+                ("backend", 6),
+                ("client", 7),
+            ] {
+                let raw = row.get_opt_string(column)?;
+                let value = normalize_dim(raw.as_deref());
+                delta
+                    .dims
+                    .entry((name, day_ms, value))
+                    .or_default()
+                    .observe(status, tokens, latency, ttft);
+                if matches!(name, "model" | "ip") {
+                    if let Some(raw) = raw.as_deref() {
+                        delta.distinct.insert((name, day_ms, raw.to_string()));
+                    }
+                }
+            }
+            let status_value = status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            delta
+                .dims
+                .entry(("status", day_ms, status_value))
+                .or_default()
+                .observe(status, tokens, latency, ttft);
+
+            if let Some(bucket) = histogram_bucket(latency) {
+                let entry = delta
+                    .hist
+                    .entry((day_ms, "latency"))
+                    .or_insert_with(|| vec![0; HIST_BUCKETS]);
+                entry[bucket as usize] += 1;
+            }
+            if let Some(bucket) = histogram_bucket(ttft) {
+                let entry = delta
+                    .hist
+                    .entry((day_ms, "ttft"))
+                    .or_insert_with(|| vec![0; HIST_BUCKETS]);
+                entry[bucket as usize] += 1;
+            }
+        }
+        if (rows.len() as i64) < BUILD_BATCH {
+            break;
+        }
+    }
+    Ok(delta)
+}
+
+/// 把 `id` 水位之后的新增记录累加进 active 分片的按日汇总。
+pub(crate) async fn ensure_active(
+    audit_path: &Path,
+    shard_id: &str,
+    store: &AuditStore,
+) -> Result<(), DbError> {
+    let db = open_store(audit_path).await?;
+    let _lock = acquire_build_lock(audit_path).await?;
+    let max_id = max_record_id(store).await?;
+    let identity = file_identity(audit_path);
+    let state = active_state(&db, shard_id).await?;
+    let mut last_id = state.map(|(last_id, _)| last_id).unwrap_or(0);
+    let rotated = state.is_some_and(|(_, stored)| stored != identity);
+    let stale_without_state = state.is_none() && shard_rollup_rows(&db, shard_id).await? > 0;
+    if rotated || stale_without_state || max_id < last_id {
+        clear_shard(&db, shard_id).await?;
+        last_id = 0;
+    }
+    if max_id == last_id {
+        return Ok(());
+    }
+    let delta = scan_after(store, last_id).await?;
+    apply_deltas(&db, shard_id, &delta, max_id, identity).await
+}
+
+async fn apply_deltas(
+    db: &Db,
+    shard_id: &str,
+    delta: &Delta,
+    max_id: i64,
+    identity: (i64, i64),
+) -> Result<(), DbError> {
+    let mut days: Vec<i64> = delta.days.keys().copied().collect();
+    days.extend(delta.dims.keys().map(|(_, day, _)| *day));
+    days.extend(delta.hist.keys().map(|(day, _)| *day));
+    days.extend(delta.distinct.iter().map(|(_, day, _)| *day));
+    days.sort_unstable();
+    days.dedup();
+
+    let conn = db.connect()?;
+    conn.execute_batch("BEGIN IMMEDIATE").await?;
+    let write = async {
+        for day in days {
+            let existing = conn
+                .query_one(
+                    "SELECT rows_all, counted, success, errors, prompt_tokens, completion_tokens, \
+                     total_tokens, latency_sum, latency_count, latency_max, ttft_sum, ttft_count \
+                     FROM day_agg WHERE shard_id = ? AND day_ms = ?",
+                    vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+                )
+                .await?;
+            let mut acc = existing
+                .as_ref()
+                .and_then(|row| acc_from_row(row, 0))
+                .unwrap_or_default();
+            if let Some(add) = delta.days.get(&day) {
+                acc.add(add);
+            }
+            conn.execute(
+                "DELETE FROM day_agg WHERE shard_id = ? AND day_ms = ?",
+                vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+            )
+            .await?;
+            if acc.rows_all > 0 {
+                let mut params = acc_params(shard_id, day, &acc);
+                conn.execute(
+                    "INSERT INTO day_agg (shard_id, day_ms, rows_all, counted, success, errors, \
+                     prompt_tokens, completion_tokens, total_tokens, latency_sum, latency_count, \
+                     latency_max, ttft_sum, ttft_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    std::mem::take(&mut params),
+                )
+                .await?;
+            }
+
+            let mut dims: HashMap<(String, String), Acc> = HashMap::new();
+            for row in conn
+                .query(
+                    "SELECT dim, value, rows_all, counted, success, errors, prompt_tokens, \
+                     completion_tokens, total_tokens, latency_sum, latency_count, latency_max, \
+                     ttft_sum, ttft_count FROM day_dim WHERE shard_id = ? AND day_ms = ?",
+                    vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+                )
+                .await?
+            {
+                let Some(dim) = row.get_opt_string(0)? else {
+                    continue;
+                };
+                let Some(value) = row.get_opt_string(1)? else {
+                    continue;
+                };
+                if let Some(acc) = acc_from_row(&row, 2) {
+                    dims.insert((dim, value), acc);
+                }
+            }
+            for ((name, delta_day, value), add) in &delta.dims {
+                if *delta_day != day {
+                    continue;
+                }
+                dims.entry(((*name).to_string(), value.clone()))
+                    .or_default()
+                    .add(add);
+            }
+            conn.execute(
+                "DELETE FROM day_dim WHERE shard_id = ? AND day_ms = ?",
+                vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+            )
+            .await?;
+            for ((dim, value), acc) in &dims {
+                if acc.rows_all == 0 {
+                    continue;
+                }
+                let mut params = acc_params(shard_id, day, acc);
+                params.push(Value::Text(dim.clone()));
+                params.push(Value::Text(value.clone()));
+                conn.execute(
+                    "INSERT INTO day_dim (shard_id, day_ms, rows_all, counted, success, errors, \
+                     prompt_tokens, completion_tokens, total_tokens, latency_sum, latency_count, \
+                     latency_max, ttft_sum, ttft_count, dim, value) \
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params,
+                )
+                .await?;
+            }
+
+            let mut hist: HashMap<String, Vec<u32>> = HashMap::new();
+            for row in conn
+                .query(
+                    "SELECT kind, buckets FROM day_hist WHERE shard_id = ? AND day_ms = ?",
+                    vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+                )
+                .await?
+            {
+                let Some(kind) = row.get_opt_string(0)? else {
+                    continue;
+                };
+                let Some(blob) = row.get_opt_blob(1)? else {
+                    continue;
+                };
+                let mut buckets = vec![0_u32; HIST_BUCKETS];
+                if blob.len() == HIST_BUCKETS * 4 {
+                    for (index, chunk) in blob.chunks_exact(4).enumerate() {
+                        buckets[index] =
+                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    }
+                }
+                hist.insert(kind, buckets);
+            }
+            for ((delta_day, kind), add) in &delta.hist {
+                if *delta_day != day {
+                    continue;
+                }
+                let entry = hist
+                    .entry((*kind).to_string())
+                    .or_insert_with(|| vec![0; HIST_BUCKETS]);
+                for (index, count) in add.iter().enumerate() {
+                    entry[index] = entry[index].saturating_add(*count);
+                }
+            }
+            conn.execute(
+                "DELETE FROM day_hist WHERE shard_id = ? AND day_ms = ?",
+                vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+            )
+            .await?;
+            for (kind, buckets) in &hist {
+                if buckets.iter().all(|count| *count == 0) {
+                    continue;
+                }
+                conn.execute(
+                    "INSERT INTO day_hist (shard_id, day_ms, kind, buckets) VALUES (?,?,?,?)",
+                    vec![
+                        Value::Text(shard_id.to_string()),
+                        Value::Integer(day),
+                        Value::Text(kind.clone()),
+                        Value::Blob(encode_histogram(buckets)),
+                    ],
+                )
+                .await?;
+            }
+
+            let mut distinct: HashSet<(String, String)> = HashSet::new();
+            for row in conn
+                .query(
+                    "SELECT dim, value FROM day_distinct WHERE shard_id = ? AND day_ms = ?",
+                    vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+                )
+                .await?
+            {
+                let Some(dim) = row.get_opt_string(0)? else {
+                    continue;
+                };
+                let Some(value) = row.get_opt_string(1)? else {
+                    continue;
+                };
+                distinct.insert((dim, value));
+            }
+            for (name, delta_day, value) in &delta.distinct {
+                if *delta_day == day {
+                    distinct.insert(((*name).to_string(), value.clone()));
+                }
+            }
+            conn.execute(
+                "DELETE FROM day_distinct WHERE shard_id = ? AND day_ms = ?",
+                vec![Value::Text(shard_id.to_string()), Value::Integer(day)],
+            )
+            .await?;
+            for (dim, value) in &distinct {
+                conn.execute(
+                    "INSERT INTO day_distinct (shard_id, day_ms, dim, value) VALUES (?,?,?,?)",
+                    vec![
+                        Value::Text(shard_id.to_string()),
+                        Value::Integer(day),
+                        Value::Text(dim.clone()),
+                        Value::Text(value.clone()),
+                    ],
+                )
+                .await?;
+            }
+        }
+
+        conn.execute(
+            "DELETE FROM active_state WHERE shard_id = ?",
+            vec![Value::Text(shard_id.to_string())],
+        )
+        .await?;
+        conn.execute(
+            "INSERT INTO active_state (shard_id, last_id, dev, ino, updated_at_ms) VALUES (?,?,?,?,?)",
+            vec![
+                Value::Text(shard_id.to_string()),
+                Value::Integer(max_id),
+                Value::Integer(identity.0),
+                Value::Integer(identity.1),
+                Value::Integer(now_ms()),
+            ],
+        )
+        .await?;
+        Ok::<(), DbError>(())
+    }
+    .await;
+    match write {
+        Ok(()) => {
+            conn.execute_batch("COMMIT").await?;
+            if let Err(error) = conn
+                .query("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
+                .await
+            {
+                tracing::debug!(%error, "active rollup checkpoint skipped");
+            }
+            info!(
+                shard = shard_id,
+                rows = delta.scanned,
+                last_id = max_id,
+                "active rollup updated"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
 fn acc_from_row(row: &crate::db::engine::Row, offset: usize) -> Option<Acc> {
     Some(Acc {
         rows_all: row.get_opt_i64(offset).ok()?.unwrap_or(0),
@@ -500,31 +1052,7 @@ async fn ensure(input: &BuildInput<'_>) -> Result<(), DbError> {
     {
         return Ok(());
     }
-    let lock_path = PathBuf::from(format!("{}.lock", rollup_path(input.audit_path).display()));
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| DbError::Shape(format!("cannot open rollup lock: {error}")))?;
-    let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
-    loop {
-        match lock.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(DbError::Driver(turso::Error::Busy(
-                        "rollup lock timed out".to_string(),
-                    )));
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(DbError::Shape(format!("cannot lock rollup: {error}")));
-            }
-        }
-    }
+    let _lock = acquire_build_lock(input.audit_path).await?;
     if valid(
         &db,
         input.shard_id,
@@ -788,3 +1316,7 @@ pub(crate) async fn forget(audit_path: &Path, shard_id: &str) -> Result<(), DbEr
         .await;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "aggregate_tests.rs"]
+mod tests;
