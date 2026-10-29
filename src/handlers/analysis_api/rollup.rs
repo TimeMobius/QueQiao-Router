@@ -31,9 +31,7 @@ pub(super) struct Data {
 }
 
 pub(super) fn enabled() -> bool {
-    !std::env::var("ANALYSIS_ROLLUP")
-        .map(|value| value.eq_ignore_ascii_case("off"))
-        .unwrap_or(false)
+    aggregate::enabled()
 }
 
 pub(super) fn supports(params: &AnalysisParams) -> bool {
@@ -67,10 +65,6 @@ pub(super) async fn analyse(
     if !enabled() || !supports(params) || interval == "hour" || dim == "hour" {
         return Ok(None);
     }
-    if !shards.iter().any(|shard| !shard.is_active) {
-        return Ok(None);
-    }
-
     let audit_path = crate::db::resolve_db_path();
     let mut data = Data::default();
     let mut models: HashSet<String> = HashSet::new();
@@ -78,6 +72,61 @@ pub(super) async fn analyse(
 
     for shard in shards {
         if shard.is_active {
+            if let Some((first_full, full_end)) = full_day_bounds(from, to) {
+                if full_end > first_full
+                    && aggregate::active_caught_up(&audit_path, &shard.id, &shard.store).await
+                {
+                    if let Some(slice) =
+                        aggregate::read_active_slice(&audit_path, &shard.id, first_full, full_end)
+                            .await
+                    {
+                        let mut per_shard = slice_to_scan(&slice, interval, dim);
+                        models.extend(
+                            slice
+                                .distinct
+                                .get("model")
+                                .into_iter()
+                                .flatten()
+                                .filter(|value| !value.is_empty())
+                                .cloned(),
+                        );
+                        ips.extend(
+                            slice
+                                .distinct
+                                .get("ip")
+                                .into_iter()
+                                .flatten()
+                                .filter(|value| !value.is_empty())
+                                .cloned(),
+                        );
+                        for (correction_from, correction_to) in
+                            correction_windows(from, to, first_full, full_end)
+                        {
+                            let scan = scan_shard(
+                                shard,
+                                params,
+                                correction_from,
+                                correction_to,
+                                interval,
+                                dim_expr,
+                            )
+                            .await?;
+                            models.extend(
+                                distinct_values(shard, correction_from, correction_to, "Model")
+                                    .await?,
+                            );
+                            ips.extend(
+                                distinct_values(shard, correction_from, correction_to, "IP")
+                                    .await?,
+                            );
+                            merge_scan(&mut per_shard, scan);
+                        }
+                        push_scan(&mut data, per_shard);
+                        continue;
+                    }
+                }
+            }
+            spawn_active_build(audit_path.clone(), shard);
             let scan = scan_shard(shard, params, from, to, interval, dim_expr).await?;
             models.extend(distinct_values(shard, from, to, "Model").await?);
             ips.extend(distinct_values(shard, from, to, "IP").await?);
@@ -161,6 +210,16 @@ pub(super) async fn analyse(
     data.distinct_capped =
         models.len() >= DISTINCT_CAP as usize || ips.len() >= DISTINCT_CAP as usize;
     Ok(Some(data))
+}
+
+fn spawn_active_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
+    let shard_id = shard.id.clone();
+    let store = shard.store.clone();
+    tokio::spawn(async move {
+        if let Err(error) = aggregate::ensure_active(&audit_path, &shard_id, &store).await {
+            tracing::warn!(%error, "active rollup unavailable; analysis uses scan path");
+        }
+    });
 }
 
 fn spawn_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
@@ -381,33 +440,12 @@ fn slice_to_scan(slice: &Slice, interval: &str, dim: &str) -> ShardScan {
     }
 }
 
-/// 完整自然日区间 `[first_full, full_end)`；无完整自然日时返回退化区间。
 fn full_day_bounds(from: i64, to: i64) -> Option<(i64, i64)> {
-    let from_day = aggregate::local_day_ms(from)?;
-    let first_full = if from == from_day {
-        from_day
-    } else {
-        aggregate::next_local_day(from_day)?
-    };
-    let to_day = aggregate::local_day_ms(to)?;
-    let to_day_end = aggregate::next_local_day(to_day)?;
-    let full_end = if to + 1 >= to_day_end {
-        to_day_end
-    } else {
-        to_day
-    };
-    Some((first_full, full_end))
+    aggregate::full_day_bounds(from, to)
 }
 
 fn correction_windows(from: i64, to: i64, first_full: i64, full_end: i64) -> Vec<(i64, i64)> {
-    let mut windows = Vec::new();
-    if from < first_full {
-        windows.push((from, first_full - 1));
-    }
-    if full_end <= to {
-        windows.push((full_end, to));
-    }
-    windows
+    aggregate::correction_windows(from, to, first_full, full_end)
 }
 
 #[cfg(test)]
@@ -811,5 +849,44 @@ mod tests {
         assert!(supports(&params));
         params.errors = Some("1".to_string());
         assert!(!supports(&params));
+    }
+
+    #[tokio::test]
+    async fn active_rollup_matches_scan_for_complete_days() {
+        let fixture = fixture("active-parity", 40).await;
+        let audit_path = fixture.dir.join("record.db");
+        aggregate::ensure_active(&audit_path, "active", &fixture.store)
+            .await
+            .unwrap();
+        assert!(aggregate::active_caught_up(&audit_path, "active", &fixture.store).await);
+
+        let from = fixture.days[0];
+        let to = aggregate::next_local_day(fixture.days[1]).unwrap() - 1;
+        let (first_full, full_end) = full_day_bounds(from, to).unwrap();
+        assert_eq!((first_full, full_end), (from, to + 1));
+
+        let slice = aggregate::read_active_slice(&audit_path, "active", first_full, full_end)
+            .await
+            .unwrap();
+        let rolled = slice_to_scan(&slice, "day", "model");
+        let dim_expr = super::super::params::dimension_expr("model").unwrap();
+        let scanned = scan_shard(
+            &fixture.shard,
+            &AnalysisParams::default(),
+            from,
+            to,
+            "day",
+            dim_expr,
+        )
+        .await
+        .unwrap();
+
+        assert_metrics("summary", &rolled.summary.metrics, &scanned.summary.metrics);
+        assert_eq!(rolled.summary.models, scanned.summary.models);
+        assert_group_eq("trend", &rolled.trend, &scanned.trend);
+        assert_group_eq("dims", &rolled.dims, &scanned.dims);
+        assert_eq!(rolled.latency_hist, scanned.latency_hist);
+        assert_eq!(rolled.ttft_hist, scanned.ttft_hist);
+        std::fs::remove_dir_all(&fixture.dir).unwrap();
     }
 }
