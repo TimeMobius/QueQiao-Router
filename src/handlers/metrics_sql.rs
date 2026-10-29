@@ -2,7 +2,7 @@ use chrono::{Datelike, Local, TimeZone};
 use std::collections::HashMap;
 
 use super::metrics_cache::MetricValue;
-use super::{GroupBy, MetricName, MetricPeriod, MetricQuery};
+use super::{GroupBy, MetricFilters, MetricName, MetricPeriod, MetricQuery};
 use crate::db::engine::{DbError, Row, Value};
 use crate::handlers::records_api;
 
@@ -37,16 +37,25 @@ pub(super) fn build_filters(
     to: i64,
     full_shard: bool,
 ) -> (String, Vec<Value>) {
+    build_filters_for(&query.filters, from, to, full_shard)
+}
+
+pub(super) fn build_filters_for(
+    filters: &MetricFilters,
+    from: i64,
+    to: i64,
+    full_shard: bool,
+) -> (String, Vec<Value>) {
     let params = records_api::ListParams {
         from: (!full_shard).then_some(from),
         to: (!full_shard).then_some(to),
-        type_: query.filters.type_.clone(),
-        model: query.filters.model.clone(),
-        status: query.filters.status,
-        backend: query.filters.backend.clone(),
-        ip: query.filters.ip.clone(),
-        client: query.filters.client.clone(),
-        apikey: query.filters.apikey.clone(),
+        type_: filters.type_.clone(),
+        model: filters.model.clone(),
+        status: filters.status,
+        backend: filters.backend.clone(),
+        ip: filters.ip.clone(),
+        client: filters.client.clone(),
+        apikey: filters.apikey.clone(),
         ..Default::default()
     };
     let (mut where_sql, binds) = records_api::build_filters(&params);

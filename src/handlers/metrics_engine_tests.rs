@@ -235,10 +235,166 @@ async fn archive_cache_key_changes_when_file_changes() {
         group: GroupBy::Single("model".to_string()),
         metrics: vec![MetricName::Requests],
         cache_key: None,
+        filters: Default::default(),
+        from: 1,
+        to: 2,
+        rollup_dim: None,
     };
     let before = archive_cache_key(&job, "SELECT COUNT(*) FROM records").unwrap();
     std::fs::write(&path, b"changed and longer").unwrap();
     let after = archive_cache_key(&job, "SELECT COUNT(*) FROM records").unwrap();
     assert_ne!(before, after);
     std::fs::remove_file(path).unwrap();
+}
+
+fn rollup_temp_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("qq-metrics-rollup-{tag}-{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rollup_insert(
+    store: &crate::db::store::AuditStore,
+    time_ms: i64,
+    model: &str,
+    status: DbValue,
+    latency: DbValue,
+) {
+    store
+        .execute(
+            "INSERT INTO records (Time, TimeMs, Model, ApiKey, IP, Type, Backend, ClientName, \
+             Status, PromptTokens, CompletionTokens, TotalTokens, LatencyMs, TtftMs, SearchText) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            vec![
+                DbValue::Text("2026-10-01 00:00:00.000000".to_string()),
+                DbValue::Integer(time_ms),
+                DbValue::Text(model.to_string()),
+                DbValue::Text("sk-a".to_string()),
+                DbValue::Text("10.0.0.1".to_string()),
+                DbValue::Text("chat.completions".to_string()),
+                DbValue::Text("b1".to_string()),
+                DbValue::Text("cli-a".to_string()),
+                status,
+                DbValue::Integer(10),
+                DbValue::Integer(20),
+                DbValue::Integer(30),
+                latency,
+                DbValue::Null,
+                DbValue::Text("text".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn metrics_rollup_matches_scan_for_complete_days() {
+    let dir = rollup_temp_dir("parity");
+    let audit_path = dir.join("record.db");
+    let store = crate::db::store::AuditStore::open(&audit_path, false, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let day1 = aggregate::local_day_ms(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 3 * 86_400_000,
+    )
+    .unwrap();
+    let day2 = aggregate::next_local_day(day1).unwrap();
+    rollup_insert(
+        &store,
+        day1 + 1000,
+        "gpt-4",
+        DbValue::Integer(200),
+        DbValue::Real(100.0),
+    )
+    .await;
+    rollup_insert(
+        &store,
+        day1 + 2000,
+        "gpt-4",
+        DbValue::Integer(500),
+        DbValue::Real(300.0),
+    )
+    .await;
+    rollup_insert(&store, day1 + 3000, "", DbValue::Null, DbValue::Null).await;
+    rollup_insert(
+        &store,
+        day2 + 1000,
+        "claude",
+        DbValue::Integer(201),
+        DbValue::Real(50.0),
+    )
+    .await;
+    aggregate::ensure_active(&audit_path, "active", &store)
+        .await
+        .unwrap();
+
+    let shard = ShardInput {
+        id: "active".to_string(),
+        store: store.clone(),
+        path: Some(audit_path.clone()),
+        min_ms: None,
+        max_ms: None,
+        is_active: true,
+        active_month: None,
+    };
+    let from = day1;
+    let to = aggregate::next_local_day(day2).unwrap() - 1;
+    let filters = MetricFilters::default();
+    let metrics = vec![
+        MetricName::Requests,
+        MetricName::Success,
+        MetricName::Errors,
+        MetricName::PromptTokens,
+        MetricName::TotalTokens,
+        MetricName::LatencySum,
+        MetricName::LatencyCount,
+        MetricName::MaxLatency,
+        MetricName::TtftSum,
+        MetricName::TtftCount,
+    ];
+    let rolled = rollup_groups(&audit_path, &shard, "model", &filters, from, to, &metrics)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (where_sql, binds) = build_filters_for(&filters, from, to, false);
+    let group = GroupBy::Single("model".to_string());
+    let sql = build_sql(&group_expression(&group), &metrics, &where_sql);
+    let job = Job {
+        shard: shard.clone(),
+        full: false,
+        where_sql,
+        binds,
+        group,
+        metrics: metrics.clone(),
+        cache_key: None,
+        filters: filters.clone(),
+        from,
+        to,
+        rollup_dim: Some("model"),
+    };
+    let scanned = scan_groups(&job, &sql).await.unwrap();
+
+    assert_eq!(rolled.len(), scanned.len());
+    for (key, expected) in &scanned {
+        let actual = &rolled[key];
+        for metric in &metrics {
+            assert!(
+                (actual[metric].number() - expected[metric].number()).abs() < 1e-9,
+                "{key} {metric:?}: {} vs {}",
+                actual[metric].number(),
+                expected[metric].number()
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
