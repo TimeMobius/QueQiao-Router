@@ -31,7 +31,8 @@ fn msg_is_empty(msg: &Message) -> bool {
     }
 }
 
-/// 处理消息：清理空白字符和合并连续的用户消息
+/// 处理消息：清理空白字符，并删除内容为空的用户消息。
+/// 连续的用户消息原样保留（不合并），以兼容每轮追加上下文的客户端。
 pub fn process_messages(mut messages: Vec<Message>) -> Vec<Message> {
     if messages.is_empty() {
         return vec![];
@@ -39,22 +40,15 @@ pub fn process_messages(mut messages: Vec<Message>) -> Vec<Message> {
 
     messages.par_iter_mut().for_each(|msg| sanitize_msg(msg));
 
-    let mut result: Vec<Message> = Vec::new();
-    for msg in messages {
-        if msg_is_empty(&msg) && msg.tool_calls.is_none() && !has_reasoning(&msg) {
-            continue;
-        }
-        if let Some(last_message) = result.last_mut() {
-            if last_message.role == "user" && msg.role == "user" {
-                *last_message = msg;
-            } else {
-                result.push(msg);
-            }
-        } else {
-            result.push(msg);
-        }
-    }
-    result
+    messages
+        .into_iter()
+        .filter(|msg| {
+            !(msg.role == "user"
+                && msg_is_empty(msg)
+                && msg.tool_calls.is_none()
+                && !has_reasoning(msg))
+        })
+        .collect()
 }
 
 /// 过滤空消息：content 为空时，仍保留携带工具调用或思考内容的消息
@@ -123,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_messages_merge_consecutive_user() {
+    fn test_process_messages_keeps_consecutive_user() {
         let messages = vec![
             create_message("user", "First message"),
             create_message("user", "Second message"),
@@ -131,11 +125,35 @@ mod tests {
         ];
 
         let result = process_messages(messages);
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 3);
         assert_eq!(result[0].role, "user");
         assert_eq!(
             result[0].content.as_ref().unwrap(),
+            &MessageContent::String("First message".to_string())
+        );
+        assert_eq!(result[1].role, "user");
+        assert_eq!(
+            result[1].content.as_ref().unwrap(),
             &MessageContent::String("Second message".to_string())
+        );
+        assert_eq!(result[2].role, "assistant");
+    }
+
+    #[test]
+    fn test_process_messages_removes_empty_user_only() {
+        let messages = vec![
+            create_message("user", "  "),
+            create_message("assistant", ""),
+            create_message("user", "Keep me"),
+        ];
+
+        let result = process_messages(messages);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, "assistant");
+        assert_eq!(result[1].role, "user");
+        assert_eq!(
+            result[1].content.as_ref().unwrap(),
+            &MessageContent::String("Keep me".to_string())
         );
     }
 
