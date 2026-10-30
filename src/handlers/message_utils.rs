@@ -31,7 +31,7 @@ fn msg_is_empty(msg: &Message) -> bool {
     }
 }
 
-/// 处理消息：清理空白字符，并删除内容为空的用户消息。
+/// 处理消息：清理空白字符并删除内容为空的消息（保留携带工具调用或思考内容的消息）。
 /// 连续的用户消息原样保留（不合并），以兼容每轮追加上下文的客户端。
 pub fn process_messages(mut messages: Vec<Message>) -> Vec<Message> {
     if messages.is_empty() {
@@ -42,12 +42,7 @@ pub fn process_messages(mut messages: Vec<Message>) -> Vec<Message> {
 
     messages
         .into_iter()
-        .filter(|msg| {
-            !(msg.role == "user"
-                && msg_is_empty(msg)
-                && msg.tool_calls.is_none()
-                && !has_reasoning(msg))
-        })
+        .filter(|msg| !(msg_is_empty(msg) && msg.tool_calls.is_none() && !has_reasoning(msg)))
         .collect()
 }
 
@@ -140,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_messages_removes_empty_user_only() {
+    fn test_process_messages_removes_empty_messages() {
         let messages = vec![
             create_message("user", "  "),
             create_message("assistant", ""),
@@ -148,11 +143,10 @@ mod tests {
         ];
 
         let result = process_messages(messages);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].role, "assistant");
-        assert_eq!(result[1].role, "user");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
         assert_eq!(
-            result[1].content.as_ref().unwrap(),
+            result[0].content.as_ref().unwrap(),
             &MessageContent::String("Keep me".to_string())
         );
     }
