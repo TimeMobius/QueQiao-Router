@@ -101,6 +101,7 @@ const DDL: &[&str] = &[
         shard_id TEXT PRIMARY KEY,
         last_id INTEGER NOT NULL,
         max_time_ms INTEGER NOT NULL DEFAULT 0,
+        last_time_ms INTEGER NOT NULL DEFAULT 0,
         dev INTEGER NOT NULL DEFAULT 0,
         ino INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
@@ -256,6 +257,11 @@ async fn open_store(audit_path: &Path) -> Result<Arc<Db>, DbError> {
     for ddl in DDL {
         conn.execute_batch(ddl).await?;
     }
+    let _ = conn
+        .execute_batch(
+            "ALTER TABLE active_state ADD COLUMN last_time_ms INTEGER NOT NULL DEFAULT 0",
+        )
+        .await;
     let _ = conn
         .execute_batch("ALTER TABLE active_state ADD COLUMN max_time_ms INTEGER NOT NULL DEFAULT 0")
         .await;
@@ -453,6 +459,7 @@ async fn read_range(
 struct ActiveState {
     last_id: i64,
     max_time_ms: i64,
+    last_time_ms: i64,
     identity: (i64, i64),
 }
 
@@ -460,7 +467,7 @@ async fn active_state(db: &Db, shard_id: &str) -> Result<Option<ActiveState>, Db
     let conn = db.connect()?;
     let row = conn
         .query_one(
-            "SELECT last_id, max_time_ms, dev, ino FROM active_state WHERE shard_id = ?",
+            "SELECT last_id, max_time_ms, last_time_ms, dev, ino FROM active_state WHERE shard_id = ?",
             vec![Value::Text(shard_id.to_string())],
         )
         .await?;
@@ -468,7 +475,8 @@ async fn active_state(db: &Db, shard_id: &str) -> Result<Option<ActiveState>, Db
         Some(row) => Ok(Some(ActiveState {
             last_id: row.get_i64(0)?,
             max_time_ms: row.get_i64(1)?,
-            identity: (row.get_i64(2)?, row.get_i64(3)?),
+            last_time_ms: row.get_i64(2)?,
+            identity: (row.get_i64(3)?, row.get_i64(4)?),
         })),
         None => Ok(None),
     }
@@ -694,6 +702,7 @@ async fn acquire_build_lock(audit_path: &Path) -> Result<std::fs::File, DbError>
 #[derive(Default)]
 struct Delta {
     max_time_ms: i64,
+    last_time_ms: i64,
     days: HashMap<i64, Acc>,
     dims: HashMap<(&'static str, i64, String), Acc>,
     distinct: HashSet<(&'static str, i64, String)>,
@@ -726,7 +735,9 @@ async fn scan_after(store: &AuditStore, last_id: i64) -> Result<Delta, DbError> 
             cursor = id;
             delta.max_id = delta.max_id.max(id);
             delta.scanned += 1;
-            let Some(time_ms) = row.get_opt_i64(1)? else {
+            let time_opt = row.get_opt_i64(1)?;
+            delta.last_time_ms = time_opt.unwrap_or(0);
+            let Some(time_ms) = time_opt else {
                 continue;
             };
             delta.max_time_ms = delta.max_time_ms.max(time_ms);
@@ -812,9 +823,27 @@ pub(crate) async fn ensure_active(
     let state = active_state(&db, shard_id).await?;
     let mut last_id = state.as_ref().map(|state| state.last_id).unwrap_or(0);
     let mut max_time_ms = state.as_ref().map(|state| state.max_time_ms).unwrap_or(0);
-    let rotated = state
+    let mut rotated = state
         .as_ref()
         .is_some_and(|state| state.identity != identity);
+    if !rotated {
+        if let Some(state) = state.as_ref() {
+            // 文件系统可能复用 inode（overlayfs），此时轮转后 identity 不变；
+            // 再比对游标行自身的时间戳，防止把新库当成旧库而漏掉数据。
+            if state.last_id > 0 && state.last_time_ms != 0 {
+                let cursor_time = store
+                    .query(
+                        "SELECT TimeMs FROM records WHERE id = ?",
+                        vec![Value::Integer(state.last_id)],
+                    )
+                    .await?
+                    .first()
+                    .and_then(|row| row.get_opt_i64(0).ok().flatten())
+                    .unwrap_or(0);
+                rotated = cursor_time != state.last_time_ms;
+            }
+        }
+    }
     let stale_without_state = state.is_none() && shard_rollup_rows(&db, shard_id).await? > 0;
     if rotated || stale_without_state || max_id < last_id {
         clear_shard(&db, shard_id).await?;
@@ -826,7 +855,16 @@ pub(crate) async fn ensure_active(
     }
     let delta = scan_after(store, last_id).await?;
     max_time_ms = max_time_ms.max(delta.max_time_ms);
-    apply_deltas(&db, shard_id, &delta, max_id, max_time_ms, identity).await
+    apply_deltas(
+        &db,
+        shard_id,
+        &delta,
+        max_id,
+        max_time_ms,
+        delta.last_time_ms,
+        identity,
+    )
+    .await
 }
 
 async fn apply_deltas(
@@ -835,6 +873,7 @@ async fn apply_deltas(
     delta: &Delta,
     max_id: i64,
     max_time_ms: i64,
+    last_time_ms: i64,
     identity: (i64, i64),
 ) -> Result<(), DbError> {
     let mut days: Vec<i64> = delta.days.keys().copied().collect();
@@ -1030,12 +1069,13 @@ async fn apply_deltas(
         )
         .await?;
         conn.execute(
-            "INSERT INTO active_state (shard_id, last_id, max_time_ms, dev, ino, updated_at_ms) \
-             VALUES (?,?,?,?,?,?)",
+            "INSERT INTO active_state (shard_id, last_id, max_time_ms, last_time_ms, dev, ino, \
+             updated_at_ms) VALUES (?,?,?,?,?,?,?)",
             vec![
                 Value::Text(shard_id.to_string()),
                 Value::Integer(max_id),
                 Value::Integer(max_time_ms),
+                Value::Integer(last_time_ms),
                 Value::Integer(identity.0),
                 Value::Integer(identity.1),
                 Value::Integer(now_ms()),

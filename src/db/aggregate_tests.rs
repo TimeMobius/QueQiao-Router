@@ -242,6 +242,51 @@ async fn active_rollup_resets_when_database_rotates() {
 }
 
 #[tokio::test]
+async fn active_rollup_resets_when_cursor_row_time_changes() {
+    let dir = temp_dir("cursor-mismatch");
+    let audit_path = dir.join("record.db");
+    let store = open_store(&dir, "record.db").await;
+    let day = today_minus(2);
+    insert(
+        &store,
+        day + 1000,
+        "old",
+        Value::Integer(200),
+        10,
+        Value::Null,
+        Value::Null,
+    )
+    .await;
+    ensure_active(&audit_path, "active", &store).await.unwrap();
+
+    store
+        .execute("DELETE FROM records", Vec::new())
+        .await
+        .unwrap();
+    insert(
+        &store,
+        day + 5000,
+        "new",
+        Value::Integer(200),
+        1,
+        Value::Null,
+        Value::Null,
+    )
+    .await;
+    ensure_active(&audit_path, "active", &store).await.unwrap();
+
+    let slice = read_active_slice(&audit_path, "active", day, next_local_day(day).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(slice.days[0].acc.rows_all, 1);
+    assert_eq!(slice.days[0].acc.prompt_tokens, 1);
+    assert_eq!(
+        slice.dims["model"].keys().cloned().collect::<Vec<_>>(),
+        vec!["new".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn active_rollup_is_not_ready_before_build() {
     let dir = temp_dir("not-ready");
     let audit_path = dir.join("record.db");
