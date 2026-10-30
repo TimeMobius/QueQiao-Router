@@ -575,6 +575,64 @@ pub(crate) async fn active_caught_up(
     matches!(pending, Ok(rows) if rows.is_empty())
 }
 
+/// 日志记录页筛选取值（模型/类型/后端/客户端）。
+pub(crate) struct Facets {
+    pub(crate) models: Vec<String>,
+    pub(crate) types: Vec<String>,
+    pub(crate) backends: Vec<String>,
+    pub(crate) clients: Vec<String>,
+}
+
+/// 从 active 汇总读取筛选取值；汇总未覆盖到昨天时返回 `None` 并触发后台补齐。
+pub(crate) async fn active_facets(
+    audit_path: &Path,
+    shard_id: &str,
+    store: &Arc<AuditStore>,
+) -> Option<Facets> {
+    let today = local_day_ms(now_ms())?;
+    if !active_caught_up(audit_path, shard_id, store.as_ref(), today - 1).await {
+        if claim_build_spawn(30_000) {
+            let path = audit_path.to_path_buf();
+            let shard_id = shard_id.to_string();
+            let store = store.clone();
+            tokio::spawn(async move {
+                if let Err(error) = ensure_active(&path, &shard_id, &store).await {
+                    tracing::warn!(%error, "active rollup unavailable; facets uses scan path");
+                }
+            });
+        }
+        return None;
+    }
+    let db = open_store(audit_path).await.ok()?;
+    let conn = db.connect().ok()?;
+    let mut values: [Vec<String>; 4] = Default::default();
+    for (index, dim) in ["model", "type", "backend", "client"].iter().enumerate() {
+        let rows = conn
+            .query(
+                "SELECT DISTINCT value FROM day_dim WHERE shard_id = ? AND dim = ? \
+                 AND value <> 'Unknown' ORDER BY value LIMIT 200",
+                vec![
+                    Value::Text(shard_id.to_string()),
+                    Value::Text((*dim).to_string()),
+                ],
+            )
+            .await
+            .ok()?;
+        for row in &rows {
+            if let Some(value) = row.get_opt_string(0).ok().flatten() {
+                values[index].push(value);
+            }
+        }
+    }
+    let [models, types, backends, clients] = values;
+    Some(Facets {
+        models,
+        types,
+        backends,
+        clients,
+    })
+}
+
 /// 后台重建去抖：`min_interval_ms` 内只放行一次。
 pub(crate) fn claim_build_spawn(min_interval_ms: i64) -> bool {
     static LAST_SPAWN_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);

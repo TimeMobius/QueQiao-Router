@@ -319,3 +319,80 @@ async fn active_rollup_is_ready_before_today_is_processed() {
         .await
     );
 }
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_dims(
+    store: &AuditStore,
+    time_ms: i64,
+    model: &str,
+    r#type: &str,
+    backend: &str,
+    client: &str,
+) {
+    store
+        .execute(
+            "INSERT INTO records (Time, TimeMs, Model, ApiKey, IP, Type, Backend, ClientName, \
+             Status, PromptTokens, CompletionTokens, TotalTokens, LatencyMs, TtftMs, SearchText) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            vec![
+                Value::Text("2026-10-01 00:00:00.000000".to_string()),
+                Value::Integer(time_ms),
+                Value::Text(model.to_string()),
+                Value::Text("sk-a".to_string()),
+                Value::Text("10.0.0.1".to_string()),
+                Value::Text(r#type.to_string()),
+                Value::Text(backend.to_string()),
+                Value::Text(client.to_string()),
+                Value::Integer(200),
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Null,
+                Value::Null,
+                Value::Text("text".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn active_facets_match_scan_values() {
+    let dir = temp_dir("facets");
+    let audit_path = dir.join("record.db");
+    let store = open_store(&dir, "record.db").await;
+    let day = today_minus(2);
+    insert_dims(
+        &store,
+        day + 1000,
+        "gpt-4",
+        "chat.completions",
+        "b1",
+        "cli-a",
+    )
+    .await;
+    insert_dims(&store, day + 2000, "", "", "", "").await;
+    insert_dims(&store, day + 3000, "claude", "embeddings", "b2", "cli-b").await;
+    ensure_active(&audit_path, "active", &store).await.unwrap();
+
+    let facets = active_facets(&audit_path, "active", &store).await.unwrap();
+    assert_eq!(
+        facets.models,
+        vec!["claude".to_string(), "gpt-4".to_string()]
+    );
+    assert_eq!(
+        facets.types,
+        vec!["chat.completions".to_string(), "embeddings".to_string()]
+    );
+    assert_eq!(facets.backends, vec!["b1".to_string(), "b2".to_string()]);
+    assert_eq!(
+        facets.clients,
+        vec!["cli-a".to_string(), "cli-b".to_string()]
+    );
+
+    let (models, types, backends, clients) = crate::db::records_query::query_facets(&store).await;
+    assert_eq!(facets.models, models);
+    assert_eq!(facets.types, types);
+    assert_eq!(facets.backends, backends);
+    assert_eq!(facets.clients, clients);
+}

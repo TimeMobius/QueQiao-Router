@@ -202,6 +202,21 @@ pub async fn record_facets(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let store = app_state.active_db().await;
 
+    if let Some(facets) = crate::db::aggregate::active_facets(
+        &crate::db::resolve_db_path(),
+        crate::db::archive::ACTIVE_SHARD,
+        &store,
+    )
+    .await
+    {
+        return Ok(Json(json!({
+            "models": facets.models,
+            "types": facets.types,
+            "backends": facets.backends,
+            "clients": facets.clients,
+        })));
+    }
+
     let (models, types, backends, clients) = query_facets(&store).await;
 
     Ok(Json(json!({
