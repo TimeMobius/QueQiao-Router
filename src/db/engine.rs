@@ -444,21 +444,30 @@ impl Row {
     }
 }
 
-/// A semaphore-bounded reader pool.
+/// A semaphore-bounded reader pool that keeps connections open between uses.
 ///
-/// Connections are cheap, so each acquisition opens a fresh one (with a reuse
-/// fast-path left for a later optimization). The semaphore bounds concurrent
-/// readers, which also bounds memory used by result sets and TLS-less readers.
+/// Opening a connection to a database with an FTS index re-scans the index
+/// directory; on network filesystems that costs tens of seconds once the
+/// attribute cache expires. Reusing connections keeps the index handle warm, so
+/// an idle period no longer turns the next dashboard request into a stall.
 pub struct ReaderPool {
-    db: Db,
+    inner: Arc<ReaderPoolInner>,
     permits: Arc<Semaphore>,
     timeout: Duration,
+}
+
+struct ReaderPoolInner {
+    db: Db,
+    idle: std::sync::Mutex<Vec<DbConn>>,
 }
 
 impl ReaderPool {
     pub fn new(db: Db, max_readers: usize, timeout: Duration) -> Self {
         Self {
-            db,
+            inner: Arc::new(ReaderPoolInner {
+                db,
+                idle: std::sync::Mutex::new(Vec::new()),
+            }),
             permits: Arc::new(Semaphore::new(max_readers.max(1))),
             timeout,
         }
@@ -469,18 +478,40 @@ impl ReaderPool {
             .await
             .map_err(|_| DbError::PoolTimeout(self.timeout))?
             .map_err(|_| DbError::Closed)?;
-        let conn = self.db.connect()?;
+        let conn = self.take_idle().unwrap_or(self.inner.db.connect()?);
         Ok(ReaderGuard {
-            conn,
+            inner: Arc::clone(&self.inner),
+            conn: Some(conn),
             _permit: permit,
         })
     }
+
+    fn take_idle(&self) -> Option<DbConn> {
+        let mut idle = match self.inner.idle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        idle.pop()
+    }
 }
 
-/// A pooled reader connection; releasing it returns the permit.
+/// A pooled reader connection; releasing it returns it to the pool.
 pub struct ReaderGuard {
-    conn: DbConn,
+    inner: Arc<ReaderPoolInner>,
+    conn: Option<DbConn>,
     _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let mut idle = match self.inner.idle.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            idle.push(conn);
+        }
+    }
 }
 
 impl fmt::Debug for ReaderGuard {
@@ -492,7 +523,9 @@ impl fmt::Debug for ReaderGuard {
 impl std::ops::Deref for ReaderGuard {
     type Target = DbConn;
     fn deref(&self) -> &DbConn {
-        &self.conn
+        self.conn
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("reader connection is only taken in Drop"))
     }
 }
 
@@ -557,6 +590,27 @@ mod tests {
         assert_eq!(row.get_opt_str(4).unwrap(), None);
 
         drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn reader_pool_reuses_connections_after_drop() {
+        let path = temp_db_path("pool-reuse");
+        let db = Db::open(&path, OpenOptions::default()).await.unwrap();
+        let pool = ReaderPool::new(db, 2, Duration::from_secs(1));
+
+        {
+            let guard = pool.acquire().await.unwrap();
+            guard.query("SELECT 1", Vec::new()).await.unwrap();
+        }
+        assert_eq!(pool.inner.idle.lock().unwrap().len(), 1);
+
+        let guard = pool.acquire().await.unwrap();
+        assert_eq!(pool.inner.idle.lock().unwrap().len(), 0);
+        guard.query("SELECT 2", Vec::new()).await.unwrap();
+        drop(guard);
+        assert_eq!(pool.inner.idle.lock().unwrap().len(), 1);
+
         let _ = std::fs::remove_file(&path);
     }
 
