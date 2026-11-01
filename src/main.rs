@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-use queqiao_router::{client, config, db, middleware, routes, state};
+use queqiao_router::{client, config, db, middleware, routes, schedule, state};
 
 use client::client_manager::ClientManager;
 use db::writer::{AuditWriter, WriterConfig};
@@ -138,31 +138,42 @@ fn main() {
             }
         });
 
-        let optimize_interval: u64 = std::env::var("DB_FTS_OPTIMIZE_INTERVAL_SEC")
+        // FTS 维护：默认每天本地凌晨执行一次（`DB_FTS_OPTIMIZE_AT`，`off` 关闭）。
+        // 显式设置 `DB_FTS_OPTIMIZE_INTERVAL_SEC` 时沿用旧的固定间隔语义（0 关闭）。
+        let optimize_interval = std::env::var("DB_FTS_OPTIMIZE_INTERVAL_SEC")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(21_600);
-        if optimize_interval > 0 {
+            .and_then(|v| v.parse::<u64>().ok());
+        let nightly = std::env::var("DB_FTS_OPTIMIZE_AT").unwrap_or_else(|_| "04:00".to_string());
+        let nightly_at = schedule::parse_hhmm(&nightly);
+        if optimize_interval.is_none() {
+            if let Some((hour, minute)) = nightly_at {
+                tracing::info!(hour, minute, "FTS optimize scheduled nightly in local time");
+                let optimize_state = app_state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let now = chrono::Local::now().timestamp_millis();
+                        let Some(next) = schedule::next_daily_after(now, hour, minute) else {
+                            tracing::warn!("cannot compute the next FTS optimize slot");
+                            return;
+                        };
+                        let wait_ms = u64::try_from(next - now).unwrap_or(0);
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        let _lock = optimize_state.db_rotation_lock.lock().await;
+                        optimize_fts_once(&optimize_state).await;
+                    }
+                });
+            } else {
+                tracing::info!(value = %nightly, "FTS optimize disabled");
+            }
+        } else if let Some(seconds) = optimize_interval.filter(|value| *value > 0) {
             let optimize_state = app_state.clone();
             tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(optimize_interval));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(seconds));
                 interval.tick().await;
                 loop {
                     interval.tick().await;
                     let _lock = optimize_state.db_rotation_lock.lock().await;
-                    let store = optimize_state.active_db().await;
-                    let started = std::time::Instant::now();
-                    match store.optimize_fts().await {
-                        Ok(()) => tracing::info!(
-                            elapsed_ms =
-                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                            "FTS index optimized"
-                        ),
-                        Err(error) => {
-                            tracing::warn!(%error, "FTS index optimization failed")
-                        }
-                    }
+                    optimize_fts_once(&optimize_state).await;
                 }
             });
         }
@@ -199,4 +210,17 @@ fn main() {
         .unwrap();
         shutdown_state.audit_writer.shutdown().await;
     });
+}
+
+/// 执行一次 FTS `OPTIMIZE INDEX` 并记录耗时。
+async fn optimize_fts_once(state: &Arc<AppState>) {
+    let store = state.active_db().await;
+    let started = std::time::Instant::now();
+    match store.optimize_fts().await {
+        Ok(()) => tracing::info!(
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "FTS index optimized"
+        ),
+        Err(error) => tracing::warn!(%error, "FTS index optimization failed"),
+    }
 }

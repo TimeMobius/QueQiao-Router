@@ -166,8 +166,10 @@ USING fts (SearchText) WITH (tokenizer = 'ngram');
   `client` 子串等仍是 SQL 残余，语义与 v7 一致。
 - 多词从 v7 的“整句短语”变为“词间 AND”；这是有意的行为变化（见基准报告）。
 
-**维护**：运行期写入会产生 FTS 段；后台任务默认每 6 小时执行一次 `OPTIMIZE INDEX`
-（`DB_FTS_OPTIMIZE_INTERVAL_SEC`，0 关闭），与轮转锁互斥。
+**维护**：运行期写入会产生 FTS 段；后台任务默认每天本地 `04:00` 执行一次
+`OPTIMIZE INDEX`（`DB_FTS_OPTIMIZE_AT=HH:MM`，`off` 关闭），与轮转锁互斥。
+显式设置 `DB_FTS_OPTIMIZE_INTERVAL_SEC` 时退回旧的固定间隔语义（0 关闭）。
+在 17GB 级别的库上单次优化约需 10 分钟，因此默认放在夜间低峰期。
 
 ---
 

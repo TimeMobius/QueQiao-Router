@@ -125,7 +125,8 @@ docker run -d \
 | `SERVER_PORT` | `8000` | 服务监听端口 |
 | `RECD_PATH` | `sqlite:./record.db` | 审计库路径（兼容 `sqlite:` 前缀）；Docker 镜像默认为 `sqlite:./logs/record.db` |
 | `DB_ROTATION_CHECK_INTERVAL_SEC` | `60` | 数据库轮转检查间隔（秒） |
-| `DB_FTS_OPTIMIZE_INTERVAL_SEC` | `21600` | FTS `OPTIMIZE INDEX` 间隔（秒）；0 关闭 |
+| `DB_FTS_OPTIMIZE_AT` | `04:00` | FTS `OPTIMIZE INDEX` 每日执行时刻（本地时区，`HH:MM`）；`off` 关闭 |
+| `DB_FTS_OPTIMIZE_INTERVAL_SEC` | 未设置 | 显式设置时改用固定间隔语义（秒）；`0` 关闭。默认不设置，按 `DB_FTS_OPTIMIZE_AT` 每日执行 |
 | `AUDIT_BATCH_SIZE` | `200` | 审计写批次行数 |
 | `AUDIT_QUEUE_CAPACITY` | `10000` | 审计写队列容量 |
 | `AUDIT_FTS_PROMPT_BYTES` / `_TAIL_BYTES` / `_ANSWER_BYTES` | `512` | 检索索引每段截断字节；0 为全文（详见 `docs/WRITE_BATCHING.md`） |
