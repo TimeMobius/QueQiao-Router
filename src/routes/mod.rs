@@ -1,11 +1,13 @@
+use crate::config::body_limit::{format_bytes, resolve_request_body_limit, RequestBodyLimit};
 use crate::metrics::exporter::create_metrics_router;
 use crate::metrics::middleware::metrics_middleware;
 use crate::state::app_state::AppState;
 use axum::{
+    extract::DefaultBodyLimit,
     http::Method,
     middleware as axum_middleware,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -26,6 +28,16 @@ async fn favicon_redirect() -> axum::response::Redirect {
 }
 
 pub fn create_router(app_state: Arc<AppState>) -> Router {
+    // 网关请求体上限：默认 64 MiB，可用 `MAX_REQUEST_BODY_BYTES` 覆盖。
+    // Axum 的 2 MiB 默认值会在多轮 Agent 会话（全量历史 + 内联 base64 图片）上
+    // 提前返回 413，此时客户端自身的预算尚未生效，无法触发自动恢复。
+    let request_body_limit = resolve_request_body_limit();
+    tracing::info!(
+        limit_bytes = request_body_limit,
+        limit_human = %format_bytes(request_body_limit),
+        "request body limit configured"
+    );
+
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_origin(Any)
@@ -60,6 +72,10 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
     }
 
     router
+        // 提高所有请求体提取器（Bytes/Json/Form/Multipart）的上限；
+        // 同时把生效值放进请求扩展，供 `CustomJson` 生成可自解释的 413 错误体。
+        .layer(DefaultBodyLimit::max(request_body_limit))
+        .layer(Extension(RequestBodyLimit(request_body_limit)))
         .layer(cors)
         .layer(axum_middleware::from_fn(metrics_middleware))
         .with_state(app_state)

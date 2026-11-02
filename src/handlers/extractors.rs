@@ -1,7 +1,11 @@
+use crate::config::body_limit::RequestBodyLimit;
 use crate::models::AccessLogMeta;
 use axum::{
     body::Bytes,
-    extract::{FromRequest, Request},
+    extract::{
+        rejection::{BytesRejection, FailedToBufferBody},
+        FromRequest, Request,
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -21,10 +25,36 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        // 请求体上限由路由层以扩展形式注入，用于生成携带当前阈值的 413 错误体。
+        let body_limit = req
+            .extensions()
+            .get::<RequestBodyLimit>()
+            .map(|limit| limit.bytes());
+
         // 1. 先读取 Bytes
         let bytes = match Bytes::from_request(req, state).await {
             Ok(b) => b,
             Err(err) => {
+                // 请求体超过网关上限：返回结构化 413，而不是 Axum 默认的纯文本
+                // "Failed to buffer the request body: length limit exceeded"。
+                // 客户端（如 DSH）可据 error.type=request_too_large 触发上下文压缩。
+                if let BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) =
+                    &err
+                {
+                    let error_message = crate::app_error::request_too_large_message(body_limit);
+                    let error_response = crate::app_error::build_request_too_large_body(body_limit);
+                    let mut response =
+                        (StatusCode::PAYLOAD_TOO_LARGE, Json(error_response)).into_response();
+                    // 超限时不再把整个请求体写入错误日志（可能是数十 MiB）。
+                    response.extensions_mut().insert(AccessLogMeta {
+                        model: "-".to_string(),
+                        backend: "unknown".to_string(),
+                        error: Some(error_message),
+                        request_body: None,
+                    });
+                    return Err(response);
+                }
+
                 let err_msg = err.to_string();
                 if err_msg.contains("peer closed connection")
                     || err_msg.contains("closed connection")
@@ -87,5 +117,90 @@ where
                 Err(response)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        extract::DefaultBodyLimit,
+        http::{header, Request as HttpRequest, StatusCode},
+        routing::post,
+        Extension, Router,
+    };
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    async fn echo(payload: CustomJson<Value>) -> Json<Value> {
+        Json(payload.0)
+    }
+
+    fn test_router(limit_bytes: usize) -> Router {
+        Router::new()
+            .route("/echo", post(echo))
+            .layer(DefaultBodyLimit::max(limit_bytes))
+            .layer(Extension(RequestBodyLimit(limit_bytes)))
+    }
+
+    async fn post_json(app: Router, payload: Vec<u8>) -> (StatusCode, String, Value) {
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/echo")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, content_type, json)
+    }
+
+    #[tokio::test]
+    async fn oversized_body_returns_structured_413() {
+        let limit = 1024;
+        // 合法 JSON，但超出 test router 设置的 1 KiB 上限
+        let payload = format!("{{\"data\":\"{}\"}}", "a".repeat(2048)).into_bytes();
+
+        let (status, content_type, body) = post_json(test_router(limit), payload).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            content_type.starts_with("application/json"),
+            "413 should be JSON, got content-type: {content_type}"
+        );
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(body["error_type"], "request_too_large");
+
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("1 KiB") && message.contains("1024 bytes"),
+            "413 message should include the effective limit, got: {message}"
+        );
+        assert!(
+            message.contains("MAX_REQUEST_BODY_BYTES"),
+            "413 message should point at the override knob, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_within_limit_is_accepted() {
+        let payload = br#"{"model":"test","messages":[]}"#.to_vec();
+
+        let (status, content_type, body) = post_json(test_router(1024), payload).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("application/json"));
+        assert_eq!(body["model"], "test");
     }
 }

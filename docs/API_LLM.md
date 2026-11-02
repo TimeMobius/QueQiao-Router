@@ -72,6 +72,30 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 仅在发送阶段遇到连接/请求错误（非超时）时重建连接重试一次。上游失败时调度器会尝试其他
 匹配客户端，全部失败后才使用配置的 `fallback`。
 
+## 请求体大小与 413
+
+网关默认接受最大 **64 MiB** 的请求体（`MAX_REQUEST_BODY_BYTES`，单位字节；Axum 自带的
+2 MiB 默认值已替换）。Agent 类客户端每轮都会重发全量历史（文本 + 内联 base64 图片），
+该上限应高于客户端侧预算之和，避免网关先于客户端预算触发 413。
+
+请求体超限时返回 `HTTP 413`，响应体与其他错误一样为 OpenAI 兼容的双格式 JSON，
+`error.type` 为 `request_too_large`，消息中带有当前生效上限：
+
+```json
+{
+  "error": {
+    "message": "Request body too large: the gateway accepts request bodies up to 64 MiB (67108864 bytes) and this request exceeded it. Reduce conversation history or inline image payloads and retry. The limit can be raised with the MAX_REQUEST_BODY_BYTES environment variable.",
+    "type": "request_too_large",
+    "param": null,
+    "code": null
+  },
+  "error_type": "request_too_large"
+}
+```
+
+超限的错误日志只记录上限与说明，**不会**把整个请求体写入 `logs/error.*.log`。
+前置反向代理（Nginx / Envoy 等）需要同步放宽自身的请求体上限。
+
 ## 请求示例
 
 ```bash

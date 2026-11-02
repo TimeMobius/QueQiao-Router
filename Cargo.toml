@@ -41,6 +41,10 @@ http-body = "1"
 http-body-util = "0.1"
 pin-project-lite = "0.2"
 
+[dev-dependencies]
+# 用于在单元测试中直接驱动 Router（tower::ServiceExt::oneshot）
+tower = { version = "0.5", features = ["util"] }
+
 [features]
 default = []
 check-api-auth = []

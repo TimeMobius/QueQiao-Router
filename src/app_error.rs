@@ -1,3 +1,4 @@
+use crate::config::body_limit::format_bytes;
 use crate::db::engine::DbError;
 use crate::models::AccessLogMeta;
 use axum::{
@@ -21,6 +22,26 @@ pub fn build_error_body(message: &str, error_type: &str) -> Value {
         },
         "error_type": error_type,
     })
+}
+
+/// 请求体超限（HTTP 413）时返回给调用方的错误消息。
+///
+/// 明确给出当前生效的上限，便于客户端压缩历史或降低图片载荷后重试。
+/// 错误类型固定为 `request_too_large`，客户端可据此触发上下文压缩等自动恢复。
+pub fn request_too_large_message(limit_bytes: Option<usize>) -> String {
+    match limit_bytes {
+        Some(limit) => format!(
+            "Request body too large: the gateway accepts request bodies up to {} ({} bytes) and this request exceeded it. Reduce conversation history or inline image payloads and retry. The limit can be raised with the MAX_REQUEST_BODY_BYTES environment variable.",
+            format_bytes(limit),
+            limit
+        ),
+        None => "Request body too large: this request exceeded the gateway request body limit. Reduce conversation history or inline image payloads and retry.".to_string(),
+    }
+}
+
+/// 构建请求体超限（HTTP 413）的 OpenAI 兼容错误体。
+pub fn build_request_too_large_body(limit_bytes: Option<usize>) -> Value {
+    build_error_body(&request_too_large_message(limit_bytes), "request_too_large")
 }
 
 #[derive(Debug)]

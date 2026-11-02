@@ -123,6 +123,7 @@ docker run -d \
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `SERVER_PORT` | `8000` | 服务监听端口 |
+| `MAX_REQUEST_BODY_BYTES` | `67108864`（64 MiB） | 请求体大小上限（字节）。Axum 默认仅 2 MiB，多轮 Agent 会话（全量历史 + 内联 base64 图片）会提前触发 413；该值需高于客户端侧预算之和。未设置、非法或 `0` 时回退默认值，详见[请求体大小上限](#-请求体大小上限) |
 | `RECD_PATH` | `sqlite:./record.db` | 审计库路径（兼容 `sqlite:` 前缀）；Docker 镜像默认为 `sqlite:./logs/record.db` |
 | `DB_ROTATION_CHECK_INTERVAL_SEC` | `60` | 数据库轮转检查间隔（秒） |
 | `DB_FTS_OPTIMIZE_AT` | `04:00` | FTS `OPTIMIZE INDEX` 每日执行时刻（本地时区，`HH:MM`）；`off` 关闭 |
@@ -228,6 +229,42 @@ openai_clients:
 连接池相关参数（每 host 最大空闲连接数、空闲淘汰时间、TCP keepalive 间隔）由顶层 `connection_pool` 配置项控制，默认值如上表。由于共享 HTTP 客户端仅在启动时构建一次，修改 `connection_pool` 后需重启服务才会生效。
 
 **重试行为**: 仅在发送阶段遇到连接/请求错误（非超时）时自动重建连接重试一次。流式请求使用 60s TTFB 超时快速失败；非流式请求受 1800s 全局超时限制。上游失败时，调度器会尝试其他匹配客户端；所有候选客户端失败后才使用配置的 `fallback`。
+
+---
+
+## 📦 请求体大小上限
+
+Axum 的 `DefaultBodyLimit` 默认为 **2 MiB**。Agent 类客户端每一轮都会重发全量历史
+（文本 + 内联 base64 图片），几轮之后就会越过 2 MiB；而客户端自身的请求预算
+（例如 DSH 的 `maxRequestImageBytes` 默认 20 MiB，且只统计图片 base64 载荷）通常
+仍有余量。如果网关先撞墙，客户端会收到一个无法自愈的 413，而历史只增不减，之后
+每一轮都会继续 413。因此网关默认上限提升为 **64 MiB**，并可通过
+`MAX_REQUEST_BODY_BYTES` 覆盖（单位：字节）：
+
+```bash
+# 例如放宽到 128 MiB 后启动
+MAX_REQUEST_BODY_BYTES=134217728 ./queqiao_router
+```
+
+启动日志会打印当前生效值（`request body limit configured`）。超过上限的请求返回
+HTTP 413 和 OpenAI 兼容的结构化错误体，`error.type` 为 `request_too_large`，
+消息中带有当前生效阈值，客户端可据此压缩历史或降低图片载荷后重试：
+
+```json
+{
+  "error": {
+    "message": "Request body too large: the gateway accepts request bodies up to 64 MiB (67108864 bytes) and this request exceeded it. Reduce conversation history or inline image payloads and retry. The limit can be raised with the MAX_REQUEST_BODY_BYTES environment variable.",
+    "type": "request_too_large",
+    "param": null,
+    "code": null
+  },
+  "error_type": "request_too_large"
+}
+```
+
+> **部署提示**: 如果网关前面还有 Nginx / Envoy / Cloudflare 等反向代理，需要同步
+> 调整它们自身的请求体上限（如 Nginx `client_max_body_size`），否则请求会在到达
+> 网关之前就被拒绝。
 
 ---
 
