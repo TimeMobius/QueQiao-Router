@@ -162,6 +162,14 @@ fn build_request_body_inner(
             if let Some(top_logprobs) = p.top_logprobs {
                 body["top_logprobs"] = json!(top_logprobs);
             }
+            // prompt 缓存键：客户端（如 pi-ai 在 cacheRetention=long 时）用它标识会话，
+            // 原样透传给上游；同时它也是审计库 SessionId 的回退来源（见 db::extract）。
+            if let Some(cache_key) = &p.prompt_cache_key {
+                body["prompt_cache_key"] = json!(cache_key);
+            }
+            if let Some(retention) = &p.prompt_cache_retention {
+                body["prompt_cache_retention"] = json!(retention);
+            }
             body
         }
         RequestPayload::Completion(p) => {

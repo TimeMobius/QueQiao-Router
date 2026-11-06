@@ -10,7 +10,7 @@ use crate::db::archive::ACTIVE_SHARD;
 use crate::db::engine::{DbError, Row, Value};
 use crate::db::store::AuditStore;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ListParams {
     pub from: Option<i64>,
     pub to: Option<i64>,

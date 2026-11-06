@@ -42,6 +42,7 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 | :--- | :--- |
 | `x-request-id` / `x-trace-id` / `x-correlation-id` | 请求追踪 id |
 | `x-session-id` / `x-parent-session-id` / `x-session-affinity` | 会话标识 |
+| `x-deepseek-harness-session-id` | DSH（deepseek-harness）Messages 路由的会话标识，与 `x-session-id` 同义 |
 
 `authorization` / `x-api-key` **不**透传——网关始终用上游 key 重建 `Authorization`；
 `user-agent` 也不透传，上游看到的是**网关自身 UA**（`QueQiao-Router/b<提交数> reqwest/<版本>`）；

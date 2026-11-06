@@ -118,6 +118,31 @@ async fn append_body_payload(store: &AuditStore, id: i64, body: &mut Value) {
     }
 }
 
+/// 给详情响应补上「会话时间线」入口所需的提示字段。
+///
+/// 面板据此决定按钮是否可用以及走哪条路径：
+/// - 有 `sessionId` → 直接按会话 id 精确查询；
+/// - 无 `sessionId` 但有 `fingerprint` → 按对话前缀指纹聚类（方案 C）。
+///
+/// 指纹是查询时现场算的派生量，不落库（见 `db::session_fingerprint`）。
+async fn attach_timeline_hints(body: &mut Value, store: &AuditStore, id: i64) {
+    let has_session = body
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    let fingerprint = if has_session {
+        None
+    } else {
+        crate::handlers::session_timeline_api::record_fingerprint(store, id)
+            .await
+            .ok()
+            .flatten()
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.insert("fingerprint".to_string(), json!(fingerprint));
+    }
+}
+
 pub async fn record_detail(
     State(app_state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -146,6 +171,7 @@ pub async fn record_detail(
         if let Some(object) = body.as_object_mut() {
             object.insert("shard".to_string(), json!(shard_label));
         }
+        attach_timeline_hints(&mut body, &store, id).await;
         if include_body {
             append_body_payload(&store, id, &mut body).await;
         }
@@ -156,6 +182,7 @@ pub async fn record_detail(
     let active = app_state.active_db().await;
     if let Some(row) = fetch_detail_row(&active, id).await? {
         let mut body = build_detail_body(&row, &active, id).await;
+        attach_timeline_hints(&mut body, &active, id).await;
         if include_body {
             append_body_payload(&active, id, &mut body).await;
         }
@@ -179,6 +206,7 @@ pub async fn record_detail(
                 if let Some(object) = body.as_object_mut() {
                     object.insert("shard".to_string(), json!(shard.id));
                 }
+                attach_timeline_hints(&mut body, &shard.store, id).await;
                 if include_body {
                     append_body_payload(&shard.store, id, &mut body).await;
                 }

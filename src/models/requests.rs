@@ -183,6 +183,14 @@ pub struct ChatCompletionRequest {
     pub logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u8>,
+    /// OpenAI 的会话级 prompt 缓存键。pi-ai 在 `cacheRetention: long` 时会把它
+    /// 当作会话标识塞进 body（见 `dsh-llm-pi-ai`），因此它既是给上游的缓存提示，
+    /// 也是**没有会话标识头时**审计库 `SessionId` 的回退来源之一。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// 与 `prompt_cache_key` 配套的缓存保留策略（如 `"24h"`），原样透传。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<String>,
     // Add other fields as needed
 }
 

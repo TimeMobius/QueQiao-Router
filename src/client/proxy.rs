@@ -64,6 +64,9 @@ const FORWARD_HEADERS: &[&str] = &[
     "x-session-id",
     "x-parent-session-id",
     "x-session-affinity",
+    // DSH（deepseek-harness）的 Messages 路由用它标识会话，与 x-session-id 同义；
+    // 转发出去让上游也能按会话关联日志。
+    "x-deepseek-harness-session-id",
 ];
 
 fn forward_identity_headers(

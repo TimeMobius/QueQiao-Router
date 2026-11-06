@@ -66,6 +66,83 @@ pub struct HeaderMeta {
     pub request_id: Option<String>,
 }
 
+/// 会话标识的请求头候选，按优先级排列。
+///
+/// 网关原生约定是 `x-session-id`，但不同客户端各有各的名字。DSH
+/// （deepseek-harness）的 Messages 适配器发 `x-deepseek-harness-session-id`
+/// （见 `dsh-llm-deepseek` 的请求头构造），pi-ai 的 `openai-responses` 协议发
+/// `session_id` / `x-client-request-id`。网关此前只认第一个名字，导致这些客户端
+/// 的审计记录 `SessionId` 恒为空——数据其实一直在请求头里，只是没被读。
+///
+/// 顺序即优先级：原生名优先，避免客户端同时发多个头时行为漂移。
+const SESSION_ID_HEADERS: &[&str] = &[
+    "x-session-id",
+    "x-deepseek-harness-session-id",
+    "session_id",
+    "x-client-request-id",
+];
+
+/// 父会话标识的请求头候选。目前没有任何已知客户端会发后者，属于前瞻性预留：
+/// 父会话 id 的现实来源是请求体里的 `dsh_session_log.session.parentSession`
+/// （见 [`body_session_meta`]），而不是请求头。
+const PARENT_SESSION_ID_HEADERS: &[&str] = &[
+    "x-parent-session-id",
+    "x-deepseek-harness-parent-session-id",
+];
+
+/// 按给定顺序返回第一个**非空**请求头值。
+///
+/// 注意不能用 `find_map(..).filter(..)`：那样遇到一个空白值的头就会停下并返回
+/// `None`，而不是继续尝试后面的候选。必须逐项过滤。
+fn first_header(get: &dyn Fn(&str) -> Option<String>, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        get(name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// DSH 官方路由写在**请求体**里的会话元数据。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct BodySessionMeta {
+    pub session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+}
+
+fn pick_str(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// 从请求体提取会话标识，作为请求头的**回退来源**。
+///
+/// 两条独立通道：
+///
+/// 1. `dsh_session_log.session`（DSH 官方 Messages 路由）。其中 `parentSession`
+///    是**子智能体唯一能到达网关的父会话线索**——DSH 不会为此发送任何请求头。
+///    `origin`/`delegationDepth` 也在同一对象里，但审计库没有对应列，故不提取。
+/// 2. `prompt_cache_key`（OpenAI 兼容端点）。pi-ai 在 `cacheRetention: long` 时
+///    把它当会话标识写进 body，值就是会话 id；上游不认该字段时会忽略，不影响转发。
+///
+/// 两者都只写进**现有**的 `SessionId` / `ParentSessionId` 列，不新增表结构。
+pub fn body_session_meta(request_body: &Value) -> BodySessionMeta {
+    let dsh = request_body
+        .get("dsh_session_log")
+        .and_then(|log| log.get("session"));
+
+    let dsh_session = dsh.and_then(|s| pick_str(s, "id"));
+    let dsh_parent = dsh.and_then(|s| pick_str(s, "parentSession"));
+    let cache_key = pick_str(request_body, "prompt_cache_key");
+
+    BodySessionMeta {
+        session_id: dsh_session.or(cache_key),
+        parent_session_id: dsh_parent,
+    }
+}
+
 fn truncate_head(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -541,8 +618,8 @@ pub fn header_meta(headers: &HeaderMap) -> HeaderMeta {
     .map(|v| v.chars().take(200).collect::<String>());
 
     HeaderMeta {
-        session_id: get("x-session-id"),
-        parent_session_id: get("x-parent-session-id"),
+        session_id: first_header(&get, SESSION_ID_HEADERS),
+        parent_session_id: first_header(&get, PARENT_SESSION_ID_HEADERS),
         session_affinity: get("x-session-affinity"),
         user_agent,
         client_name,
@@ -576,6 +653,8 @@ mod tests {
             stream_options: None,
             logprobs: None,
             top_logprobs: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         })
     }
 
@@ -707,5 +786,130 @@ mod tests {
         let got = header_meta(&headers).request_id.unwrap();
         assert_eq!(got.chars().count(), 200);
         assert!(got.starts_with("模"));
+    }
+
+    // ---- 会话标识：多别名回退 ----
+
+    #[test]
+    fn session_id_falls_back_to_harness_header() {
+        // DSH 的 Messages 路由只发这个头；网关此前只认 x-session-id，导致
+        // 审计库 SessionId 恒为空。
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-deepseek-harness-session-id",
+            HeaderValue::from_static("session-abc"),
+        );
+        assert_eq!(
+            header_meta(&headers).session_id.as_deref(),
+            Some("session-abc")
+        );
+    }
+
+    #[test]
+    fn native_session_header_wins_over_alias() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("native"));
+        headers.insert(
+            "x-deepseek-harness-session-id",
+            HeaderValue::from_static("harness"),
+        );
+        assert_eq!(header_meta(&headers).session_id.as_deref(), Some("native"));
+    }
+
+    #[test]
+    fn session_id_accepts_pi_responses_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static("pi-sess"));
+        assert_eq!(header_meta(&headers).session_id.as_deref(), Some("pi-sess"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-request-id", HeaderValue::from_static("pi-req"));
+        assert_eq!(header_meta(&headers).session_id.as_deref(), Some("pi-req"));
+    }
+
+    #[test]
+    fn empty_session_header_is_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("   "));
+        headers.insert(
+            "x-deepseek-harness-session-id",
+            HeaderValue::from_static("fallback"),
+        );
+        assert_eq!(
+            header_meta(&headers).session_id.as_deref(),
+            Some("fallback")
+        );
+    }
+
+    // ---- 请求体会话元数据 ----
+
+    #[test]
+    fn body_meta_reads_dsh_session_log() {
+        let body = serde_json::json!({
+            "model": "deepseek-flash",
+            "dsh_session_log": {
+                "session": {
+                    "id": "session-child",
+                    "parentSession": "session-parent",
+                    "origin": "subagent",
+                    "delegationDepth": 1
+                }
+            }
+        });
+        let meta = body_session_meta(&body);
+        assert_eq!(meta.session_id.as_deref(), Some("session-child"));
+        assert_eq!(meta.parent_session_id.as_deref(), Some("session-parent"));
+    }
+
+    #[test]
+    fn body_meta_reads_prompt_cache_key() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "prompt_cache_key": "session-cache-key"
+        });
+        let meta = body_session_meta(&body);
+        assert_eq!(meta.session_id.as_deref(), Some("session-cache-key"));
+        assert_eq!(meta.parent_session_id, None);
+    }
+
+    #[test]
+    fn body_meta_prefers_dsh_session_over_cache_key() {
+        let body = serde_json::json!({
+            "dsh_session_log": {"session": {"id": "dsh-id", "parentSession": "p"}},
+            "prompt_cache_key": "cache-id"
+        });
+        assert_eq!(
+            body_session_meta(&body).session_id.as_deref(),
+            Some("dsh-id")
+        );
+    }
+
+    #[test]
+    fn body_meta_is_empty_for_plain_body() {
+        let body = serde_json::json!({"model": "m", "messages": []});
+        let meta = body_session_meta(&body);
+        assert_eq!(meta, BodySessionMeta::default());
+    }
+
+    #[test]
+    fn body_meta_ignores_blank_values() {
+        let body = serde_json::json!({
+            "dsh_session_log": {"session": {"id": "   ", "parentSession": ""}},
+            "prompt_cache_key": "  "
+        });
+        assert_eq!(body_session_meta(&body), BodySessionMeta::default());
+    }
+
+    #[test]
+    fn body_meta_tolerates_wrong_shapes() {
+        // dsh_session_log 不是对象、session 是字符串等畸形输入都不得 panic。
+        for body in [
+            serde_json::json!({"dsh_session_log": "not-an-object"}),
+            serde_json::json!({"dsh_session_log": {"session": "nope"}}),
+            serde_json::json!({"dsh_session_log": null}),
+        ] {
+            assert_eq!(body_session_meta(&body), BodySessionMeta::default());
+        }
     }
 }

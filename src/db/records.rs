@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::error;
 
 use crate::db::engine::{DbError, Value as DbValue};
-use crate::db::extract::{extract_request, extract_response, header_meta};
+use crate::db::extract::{body_session_meta, extract_request, extract_response, header_meta};
 use crate::db::store::{opt_int, opt_real, opt_text, AuditStore};
 use crate::models::requests::{MessageContent, RequestPayload};
 use crate::state::app_state::AppState;
@@ -305,6 +305,12 @@ pub async fn log_non_streaming_request(
     meta: LogMeta,
 ) {
     let header = header_meta(headers);
+    // 请求头里没有会话标识时，回落到请求体：DSH 的 `dsh_session_log.session`
+    // （父会话 id **只**在这里）与 OpenAI 兼容端的 `prompt_cache_key`。
+    // 写入的是**现有**的 SessionId / ParentSessionId 列，不新增表结构。
+    let dsh = body_session_meta(request_body);
+    let session_id = header.session_id.or(dsh.session_id);
+    let parent_session_id = header.parent_session_id.or(dsh.parent_session_id);
     let req = extract_request(payload);
     let resp = extract_response(response_body);
 
@@ -367,8 +373,8 @@ pub async fn log_non_streaming_request(
         model: payload.get_model().to_string(),
         r#type: request_type.to_string(),
         backend: meta.backend.clone(),
-        session_id: header.session_id,
-        parent_session_id: header.parent_session_id,
+        session_id,
+        parent_session_id,
         request_id: header.request_id,
         session_affinity: header.session_affinity,
         user_agent: header.user_agent,
@@ -416,10 +422,12 @@ pub async fn log_non_streaming_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::extract::body_session_meta;
     use crate::models::requests::{
         AnthropicMessagesRequest, ChatCompletionRequest, ClassifyRequest, CompletionRequest,
         EmbeddingRequest, RerankRequest, ResponsesRequest, ScoreRequest,
     };
+    use axum::http::HeaderValue;
 
     fn make_chat_payload() -> RequestPayload {
         RequestPayload::Chat(ChatCompletionRequest {
@@ -434,6 +442,8 @@ mod tests {
             stream_options: None,
             logprobs: None,
             top_logprobs: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -506,6 +516,74 @@ mod tests {
             stream: None,
             extra: serde_json::Map::new(),
         })
+    }
+
+    // ---- 会话标识：请求头与请求体的合并口径 ----
+    //
+    // 这里锁定 `log_non_streaming_request` 里的合并规则：请求头优先，请求体补空缺。
+    // 两条通道的来源不同（头：x-session-id 及别名；体：dsh_session_log / prompt_cache_key），
+    // 且父会话 id **只**可能来自请求体，因此必须分别验证。
+
+    fn merged_session_ids(headers: &HeaderMap, body: &Value) -> (Option<String>, Option<String>) {
+        let header = header_meta(headers);
+        let body_meta = body_session_meta(body);
+        (
+            header.session_id.or(body_meta.session_id),
+            header.parent_session_id.or(body_meta.parent_session_id),
+        )
+    }
+
+    #[test]
+    fn header_session_id_wins_over_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("from-header"));
+        let body = serde_json::json!({"prompt_cache_key": "from-body"});
+        let (session, _) = merged_session_ids(&headers, &body);
+        assert_eq!(session.as_deref(), Some("from-header"));
+    }
+
+    #[test]
+    fn body_session_id_fills_gap_when_header_absent() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({"prompt_cache_key": "from-body"});
+        let (session, parent) = merged_session_ids(&headers, &body);
+        assert_eq!(session.as_deref(), Some("from-body"));
+        assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn parent_session_id_only_comes_from_body() {
+        // DSH 从不发送 x-parent-session-id；父会话 id 只能从 dsh_session_log 取。
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "dsh_session_log": {
+                "session": {"id": "child", "parentSession": "parent"}
+            }
+        });
+        let (session, parent) = merged_session_ids(&headers, &body);
+        assert_eq!(session.as_deref(), Some("child"));
+        assert_eq!(parent.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn explicit_parent_header_wins_over_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-parent-session-id",
+            HeaderValue::from_static("header-parent"),
+        );
+        let body = serde_json::json!({
+            "dsh_session_log": {"session": {"id": "child", "parentSession": "body-parent"}}
+        });
+        let (_, parent) = merged_session_ids(&headers, &body);
+        assert_eq!(parent.as_deref(), Some("header-parent"));
+    }
+
+    #[test]
+    fn no_identity_anywhere_yields_none() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({"model": "m", "messages": []});
+        assert_eq!(merged_session_ids(&headers, &body), (None, None));
     }
 
     #[test]

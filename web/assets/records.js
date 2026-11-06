@@ -1,5 +1,6 @@
 (function () {
     var API = "/dashboard/api/records";
+    var TIMELINE_API = "/dashboard/api/session-timeline";
     var LOG_API = "/dashboard/api/error-log";
     var state = { errors: false, cursor: null, stack: [], limit: 20, total: 0, totalExact: true, nextCursor: null, logCursor: null, logStack: [], logNext: null, loading: false, seq: 0, relationSeq: 0, detail: null, urlFilters: {} };
 
@@ -554,6 +555,8 @@
                 metaRow("服务 IP", d.ip) +
                 metaRow("会话 ID", d.sessionId) +
                 metaRow("父会话 ID", d.parentSessionId) +
+                // 没有会话 ID 时展示推断用的对话前缀，让用户明白时间线是按什么聚合的。
+                metaRow("对话前缀", d.sessionId ? null : (d.fingerprint ? "prefix:" + d.fingerprint : null)) +
                 metaRow("请求 ID", d.requestId) +
                 apiKeyRow(d.apiKey) +
             "</dl>") +
@@ -573,10 +576,17 @@
                 metaRow("请求体积", fmtBytes(d.requestBytes)) +
                 metaRow("响应体积", fmtBytes(d.responseBytes)) +
             "</dl>");
+        // 会话时间线：优先用真实会话 ID；没有时退到对话前缀指纹（服务端现场计算）。
+        var canTimeline = !!(d.sessionId || d.fingerprint);
+        var timelineTitle = d.sessionId
+            ? ""
+            : (d.fingerprint
+                ? ' title="该记录没有会话 ID，将按对话前缀指纹推断时间线"'
+                : ' title="该记录既没有会话 ID，也无法从请求体推断对话前缀"');
         html += '<div class="drawer-actions">' +
             '<button type="button" class="drawer-btn" id="timelineBtn"' +
-                (d.sessionId ? "" : ' disabled title="该记录没有会话 ID"') + ">" +
-                ICON.latency + "会话时间线</button>" +
+                (canTimeline ? "" : " disabled") + timelineTitle + ">" +
+                ICON.latency + "会话时间线" + "</button>" +
             '<button type="button" class="drawer-btn" id="treeBtn">' + ICON.tools + "调用树</button>" +
             "</div>";
         html += section("Prompt", ICON.text, d.prompt, true);
@@ -592,7 +602,8 @@
         if (btn) btn.addEventListener("click", function () { loadBody(d.id, btn); });
         var timelineBtn = $("timelineBtn");
         if (timelineBtn && !timelineBtn.disabled) timelineBtn.addEventListener("click", function () {
-            loadTimeline(d.sessionId);
+            if (d.sessionId) loadTimeline(d.sessionId);
+            else loadFingerprintTimeline(d.fingerprint);
         });
         var treeBtn = $("treeBtn");
         if (treeBtn) treeBtn.addEventListener("click", function () { loadCallTree(d); });
@@ -689,8 +700,19 @@
     }
 
     function renderTimeline(items, sessionId, truncated) {
+        renderTimelineInto(items, "会话 ID：" + esc(sessionId), truncated, "");
+    }
+
+    /**
+     * 渲染时间线的公共实现。
+     * @param items     记录数组
+     * @param labelHtml 已转义的标题片段（会话 ID 或对话前缀）
+     * @param truncated 是否因上限被截断
+     * @param preface   附加在标题前的提示 HTML（已转义/受控）
+     */
+    function renderTimelineInto(items, labelHtml, truncated, preface) {
         if (!items.length) {
-            setRelationBody('<p class="tree-loading">该会话暂无记录</p>');
+            setRelationBody((preface || "") + '<p class="tree-loading">该会话暂无记录</p>');
             return;
         }
         items.sort(function (a, b) {
@@ -729,11 +751,64 @@
             "</button>";
         }).join("");
         setRelationBody(
+            (preface || "") +
             (truncated ? '<p class="tree-notice">已达上限，结果可能不完整</p>' : "") +
-            '<p class="hint" style="margin-top:0">会话 ID：<span class="mono">' + esc(sessionId) +
-                "</span> · 共 " + full(items.length) + " 条 · 按时间升序</p>" +
+            '<p class="hint" style="margin-top:0">' + labelHtml +
+                " · 共 " + full(items.length) + " 条 · 按时间升序</p>" +
             summary + '<div class="timeline-list">' + list + "</div>"
         );
+    }
+
+    /**
+     * 按对话前缀指纹重建会话时间线。
+     *
+     * 用于「记录没有会话 ID」的情形（DSH 的 OpenAI chat 路由不发任何会话标识头）。
+     * 指纹是服务端现场从请求体算出来的派生量，不落库；这里只负责取回并按时间升序渲染。
+     *
+     * 局限（UI 上必须说明）：会话被压缩后前缀改变，时间线会断成多段；
+     * 前缀相同的并发 fork 会被合并。
+     */
+    function loadFingerprintTimeline(fingerprint) {
+        var seq = ++state.relationSeq;
+        relationView("会话时间线（按对话前缀推断）", ICON.latency);
+        setRelationBody('<p class="tree-loading">加载中…</p>');
+        var now = Date.now();
+        var p = new URLSearchParams();
+        p.set("from", String(now - RELATION_WINDOW_MS));
+        p.set("to", String(now));
+        p.set("fingerprint", fingerprint);
+
+        fetch(TIMELINE_API + "?" + p.toString()).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }).then(function (d) {
+            if (seq !== state.relationSeq) return;
+            renderFingerprintTimeline(d, fingerprint);
+        }).catch(function (e) {
+            if (seq !== state.relationSeq) return;
+            setRelationBody(relationFailText(e));
+            var retry = $("relationRetry");
+            if (retry) retry.addEventListener("click", function () {
+                loadFingerprintTimeline(fingerprint);
+            });
+        });
+    }
+
+    function renderFingerprintTimeline(d, fingerprint) {
+        var items = d.items || [];
+        var notice = "";
+        if (d.truncated) {
+            notice = '<p class="tree-notice">候选记录超过扫描上限，结果可能不完整；请缩小时间范围。</p>';
+        }
+        var caveat = '<p class="hint" style="margin-top:0">' +
+            '该记录没有会话 ID（客户端未发送会话标识）。时间线按<b>对话前缀指纹</b>推断：' +
+            '同一会话每轮都会重发相同的历史前缀。会话被压缩后会断成多段，前缀相同的并发会话可能被合并。' +
+            "</p>";
+        if (!items.length) {
+            setRelationBody(notice + caveat + '<p class="tree-loading">该指纹下暂无记录</p>');
+            return;
+        }
+        renderTimelineInto(items, "对话前缀 " + esc(fingerprint), d.truncated, notice + caveat);
     }
 
     function loadTimeline(sessionId) {

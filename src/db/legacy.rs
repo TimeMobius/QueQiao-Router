@@ -10,7 +10,9 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use tracing::{info, warn};
 
-use crate::db::extract::{extract_request, extract_response, header_meta, HeaderMeta};
+use crate::db::extract::{
+    body_session_meta, extract_request, extract_response, header_meta, HeaderMeta,
+};
 use crate::db::payload;
 use crate::db::rotation;
 use crate::models::requests::{MessageContent, RequestPayload};
@@ -133,6 +135,15 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
                     .map(legacy_header_meta)
                     .unwrap_or_default();
 
+                // 与 V2 写入路径同口径：请求头缺失时回落到请求体
+                // （DSH 的 dsh_session_log.session / prompt_cache_key）。
+                let body_meta = req_value
+                    .as_ref()
+                    .map(body_session_meta)
+                    .unwrap_or_default();
+                let session_id = header.session_id.or(body_meta.session_id);
+                let parent_session_id = header.parent_session_id.or(body_meta.parent_session_id);
+
                 // Tool/Multimodal 与 V2 相同口径重算；解析失败时保留旧值。
                 let tool = req_value
                     .as_ref()
@@ -200,8 +211,8 @@ pub(crate) async fn migrate_archive(pool: &SqlitePool) -> Result<(), sqlx::Error
                 .bind(&header.client_name)
                 .bind(&header.client_version)
                 .bind(&header.api_key)
-                .bind(&header.session_id)
-                .bind(&header.parent_session_id)
+                .bind(&session_id)
+                .bind(&parent_session_id)
                 .bind(&header.request_id)
                 .bind(&header.session_affinity)
                 .bind(tool)

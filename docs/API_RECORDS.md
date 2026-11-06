@@ -34,10 +34,22 @@ metrics、不写访问日志，可安全频繁轮询。
 会话/请求标识由客户端请求头提取入库（见 `src/db/extract.rs` 的 `header_meta`），并按白名单
 **原样转发**给上游（客户端 `User-Agent` 不转发，上游看到的是网关自身 UA）：
 
-| 界面显示 | 数据库列 | 查询参数 / 响应字段 | 来源请求头 | 转发上游 |
+| 界面显示 | 数据库列 | 查询参数 / 响应字段 | 来源（按优先级） | 转发上游 |
 | :--- | :--- | :--- | :--- | :--- |
-| 会话 ID | `SessionId` | `session_id` / `sessionId` | `x-session-id` | 是 |
-| 父会话 ID | `ParentSessionId` | `parent_session_id` / `parentSessionId` | `x-parent-session-id` | 是 |
+| 会话 ID | `SessionId` | `session_id` / `sessionId` | 请求头 `x-session-id` → `x-deepseek-harness-session-id` → `session_id` → `x-client-request-id`；请求头全缺时回落到请求体 `dsh_session_log.session.id` → `prompt_cache_key` | 前三个白名单内的会转发 |
+| 父会话 ID | `ParentSessionId` | `parent_session_id` / `parentSessionId` | 请求头 `x-parent-session-id`；否则请求体 `dsh_session_log.session.parentSession` | 是 |
+
+**会话 ID 的别名回退**：不同客户端的叫法不同，网关按上表顺序取第一个非空值。
+- `x-deepseek-harness-session-id` —— DSH（deepseek-harness）的 Anthropic Messages 路由；
+- `session_id` / `x-client-request-id` —— pi-ai 的 `openai-responses` 协议；
+- `prompt_cache_key`（请求体）—— OpenAI 兼容端在 `cacheRetention: long` 时携带，
+  值即会话 id；网关同时把它原样透传给上游。
+
+**父会话 ID 只能来自请求体**：DSH 不会为父会话发送任何请求头，子智能体的父会话 id
+只出现在请求体的 `dsh_session_log.session.parentSession` 里（由
+`dsh-session-log-deepseek` 插件注入，仅 DeepSeek Messages 路由）。
+
+两个请求体来源都写进**现有**的 `SessionId` / `ParentSessionId` 列，未新增表结构。
 | 请求 ID | `RequestId` | `request_id` / `requestId` | `x-request-id` / `x-trace-id` / `request-id` / `x-correlation-id` 中第一个非空（trim、截断 200 字符） | `x-request-id` / `x-trace-id` / `x-correlation-id` 三个会转发；裸 `request-id` 不转发 |
 
 同一次请求若同时携带多个候选请求头：审计库 `RequestId` 只存上述顺序中第一个非空的值；
@@ -166,6 +178,77 @@ v8 归档不受影响。无法解析的时间戳保留为 NULL 隔离，并被�
 | `request_body` | 请求体（`http_error` 且日志行带请求体时） |
 
 某字段为 `null` 表示该行不含此信息，不是错误。`nextBefore` 为 `null` 表示已到文件开头。
+
+---
+
+## `GET /dashboard/api/session-timeline` — 会话时间线
+
+把同一会话的记录按时间升序聚合。面板记录抽屉里的「会话时间线」按钮调用的就是它。
+
+两种模式，**二选一**：
+
+| 参数 | 说明 |
+| :--- | :--- |
+| `session_id` | 已知会话 id。按 `SessionId` 精确查询（不是子串匹配）。 |
+| `fingerprint` | 对话前缀指纹，接受 `prefix:xxxxxxxxxxxxxxxx` 或裸 16 位串。 |
+| `from` / `to` | epoch 毫秒；指纹模式下强烈建议带上，以缩小扫描范围 |
+| `type` / `model` / `client` / `backend` | 与列表接口同语义，进一步收窄指纹扫描 |
+
+### 对话前缀指纹（无会话 ID 时的回退）
+
+部分客户端（DSH 的 OpenAI chat-completions 路由在非 OpenRouter 目标上）**不发任何会话标识头**，
+请求体里也没有缓存键。这类记录的 `SessionId` 为空，面板原本只能禁用按钮。
+
+网关因此提供一条推断路径：Agent 类客户端每轮都重发**完整历史**，且历史前缀在会话内不变，
+所以「system + 首条 message」的 SHA-256 前 8 字节在会话内恒定、在会话间几乎必然不同。
+指纹是**查询时现场从 `payloads` 表解压请求体计算**的派生量：
+
+- **不新增数据库列**，零 schema 变更；
+- 进程内按 `record_id` 缓存（记录落库后不再变化，可安全缓存），容量 5 万条，满了整体清空。
+
+**已知局限**（UI 上已明示）：
+
+- 会话被**压缩**（compaction）后前缀改变 → 时间线断成多段；
+- 前缀完全相同的并发 fork 会被合并成一个会话；
+- 只对「每轮重发全量历史」的客户端有效；一次性单轮请求各自独立成簇；
+- 候选记录扫描上限 2000 条，超出时响应 `truncated: true`。
+
+### 响应
+
+`session_id` 模式：
+
+```json
+{ "mode": "session", "sessionId": "session-…", "items": [...], "total": 12, "totalExact": true }
+```
+
+`fingerprint` 模式（未给 `fingerprint` 时返回全部分组概览，供 UI 列出可选项）：
+
+```json
+{
+  "mode": "fingerprint",
+  "fingerprint": "a0fac5c69b4e10c8",
+  "items": [ { "id": 22, "timeMs": 1793973877743, "fingerprint": "a0fac5c69b4e10c8", "...": "..." } ],
+  "sessions": [ { "key": "prefix:a0fac5c69b4e10c8", "count": 5, "firstTime": "…", "lastTime": "…" } ],
+  "scanned": 19,
+  "unassigned": 0,
+  "truncated": false
+}
+```
+
+`items` 一律按 `(timeMs, id)` **升序**（时间线按时间正序阅读）。已有 `SessionId` 的记录
+不参与指纹聚类——真实 id 永远优先。
+
+### 详情接口的配合字段
+
+`GET /dashboard/api/records/:id` 现在额外返回：
+
+- `fingerprint`：无 `SessionId` 时给出推断用指纹，否则为 `null`；
+- 面板据此决定按钮可用性与走哪条路径（真实 id 优先）。
+
+```bash
+curl 'http://127.0.0.1:8000/dashboard/api/session-timeline?session_id=session-abc'
+curl 'http://127.0.0.1:8000/dashboard/api/session-timeline?fingerprint=prefix:a0fac5c69b4e10c8'
+```
 
 ---
 

@@ -14,6 +14,7 @@ pub mod records;
 pub mod records_query;
 pub mod rotation;
 pub mod schema;
+pub mod session_fingerprint;
 pub mod store;
 pub mod turso_schema;
 pub mod writer;
