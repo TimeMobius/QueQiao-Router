@@ -449,6 +449,7 @@ mod tests {
             presence_penalty: None,
             repetition_penalty: None,
             seed: None,
+            extra: serde_json::Map::new(),
         })
     }
 
@@ -464,6 +465,7 @@ mod tests {
             logprobs: None,
             prompt_logprobs: None,
             echo: None,
+            extra: serde_json::Map::new(),
         })
     }
 
@@ -474,6 +476,7 @@ mod tests {
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: serde_json::Map::new(),
         })
     }
 
@@ -483,6 +486,7 @@ mod tests {
             query: "test query".to_string(),
             documents: vec!["doc1".to_string(), "doc2".to_string()],
             top_n: None,
+            extra: serde_json::Map::new(),
         })
     }
 
@@ -491,6 +495,7 @@ mod tests {
             model: "score-model".to_string(),
             text_1: serde_json::json!("text1"),
             text_2: serde_json::json!("text2"),
+            extra: serde_json::Map::new(),
         })
     }
 
@@ -498,6 +503,7 @@ mod tests {
         RequestPayload::Classify(ClassifyRequest {
             model: "classify-model".to_string(),
             input: serde_json::json!("input text"),
+            extra: serde_json::Map::new(),
         })
     }
 

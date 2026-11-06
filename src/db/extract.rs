@@ -655,6 +655,7 @@ mod tests {
             top_logprobs: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            extra: serde_json::Map::new(),
         })
     }
 
@@ -755,6 +756,7 @@ mod tests {
             logprobs: None,
             prompt_logprobs: None,
             echo: None,
+            extra: serde_json::Map::new(),
         });
         assert_eq!(extract_request(&payload).prompt, "hello completion");
     }

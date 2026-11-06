@@ -113,11 +113,13 @@ fn build_request_body_inner(
             let adjusted_max_tokens = adjust_max_tokens(client_config.max_tokens, p.max_tokens);
             let merged_stop = merge_stop_words(client_config.stop.as_ref(), p.stop.clone());
 
-            let mut body = json!({
-                "model": p.model,
-                "messages": p.messages,
-                "stream": stream,
-            });
+            // 未知字段垫底：客户端显式发来的扩展参数（top_k / guided_json /
+            // response_format …）原样带给上游。随后所有已知字段都会覆盖同名键，
+            // 因此客户端无法经 extra 绕过 `model` / `stream` 这类网关权威字段。
+            let mut body = Value::Object(p.extra.clone());
+            body["model"] = json!(p.model);
+            body["messages"] = json!(p.messages);
+            body["stream"] = json!(stream);
 
             if let Some(temp) = p.temperature {
                 body["temperature"] = json!(temp);
@@ -150,11 +152,16 @@ fn build_request_body_inner(
                 body["chat_template_kwargs"] = kwargs.clone();
             }
             if stream {
+                // 客户端给了就用客户端的；没给才注入 include_usage。
+                // 用赋值覆盖（而非只在缺失时插入），保证不会与 extra 里的同名键并存两份。
                 if let Some(opts) = &p.stream_options {
                     body["stream_options"] = opts.clone();
                 } else {
                     body["stream_options"] = json!({"include_usage": true});
                 }
+            } else if let Some(obj) = body.as_object_mut() {
+                // 非流式请求不该把 stream_options 透传给上游（它只对 SSE 有意义）。
+                obj.remove("stream_options");
             }
             if let Some(logprobs) = p.logprobs {
                 body["logprobs"] = json!(logprobs);
@@ -176,11 +183,11 @@ fn build_request_body_inner(
             let adjusted_max_tokens = adjust_max_tokens(client_config.max_tokens, p.max_tokens);
             let merged_stop = merge_stop_words(client_config.stop.as_ref(), p.stop.clone());
 
-            let mut body = json!({
-                "model": p.model,
-                "prompt": p.prompt,
-                "stream": stream,
-            });
+            // 同 Chat 分支：未知字段垫底，已知字段覆盖。
+            let mut body = Value::Object(p.extra.clone());
+            body["model"] = json!(p.model);
+            body["prompt"] = json!(p.prompt);
+            body["stream"] = json!(stream);
 
             if let Some(temp) = p.temperature {
                 body["temperature"] = json!(temp);
@@ -197,6 +204,8 @@ fn build_request_body_inner(
                 } else {
                     body["stream_options"] = json!({"include_usage": true});
                 }
+            } else if let Some(obj) = body.as_object_mut() {
+                obj.remove("stream_options");
             }
             if let Some(logprobs) = p.logprobs {
                 body["logprobs"] = json!(logprobs);
@@ -259,6 +268,163 @@ pub fn apply_prefix_to_json(response_body: &mut Value, prefix: &str, is_chat: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用最小后端配置：无模型改写、无 extra_body、无 stop/max_tokens 覆盖，
+    /// 使断言只反映请求体自身的重建行为。
+    fn test_client() -> ClientConfig {
+        ClientConfig {
+            name: "test".to_string(),
+            base_url: "http://localhost/v1".to_string(),
+            api_key: None,
+            model_match: crate::config::types::ModelMatch {
+                match_type: "exact".to_string(),
+                value: vec!["m".to_string()],
+            },
+            priority: None,
+            fallback: None,
+            special_prefix: None,
+            stop: None,
+            max_tokens: None,
+            extra_body: None,
+            thinking_format: None,
+            model_rewrite: None,
+            model_echo: crate::config::types::ModelEcho::default(),
+            extra_body_cached: ExtraBodyCached::default(),
+        }
+    }
+
+    fn chat_payload(value: serde_json::Value) -> RequestPayload {
+        RequestPayload::Chat(
+            serde_json::from_value::<crate::models::requests::ChatCompletionRequest>(value)
+                .unwrap(),
+        )
+    }
+
+    // ---- 未知字段透传 ----
+
+    #[test]
+    fn chat_preserves_unknown_fields() {
+        // vLLM / SGLang 的扩展采样与结构化输出字段，结构体里没有声明。
+        let payload = chat_payload(json!({
+            "model": "m",
+            "messages": [],
+            "top_k": 42,
+            "guided_json": {"type": "object"},
+            "response_format": {"type": "json_object"},
+            "prompt_cache_key": "ck-1"
+        }));
+        let body = build_request_body_generic(&payload, &test_client(), false);
+
+        assert_eq!(body["top_k"], json!(42));
+        assert_eq!(body["guided_json"], json!({"type": "object"}));
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+        assert_eq!(body["prompt_cache_key"], json!("ck-1"));
+    }
+
+    #[test]
+    fn chat_known_fields_override_extra() {
+        // 客户端把 model/stream 塞进"未知"位置也不能生效：
+        // 这两个字段由结构体解析，网关拥有最终决定权。
+        let payload = chat_payload(json!({
+            "model": "inbound-model",
+            "messages": [],
+            "stream": false
+        }));
+        let body = build_request_body_generic(&payload, &test_client(), true);
+
+        // 入站 model 保留（未配 model_rewrite），stream 由调用点参数决定为 true。
+        assert_eq!(body["model"], json!("inbound-model"));
+        assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn chat_stream_options_not_duplicated() {
+        // extra 里即使出现 stream_options，也必须被已知字段覆盖，不能并存两份。
+        let payload = chat_payload(json!({
+            "model": "m",
+            "messages": [],
+            "stream_options": {"include_usage": false}
+        }));
+        let body = build_request_body_generic(&payload, &test_client(), true);
+
+        // 客户端显式给了就尊重客户端值（既有行为）。
+        assert_eq!(body["stream_options"], json!({"include_usage": false}));
+        // JSON 对象天然去重；这里再确认值不是被注入的默认值。
+        assert_ne!(body["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn chat_injects_stream_options_when_absent() {
+        let payload = chat_payload(json!({"model": "m", "messages": []}));
+        let body = build_request_body_generic(&payload, &test_client(), true);
+        assert_eq!(body["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn chat_non_stream_drops_stream_options() {
+        // 非流式请求不该带 stream_options，即使客户端发了。
+        let payload = chat_payload(json!({
+            "model": "m",
+            "messages": [],
+            "stream_options": {"include_usage": true}
+        }));
+        let body = build_request_body_generic(&payload, &test_client(), false);
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn model_rewrite_applies_after_passthrough() {
+        // 透传不得破坏 model_rewrite：改写仍是 model 字段的最终权威。
+        let mut config = test_client();
+        config.model_rewrite = Some(
+            [("inbound".to_string(), "upstream".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let payload = chat_payload(json!({
+            "model": "inbound",
+            "messages": [],
+            "top_k": 9
+        }));
+        let body = build_request_body_generic(&payload, &config, false);
+
+        assert_eq!(body["model"], json!("upstream"));
+        assert_eq!(body["top_k"], json!(9));
+    }
+
+    #[test]
+    fn completion_preserves_unknown_fields() {
+        let payload = RequestPayload::Completion(
+            serde_json::from_value::<crate::models::requests::CompletionRequest>(json!({
+                "model": "m",
+                "prompt": "hi",
+                "suffix": "tail",
+                "best_of": 3
+            }))
+            .unwrap(),
+        );
+        let body = build_request_body_generic(&payload, &test_client(), false);
+
+        assert_eq!(body["suffix"], json!("tail"));
+        assert_eq!(body["best_of"], json!(3));
+    }
+
+    #[test]
+    fn embedding_preserves_unknown_fields() {
+        let payload = RequestPayload::Embedding(
+            serde_json::from_value::<crate::models::requests::EmbeddingRequest>(json!({
+                "model": "m",
+                "input": "hi",
+                "truncate_prompt_tokens": 5,
+                "task": "embed"
+            }))
+            .unwrap(),
+        );
+        let body = build_request_body_generic(&payload, &test_client(), false);
+
+        assert_eq!(body["truncate_prompt_tokens"], json!(5));
+        assert_eq!(body["task"], json!("embed"));
+    }
 
     #[test]
     fn test_merge_stop_words_both_present() {

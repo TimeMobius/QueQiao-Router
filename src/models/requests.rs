@@ -191,7 +191,17 @@ pub struct ChatCompletionRequest {
     /// 与 `prompt_cache_key` 配套的缓存保留策略（如 `"24h"`），原样透传。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<String>,
-    // Add other fields as needed
+    /// 未在结构体中声明的字段，原样透传给上游。
+    ///
+    /// 网关是透传代理，不应逐字段猜测客户端会用哪些扩展参数：vLLM / SGLang /
+    /// OpenAI 生态持续新增采样与路由字段（`top_k`、`guided_json`、
+    /// `response_format`、`prompt_cache_key`…），逐字段声明必然滞后，而丢弃时
+    /// **不会报错**，排查成本极高。
+    ///
+    /// 重建请求体时必须把它**铺在最底层**，再由已知字段覆盖同名键——这样
+    /// `model` / `stream` 等网关拥有最终决定权的字段不会被客户端经此绕过。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +224,17 @@ pub struct CompletionRequest {
     pub prompt_logprobs: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
+    /// 未在结构体中声明的字段，原样透传给上游。
+    ///
+    /// 网关是透传代理，不应逐字段猜测客户端会用哪些扩展参数：vLLM / SGLang /
+    /// OpenAI 生态持续新增采样与路由字段（`top_k`、`guided_json`、
+    /// `response_format`、`prompt_cache_key`…），逐字段声明必然滞后，而丢弃时
+    /// **不会报错**，排查成本极高。
+    ///
+    /// 重建请求体时必须把它**铺在最底层**，再由已知字段覆盖同名键——这样
+    /// `model` / `stream` 等网关拥有最终决定权的字段不会被客户端经此绕过。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 // --- New vLLM Compatible Requests ---
@@ -228,6 +249,17 @@ pub struct EmbeddingRequest {
     pub dimensions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// 未在结构体中声明的字段，原样透传给上游。
+    ///
+    /// 网关是透传代理，不应逐字段猜测客户端会用哪些扩展参数：vLLM / SGLang /
+    /// OpenAI 生态持续新增采样与路由字段（`top_k`、`guided_json`、
+    /// `response_format`、`prompt_cache_key`…），逐字段声明必然滞后，而丢弃时
+    /// **不会报错**，排查成本极高。
+    ///
+    /// 重建请求体时必须把它**铺在最底层**，再由已知字段覆盖同名键——这样
+    /// `model` / `stream` 等网关拥有最终决定权的字段不会被客户端经此绕过。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +269,17 @@ pub struct RerankRequest {
     pub documents: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_n: Option<usize>,
+    /// 未在结构体中声明的字段，原样透传给上游。
+    ///
+    /// 网关是透传代理，不应逐字段猜测客户端会用哪些扩展参数：vLLM / SGLang /
+    /// OpenAI 生态持续新增采样与路由字段（`top_k`、`guided_json`、
+    /// `response_format`、`prompt_cache_key`…），逐字段声明必然滞后，而丢弃时
+    /// **不会报错**，排查成本极高。
+    ///
+    /// 重建请求体时必须把它**铺在最底层**，再由已知字段覆盖同名键——这样
+    /// `model` / `stream` 等网关拥有最终决定权的字段不会被客户端经此绕过。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,12 +287,34 @@ pub struct ScoreRequest {
     pub model: String,
     pub text_1: Value, // String or Vec<String>
     pub text_2: Value, // String or Vec<String>
+    /// 未在结构体中声明的字段，原样透传给上游。
+    ///
+    /// 网关是透传代理，不应逐字段猜测客户端会用哪些扩展参数：vLLM / SGLang /
+    /// OpenAI 生态持续新增采样与路由字段（`top_k`、`guided_json`、
+    /// `response_format`、`prompt_cache_key`…），逐字段声明必然滞后，而丢弃时
+    /// **不会报错**，排查成本极高。
+    ///
+    /// 重建请求体时必须把它**铺在最底层**，再由已知字段覆盖同名键——这样
+    /// `model` / `stream` 等网关拥有最终决定权的字段不会被客户端经此绕过。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifyRequest {
     pub model: String,
     pub input: Value, // String or Vec<String>
+    /// 未在结构体中声明的字段，原样透传给上游。
+    ///
+    /// 网关是透传代理，不应逐字段猜测客户端会用哪些扩展参数：vLLM / SGLang /
+    /// OpenAI 生态持续新增采样与路由字段（`top_k`、`guided_json`、
+    /// `response_format`、`prompt_cache_key`…），逐字段声明必然滞后，而丢弃时
+    /// **不会报错**，排查成本极高。
+    ///
+    /// 重建请求体时必须把它**铺在最底层**，再由已知字段覆盖同名键——这样
+    /// `model` / `stream` 等网关拥有最终决定权的字段不会被客户端经此绕过。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

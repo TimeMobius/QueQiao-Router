@@ -49,6 +49,33 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 其余客户端头一律不转发。上述标识头同时会被写入审计库（见 `DATABASE_SCHEMA.md`
 的「身份字段与请求头的对应关系」）。
 
+## 透传请求体字段
+
+网关**不丢弃**客户端发来的未声明字段。`/v1/chat/completions`、`/v1/completions`、
+`/v1/embeddings`、`/v1/rerank`、`/score`、`/classify` 的请求结构体都带
+`#[serde(flatten)] extra`，未在结构体中声明的键会原样带到上游。
+
+这对 vLLM / SGLang / OpenAI 生态的扩展参数是必需的，例如：
+
+| 类别 | 字段 |
+| :--- | :--- |
+| 采样扩展 | `top_k`、`min_p`、`typical_p`、`tfs` |
+| vLLM 专有 | `guided_json`、`guided_regex`、`guided_choice`、`enable_thinking`、`thinking_budget`、`truncate_prompt_tokens`、`priority`、`ignore_eos` |
+| 结构化输出 | `response_format`、`json_schema` |
+| 缓存/路由 | `prompt_cache_key`、`prompt_cache_retention`、`metadata`、`user` |
+
+**网关保留最终决定权的字段**（客户端无法经未知字段绕过）：
+
+- `model` —— 若配置了 `model_rewrite`，改写发生在重建之后，是最终值；
+- `stream` —— 由请求实际形态决定，不使用客户端在 body 里声明的值；
+- `stream_options` —— 流式时尊重客户端值（缺省注入 `include_usage: true`），
+  非流式时**移除**（该字段对 SSE 之外无意义）；
+- 后端 `extra_body` 配置 —— 仅在字段缺失时补充，不会覆盖客户端字段。
+
+> 透传意味着上游会看到客户端发来的一切字段。若某上游对未知字段严格校验并返回 422，
+> 那是客户端与上游之间的约定，网关不做过滤；可用后端 `extra_body` 反向覆盖，
+> 或让客户端不要发送该字段。
+
 ## 思考格式（ThinkingFormat）
 
 | 值 | 效果 |
