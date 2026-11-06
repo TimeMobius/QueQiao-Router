@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
-use crate::config::types::{ClientConfig, ModelMatch};
+use crate::config::types::ClientConfig;
 use crate::services::models_cache::{CacheKey, CacheOutcome, ModelsCache};
 use crate::state::app_state::AppState;
 
@@ -26,15 +26,12 @@ const LEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(35);
 /// upstream at most every 30 seconds.
 const STALE_RETRY_TTL: Duration = Duration::from_secs(30);
 
-fn model_matches_filter(model_id: &str, model_match: &ModelMatch) -> bool {
-    match model_match.match_type.as_str() {
-        "keyword" => model_match
-            .value
-            .iter()
-            .any(|keyword| model_id.contains(keyword)),
-        "exact" => model_match.value.contains(&model_id.to_string()),
-        _ => false,
-    }
+/// 上游返回的模型 id 是否应对外暴露。
+///
+/// 复用 `ClientConfig::matches_model`，与路由匹配共用同一份语义
+/// （`model_match` ∪ `model_rewrite` 的键），避免两处实现漂移。
+fn model_matches_filter(model_id: &str, client_config: &ClientConfig) -> bool {
+    client_config.matches_model(model_id)
 }
 
 /// Client credential wins; backend `api_key` is the fallback. This is the
@@ -137,13 +134,13 @@ async fn aggregate_models(
                 if let Some(data) = models.get("data").and_then(|d| d.as_array()) {
                     for model in data {
                         if let Some(id) = model.get("id").and_then(|id| id.as_str()) {
-                            if model_matches_filter(id, &client_config.model_match) {
+                            if model_matches_filter(id, client_config) {
                                 all_models.push(model.clone());
                             }
                         }
                     }
                 } else if let Some(id) = models.get("id").and_then(|id| id.as_str()) {
-                    if model_matches_filter(id, &client_config.model_match) {
+                    if model_matches_filter(id, client_config) {
                         all_models.push(models.clone());
                     }
                 }
@@ -175,6 +172,27 @@ async fn aggregate_models(
             }
         } else {
             unique_models.push(model);
+        }
+    }
+
+    // 把 model_rewrite 的键合成为对外可见的模型条目。
+    //
+    // 别名是**配置承诺**：上游只会返回真名（如 deepseek-v4.1-flash），
+    // 若不做合成，客户端在模型选择器里根本看不到 deepseek-flash。
+    // 放在这里（去重之后、返回之前）可同时覆盖 ttl=0 直连路径与缓存路径，
+    // 且不会因缓存命中而重复注入。
+    for client_config in openai_clients {
+        let Some(rewrite) = &client_config.model_rewrite else {
+            continue;
+        };
+        for alias in rewrite.keys() {
+            if seen_ids.insert(alias.clone()) {
+                unique_models.push(json!({
+                    "id": alias,
+                    "object": "model",
+                    "owned_by": client_config.name,
+                }));
+            }
         }
     }
 

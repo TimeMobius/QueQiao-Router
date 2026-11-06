@@ -107,7 +107,7 @@ docker run -d \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/logs:/app/logs \
   --restart always \
-  ghcr.io/timemobius/queqiao-router:b677
+  ghcr.io/timemobius/queqiao-router:b675
 ```
 
 > **数据库路径说明**: 源码默认 `RECD_PATH=./record.db`（数据库文件在运行目录，兼容 `sqlite:` 前缀），而 Docker 镜像默认设为 `sqlite:./logs/record.db`（写入挂载的 logs 卷）。若使用 Docker，建议将 logs 目录挂载为主机持久化路径，或显式设置 `RECD_PATH` 环境变量指向挂载路径，避免容器重启后数据丢失。
@@ -201,7 +201,43 @@ openai_clients:
     extra_body: |                # 可选：JSON 对象，仅当请求未提供同名字段时注入
       {"frequency_penalty": 1, "presence_penalty": 0.91}
     thinking_format: "reasoning" # 可选：覆盖全局思考格式
+    model_rewrite:               # 可选：模型名改写（入站名 → 上游名）
+      "deepseek-flash": "deepseek-v4.1-flash"
+    model_echo: "upstream"       # 可选：响应体 model 回显，upstream(默认) | inbound
 ```
+
+### 模型名改写 (model_rewrite) 说明
+
+当上游只认某个模型名、但希望网关对外暴露更简短的别名时使用：
+
+```yaml
+openai_clients:
+  - name: "hapiopen"
+    base_url: "https://hapiopen.cc/v1"
+    api_key: "sk-xxx"
+    model_match:
+      type: "exact"
+      value: []                # 可留空：model_rewrite 的键会自动并入可路由模型集
+    model_rewrite:
+      "deepseek-flash": "deepseek-v4.1-flash"
+```
+
+此后客户端用 `"model": "deepseek-flash"` 调用，网关转发给上游时改写为
+`deepseek-v4.1-flash`；`GET /v1/models` 也会列出 `deepseek-flash`。
+
+| 规则 | 行为 |
+| :--- | :--- |
+| 命中映射 | 上游请求体的 `model` 改为映射值 |
+| 未命中映射 | 原样透传入站名（等价于默认行为） |
+| 路由匹配 | 入站名命中 `model_match` **或** 存在于 `model_rewrite` 的键中即可路由 |
+| 日志/指标/审计库 `Model` 列 | 一律记录**入站名**，便于按客户端视角聚合 |
+| `fallback` | 属入站名空间；切换后按目标后端的映射重新改写 |
+| 改写模式 | 仅精确映射，不做前缀/正则替换，也不做链式映射 |
+| 音频 `/v1/audio/*` | multipart 中的 `model` 字段同样被改写 |
+
+**`model_echo`**：默认 `upstream`，响应体里的 `model` 原样透传上游返回的名字（零额外开销）。
+设为 `inbound` 则改回客户端请求时用的名字——注意流式路径会因此对带 `model` 的
+SSE chunk 多做一次 JSON 解析，仅在确有必要时开启。
 
 ### 思考格式 (ThinkingFormat) 说明
 

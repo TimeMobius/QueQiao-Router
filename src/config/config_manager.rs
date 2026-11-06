@@ -67,7 +67,78 @@ impl ConfigManager {
         let contents = fs::read_to_string(config_path)?;
         let mut config: Config = serde_yaml::from_str(&contents)?;
         Self::populate_extra_body_cache(&mut config);
+        Self::validate_config(&config)?;
+        Self::log_model_rewrites(&config);
         Ok(config)
+    }
+
+    /// 配置语义校验。
+    ///
+    /// 返回 `Err` 时，热重载会保留旧配置并等待下次重试（见 `reload_if_changed`），
+    /// 因此校验失败不会把运行中的网关打挂；启动时失败则会直接退出，
+    /// 让写错的配置尽早暴露。
+    fn validate_config(config: &Config) -> Result<(), String> {
+        let mut seen_names = std::collections::HashSet::new();
+
+        for client in &config.openai_clients {
+            if client.name.trim().is_empty() {
+                return Err("openai_clients: client name must not be empty".to_string());
+            }
+            if !seen_names.insert(client.name.as_str()) {
+                return Err(format!(
+                    "openai_clients: duplicate client name '{}'",
+                    client.name
+                ));
+            }
+            if !matches!(client.model_match.match_type.as_str(), "exact" | "keyword") {
+                return Err(format!(
+                    "client '{}': model_match.type must be 'exact' or 'keyword', got '{}'",
+                    client.name, client.model_match.match_type
+                ));
+            }
+
+            let Some(rewrite) = &client.model_rewrite else {
+                continue;
+            };
+            for (from, to) in rewrite {
+                if from.trim().is_empty() {
+                    return Err(format!(
+                        "client '{}': model_rewrite contains an empty model name",
+                        client.name
+                    ));
+                }
+                if to.trim().is_empty() {
+                    return Err(format!(
+                        "client '{}': model_rewrite['{}'] has an empty target",
+                        client.name, from
+                    ));
+                }
+                if from == to {
+                    tracing::warn!(
+                        "client '{}': model_rewrite['{}'] maps to itself, no-op",
+                        client.name,
+                        from
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 启动/热重载时打印生效的模型别名，便于运维核对实际转发目标。
+    fn log_model_rewrites(config: &Config) {
+        for client in &config.openai_clients {
+            let Some(rewrite) = &client.model_rewrite else {
+                continue;
+            };
+            for (from, to) in rewrite {
+                info!(
+                    "client '{}': model alias '{}' -> '{}'",
+                    client.name, from, to
+                );
+            }
+        }
     }
 
     /// Parse each client's `extra_body` JSON string into the cached Value tree

@@ -378,14 +378,39 @@ pub async fn process_anthropic_streaming_response(
     });
 
     // SSE forwarding: preserve event type, forward data verbatim
+    //
+    // `model_echo: inbound`（默认关闭）时，仅在 chunk 真的带 "model" 的极少数情况
+    // 才做一次 JSON 解析改写（Anthropic 通常只有 message_start 一处），
+    // 其余 chunk 依旧逐字透传，保持零解析热路径。
+    let echo_inbound_model = client_config.model_echo == crate::config::types::ModelEcho::Inbound;
+    let inbound_model_for_echo = model_for_error.clone();
     let sse_stream = OutcomeSignal::new(stream.eventsource(), outcome).map(move |result| {
         match result {
             Ok(event) => {
                 // Send data to logger channel (best-effort, ignore send errors)
                 let _ = tx.send(event.data.clone());
 
+                let data = if echo_inbound_model && event.data.contains("\"model\"") {
+                    match serde_json::from_str::<Value>(&event.data) {
+                        Ok(mut value) => {
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert("model".to_string(), json!(inbound_model_for_echo));
+                            }
+                            if let Some(message) =
+                                value.get_mut("message").and_then(|m| m.as_object_mut())
+                            {
+                                message.insert("model".to_string(), json!(inbound_model_for_echo));
+                            }
+                            serde_json::to_string(&value).unwrap_or(event.data)
+                        }
+                        Err(_) => event.data,
+                    }
+                } else {
+                    event.data
+                };
+
                 // Preserve the SSE event type field
-                let mut out = Event::default().data(event.data);
+                let mut out = Event::default().data(data);
                 if !event.event.is_empty() {
                     out = out.event(event.event);
                 }

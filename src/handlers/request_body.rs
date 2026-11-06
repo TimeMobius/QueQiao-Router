@@ -54,7 +54,39 @@ pub fn build_request_body_generic(
         &client_config.extra_body_cached,
         &client_config.name,
     );
+    // 必须放在最后：模型名改写是 `model` 字段的最终权威，
+    // 不允许被 extra_body 里的同名键意外覆盖。
+    rewrite_body_model(&mut body, client_config);
     body
+}
+
+/// 按后端配置把请求体中的 `model` 从入站名改写为上游名。
+///
+/// 覆盖全部请求类型：`Chat` / `Completion` 分支是字面量写入 `model`，
+/// 其余类型走 `serde_json::to_value(p)`，因此在 JSON 层统一处理即可，
+/// 无需逐个分支修改。
+///
+/// 未配置 `model_rewrite` 或未命中映射时**零分配**直接返回。
+fn rewrite_body_model(body: &mut Value, client_config: &ClientConfig) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let Some(inbound) = obj.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(upstream) = client_config
+        .model_rewrite
+        .as_ref()
+        .and_then(|rewrite| rewrite.get(inbound))
+    else {
+        return;
+    };
+    if upstream.as_str() != inbound {
+        // 先 clone 再插入：`upstream` 借用自 client_config，
+        // 但 `obj.insert` 需要 body 的可变借用，这里让不可变借用提前结束。
+        let upstream = upstream.clone();
+        obj.insert("model".to_string(), json!(upstream));
+    }
 }
 
 fn apply_extra_body_cached(body: &mut Value, extra: &ExtraBodyCached, _client_name: &str) {
@@ -384,6 +416,8 @@ mod tests {
             max_tokens: None,
             extra_body: None,
             thinking_format: None,
+            model_rewrite: None,
+            model_echo: crate::config::types::ModelEcho::default(),
             extra_body_cached: ExtraBodyCached::default(),
         };
 

@@ -377,11 +377,11 @@ async fn dispatch_request(
 
     let active_labels = ActiveRequestLabels {
         endpoint: api_endpoint.clone(),
-        model: request_body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        // 必须用**入站名**：dispatcher 侧 `get_active_counts_for_clients`
+        // 以入站模型名读取 ACTIVE_REQUESTS。若这里取 request_body 的 model
+        // （模型名改写后是上游名），写入与读取的标签永不相等，
+        // least_connections 策略会静默退化为按名字排序。
+        model: payload.get_model().to_string(),
         backend: client_config.name.clone(),
     };
 
@@ -524,6 +524,14 @@ async fn process_non_streaming_response(
                     &mut response_body,
                     target,
                 );
+            }
+        }
+
+        // 可选：把响应体里的 model 改回入站名（默认透传上游原名）。
+        // 非流式路径此时已解析过 JSON，因此这里是零额外成本。
+        if client_config.model_echo == crate::config::types::ModelEcho::Inbound {
+            if let Some(obj) = response_body.as_object_mut() {
+                obj.insert("model".to_string(), json!(payload.get_model()));
             }
         }
 

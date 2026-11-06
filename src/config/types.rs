@@ -41,10 +41,34 @@ pub struct ClientConfig {
     #[serde(default)]
     pub thinking_format: Option<ThinkingFormat>,
 
+    /// 模型名改写：入站名 → 上游名，仅精确映射。
+    /// 映射的键自动并入本后端的可路由模型集（与 `model_match` 取并集），
+    /// 因此纯别名后端可以把 `model_match.value` 留空。
+    /// 未命中时原样透传入站名。
+    #[serde(default)]
+    pub model_rewrite: Option<std::collections::HashMap<String, String>>,
+
+    /// 响应体 `model` 字段的回显策略，默认透传上游原名。
+    /// `inbound` 会把流式热路径从"逐 chunk 原样透传"变成"逐 chunk JSON 往返"，
+    /// 仅在确有必要时开启。
+    #[serde(default)]
+    pub model_echo: ModelEcho,
+
     /// 预解析的 extra_body，配置加载时由字符串解析为 Value 树。
     /// 运行时直接使用此缓存，避免每个请求重复 parse。
     #[serde(skip)]
     pub extra_body_cached: ExtraBodyCached,
+}
+
+/// 响应体中 `model` 字段的回显策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelEcho {
+    /// 原样透传上游返回的模型名（默认，零额外开销）。
+    #[default]
+    Upstream,
+    /// 改回客户端请求时使用的入站名。
+    Inbound,
 }
 
 impl Default for ClientConfig {
@@ -64,8 +88,47 @@ impl Default for ClientConfig {
             max_tokens: Default::default(),
             extra_body: Default::default(),
             thinking_format: Default::default(),
+            model_rewrite: Default::default(),
+            model_echo: Default::default(),
             extra_body_cached: ExtraBodyCached::default(),
         }
+    }
+}
+
+impl ClientConfig {
+    /// 入站模型名是否可路由到本后端。
+    ///
+    /// 判定为 `model_match` 命中，**或**该名字存在于 `model_rewrite` 的键中。
+    /// 后者让"配置了别名却忘记同步 `model_match.value`"不会变成静默不路由。
+    pub fn matches_model(&self, inbound: &str) -> bool {
+        let by_match = match self.model_match.match_type.as_str() {
+            "keyword" => self
+                .model_match
+                .value
+                .iter()
+                .any(|keyword| inbound.contains(keyword.as_str())),
+            "exact" => self
+                .model_match
+                .value
+                .iter()
+                .any(|value| value.as_str() == inbound),
+            _ => false,
+        };
+
+        by_match
+            || self
+                .model_rewrite
+                .as_ref()
+                .is_some_and(|rewrite| rewrite.contains_key(inbound))
+    }
+
+    /// 把入站模型名解析为本后端的上游模型名；未配置或未命中时原样返回。
+    pub fn resolve_upstream_model<'a>(&'a self, inbound: &'a str) -> &'a str {
+        self.model_rewrite
+            .as_ref()
+            .and_then(|rewrite| rewrite.get(inbound))
+            .map(String::as_str)
+            .unwrap_or(inbound)
     }
 }
 
@@ -237,6 +300,8 @@ mod tests {
             max_tokens: None,
             extra_body: None,
             thinking_format,
+            model_rewrite: None,
+            model_echo: ModelEcho::default(),
             extra_body_cached: ExtraBodyCached::default(),
         }
     }
@@ -323,5 +388,119 @@ models_cache:
             cfg.resolve_thinking_format(&client),
             ThinkingFormat::Passthrough
         );
+    }
+
+    // --- 模型名改写 (model_rewrite) ---
+
+    fn client_with_rewrite(
+        match_type: &str,
+        matched: &[&str],
+        rewrite: &[(&str, &str)],
+    ) -> ClientConfig {
+        ClientConfig {
+            model_match: ModelMatch {
+                match_type: match_type.to_string(),
+                value: matched.iter().map(|s| s.to_string()).collect(),
+            },
+            model_rewrite: Some(
+                rewrite
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            ..ClientConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_model_rewrite_defaults_to_none_and_echo_upstream() {
+        let yaml = r#"
+openai_clients:
+  - name: plain
+    base_url: "https://example.com/v1"
+    model_match:
+      type: exact
+      value: ["m"]
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("parse");
+        let client = &cfg.openai_clients[0];
+        assert!(client.model_rewrite.is_none());
+        assert_eq!(client.model_echo, ModelEcho::Upstream);
+    }
+
+    #[test]
+    fn test_model_rewrite_parsed_from_yaml() {
+        let yaml = r#"
+openai_clients:
+  - name: hapiopen
+    base_url: "https://hapiopen.cc/v1"
+    model_match:
+      type: exact
+      value: []
+    model_rewrite:
+      "deepseek-flash": "deepseek-v4.1-flash"
+    model_echo: inbound
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("parse");
+        let client = &cfg.openai_clients[0];
+        let rewrite = client.model_rewrite.as_ref().expect("rewrite present");
+        assert_eq!(
+            rewrite.get("deepseek-flash").map(String::as_str),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(client.model_echo, ModelEcho::Inbound);
+    }
+
+    #[test]
+    fn test_resolve_upstream_model_hit_miss_and_absent() {
+        let client =
+            client_with_rewrite("exact", &[], &[("deepseek-flash", "deepseek-v4.1-flash")]);
+        assert_eq!(
+            client.resolve_upstream_model("deepseek-flash"),
+            "deepseek-v4.1-flash"
+        );
+        // 未命中映射：原样返回
+        assert_eq!(
+            client.resolve_upstream_model("deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
+
+        // 完全没有配置 model_rewrite：原样返回
+        let plain = ClientConfig::default();
+        assert!(plain.model_rewrite.is_none());
+        assert_eq!(plain.resolve_upstream_model("any-model"), "any-model");
+    }
+
+    #[test]
+    fn test_matches_model_exact_and_alias_union() {
+        // model_match 为空，别名键仍应可路由
+        let alias_only =
+            client_with_rewrite("exact", &[], &[("deepseek-flash", "deepseek-v4.1-flash")]);
+        assert!(alias_only.matches_model("deepseek-flash"));
+        assert!(!alias_only.matches_model("unknown-model"));
+        // 上游真名既不在 model_match 也不在映射键中 → 不可路由
+        assert!(!alias_only.matches_model("deepseek-v4.1-flash"));
+
+        // 显式列出的真名 + 别名，两者都可路由
+        let both = client_with_rewrite(
+            "exact",
+            &["deepseek-v4.1-flash"],
+            &[("deepseek-flash", "deepseek-v4.1-flash")],
+        );
+        assert!(both.matches_model("deepseek-flash"));
+        assert!(both.matches_model("deepseek-v4.1-flash"));
+    }
+
+    #[test]
+    fn test_matches_model_keyword_and_unknown_match_type() {
+        let keyword = client_with_rewrite("keyword", &["deepseek"], &[]);
+        assert!(keyword.matches_model("deepseek-flash"));
+        assert!(keyword.matches_model("my-deepseek-v4"));
+        assert!(!keyword.matches_model("gpt-4"));
+
+        // 未知 match_type 恒为 false（与既有实现一致），但别名键仍生效
+        let unknown = client_with_rewrite("regex", &["deepseek"], &[("alias", "target")]);
+        assert!(!unknown.matches_model("deepseek-flash"));
+        assert!(unknown.matches_model("alias"));
     }
 }

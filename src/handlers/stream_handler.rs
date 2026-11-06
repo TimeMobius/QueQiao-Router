@@ -472,6 +472,23 @@ fn has_empty_choices_marker(data: &str) -> bool {
     false
 }
 
+/// 廉价预扫描：chunk 是否带 `"model"` 字段。
+///
+/// 只在 `model_echo: inbound` 时用于决定是否值得付出一次 JSON 解析。
+/// 纯子串匹配、零分配；`model` 通常只在首个 chunk 出现，因此热路径几乎无成本。
+fn has_model_field_marker(data: &str) -> bool {
+    data.contains("\"model\"")
+}
+
+/// 把 SSE chunk 里的 `model` 字段改写入站名（仅 `model_echo: inbound`）。
+fn rewrite_chunk_model(value: &mut Value, inbound_model: &str) {
+    if let Some(obj) = value.as_object_mut() {
+        if obj.contains_key("model") {
+            obj.insert("model".to_string(), json!(inbound_model));
+        }
+    }
+}
+
 /// 为 vLLM 结尾的 `"choices":[]` usage chunk 注入占位 choice，
 /// 使严格解析 `choices[0]` 的下游（如 OpenWebUI）不越界崩溃，且不丢 usage。
 /// 仅改动"存在但为空"的数组；缺失或非空时不动。返回是否注入。
@@ -761,6 +778,14 @@ pub async fn process_streaming_response(
     // Fast path: when no thinking transform and no special prefix,
     // skip the simd-json parse→transform→reserialize round-trip entirely.
     let needs_json_roundtrip = apply_thinking || !special_prefix.is_empty();
+
+    // 可选的 model 回显改写（默认关闭）。
+    // 这里**不**把它并入 needs_json_roundtrip：那会让每个 chunk 都付出
+    // simd-json 解析+重序列化成本。改为先做廉价的子串预扫描，
+    // 只有 chunk 里真的出现 `"model"` 才解析——而 model 通常只在首个
+    // chunk 出现一次，热路径几乎零额外成本。
+    let echo_inbound_model = client_config.model_echo == crate::config::types::ModelEcho::Inbound;
+    let inbound_model_name = model_for_meta.clone();
     let model_for_error = model_for_meta.clone();
     let backend_for_error = backend_for_meta.clone();
     let raw_body_tail_for_error = raw_body_tail.clone();
@@ -824,6 +849,10 @@ pub async fn process_streaming_response(
 
                         ensure_non_empty_choices(&mut value, is_chat);
 
+                        if echo_inbound_model {
+                            rewrite_chunk_model(&mut value, &inbound_model_name);
+                        }
+
                         let json_str = simd_json::to_string(&value).unwrap_or_default();
                         let _ = tx.send(json_str.clone());
                         stream::iter(vec![Ok(Event::default().data(json_str))])
@@ -836,6 +865,21 @@ pub async fn process_streaming_response(
                     let mut data_str = event.data;
                     if let Ok(mut value) = unsafe { simd_json::from_str::<Value>(&mut data_str) } {
                         ensure_non_empty_choices(&mut value, is_chat);
+                        if echo_inbound_model {
+                            rewrite_chunk_model(&mut value, &inbound_model_name);
+                        }
+                        let json_str = simd_json::to_string(&value).unwrap_or(data_str);
+                        let _ = tx.send(json_str.clone());
+                        stream::iter(vec![Ok(Event::default().data(json_str))])
+                    } else {
+                        let _ = tx.send(data_str.clone());
+                        stream::iter(vec![Ok(Event::default().data(data_str))])
+                    }
+                } else if echo_inbound_model && has_model_field_marker(&event.data) {
+                    // 仅当 chunk 真的带 "model" 时才解析（通常只在首个 chunk 出现一次）。
+                    let mut data_str = event.data;
+                    if let Ok(mut value) = unsafe { simd_json::from_str::<Value>(&mut data_str) } {
+                        rewrite_chunk_model(&mut value, &inbound_model_name);
                         let json_str = simd_json::to_string(&value).unwrap_or(data_str);
                         let _ = tx.send(json_str.clone());
                         stream::iter(vec![Ok(Event::default().data(json_str))])

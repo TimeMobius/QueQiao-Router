@@ -178,6 +178,8 @@ mod tests {
             max_tokens: None,
             extra_body: None,
             thinking_format: None,
+            model_rewrite: None,
+            model_echo: crate::config::types::ModelEcho::default(),
             extra_body_cached: Default::default(),
         }
     }

@@ -54,18 +54,12 @@ impl ClientManager {
         config: &RwLockReadGuard<'a, Config>,
         model: &str,
     ) -> Vec<ClientConfig> {
+        // 匹配语义集中在 `ClientConfig::matches_model`（model_match ∪ model_rewrite 的键），
+        // 避免与 /v1/models 的过滤逻辑各写一份而漂移。
         let matching_clients: Vec<ClientConfig> = config
             .openai_clients
             .iter()
-            .filter(|client| match client.model_match.match_type.as_str() {
-                "keyword" => client
-                    .model_match
-                    .value
-                    .iter()
-                    .any(|keyword| model.contains(keyword)),
-                "exact" => client.model_match.value.contains(&model.to_string()),
-                _ => false,
-            })
+            .filter(|client| client.matches_model(model))
             .cloned()
             .collect();
 

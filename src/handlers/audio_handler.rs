@@ -117,9 +117,20 @@ async fn handle_audio_request(
 
                 async move {
                     // 3. 为每个客户端重新构建 Form
+                    //
+                    // 音频请求的 `model` 是 multipart 的一个普通 part（不是 JSON 字段），
+                    // 必须在这里按后端配置改写，否则别名对 /v1/audio/* 不生效。
+                    let upstream_model = client_config.resolve_upstream_model(&current_model);
+                    let rewrite_model_part = upstream_model != current_model;
                     let mut form = Form::new();
                     for part in parts_clone {
-                        let mut req_part = Part::bytes(part.data);
+                        let is_model_part = part.name == "model";
+                        let data = if is_model_part && rewrite_model_part {
+                            upstream_model.as_bytes().to_vec()
+                        } else {
+                            part.data
+                        };
+                        let mut req_part = Part::bytes(data);
                         if let Some(fn_str) = part.file_name {
                             req_part = req_part.file_name(fn_str);
                         }
