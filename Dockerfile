@@ -1,5 +1,8 @@
 # Build Stage
-FROM rust:latest AS builder
+# 固定工具链版本：rustc 1.100（stable 2026-11-09）起 allocator API 变化，
+# 依赖 turso_core 0.8.3 编译失败（E0308, DynVec::new_in）。请勿改回 rust:latest，
+# 移动标签会让 CI 镜像构建随上游工具链漂移而失败。
+FROM rust:1.96-bookworm AS builder
 
 WORKDIR /usr/src/app
 COPY . .

@@ -26,7 +26,10 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          # 固定工具链：rustc 1.100（stable 2026-11-09）起 allocator API 变化，
+          # 依赖 turso_core 0.8.3 编译失败（E0308, DynVec::new_in）。
+          # 升级前先在本地（当前 1.96.0）验证 turso 依赖可编译。
+          toolchain: 1.96.0
           override: true
           components: rustfmt, clippy
 
