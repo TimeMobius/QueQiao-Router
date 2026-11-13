@@ -222,6 +222,9 @@ fn build_request_body_inner(
         RequestPayload::Rerank(p) => serde_json::to_value(p).unwrap_or(json!({})),
         RequestPayload::Score(p) => serde_json::to_value(p).unwrap_or(json!({})),
         RequestPayload::Classify(p) => serde_json::to_value(p).unwrap_or(json!({})),
+        // System One：`model` / `state` / `questions` 与未声明字段（images、assets…）
+        // 都在结构体里，序列化即完整透传；该协议没有 stream 概念。
+        RequestPayload::SystemOne(p) => serde_json::to_value(p).unwrap_or(json!({})),
         RequestPayload::Responses(p) => {
             let mut body = serde_json::to_value(p).unwrap_or(json!({}));
             if let Some(obj) = body.as_object_mut() {
@@ -424,6 +427,57 @@ mod tests {
 
         assert_eq!(body["truncate_prompt_tokens"], json!(5));
         assert_eq!(body["task"], json!("embed"));
+    }
+
+    #[test]
+    fn systemone_passthrough_keeps_state_questions_and_extra() {
+        // 网关不解析 System One 题型语义：state/questions 与未声明字段（images、assets）
+        // 都必须原样到达上游，且不能注入 stream。
+        let payload = RequestPayload::SystemOne(
+            serde_json::from_value::<crate::models::requests::SystemOneRequest>(json!({
+                "model": "typesafe/jev-1.13",
+                "state": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}, "text"],
+                "questions": {
+                    "refund": {"type": "noul", "instructions": "asking for money back?"},
+                    "team": {"type": "choice", "instructions": "which team?", "criteria": {"billing": "x"}}
+                },
+                "images": ["data:image/png;base64,AAA"],
+                "assets": {"<image-1>": {"type": "image", "format": "png", "data_base64": "AAA"}}
+            }))
+            .unwrap(),
+        );
+        let body = build_request_body_generic(&payload, &test_client(), false);
+
+        assert_eq!(body["model"], json!("typesafe/jev-1.13"));
+        assert_eq!(body["state"][1], json!("text"));
+        assert_eq!(body["questions"]["refund"]["type"], json!("noul"));
+        assert_eq!(body["questions"]["team"]["criteria"]["billing"], json!("x"));
+        assert_eq!(body["images"][0], json!("data:image/png;base64,AAA"));
+        assert!(body["assets"].get("<image-1>").is_some());
+        assert!(body.get("stream").is_none());
+    }
+
+    #[test]
+    fn systemone_model_rewrite_applies() {
+        // model_rewrite 同样覆盖 System One：入站别名 → 上游真实 id。
+        let mut config = test_client();
+        config.model_rewrite = Some(
+            [("jev".to_string(), "typesafe/jev-1.13".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let payload = RequestPayload::SystemOne(
+            serde_json::from_value::<crate::models::requests::SystemOneRequest>(json!({
+                "model": "jev",
+                "state": "text",
+                "questions": {"q": {"type": "noul"}}
+            }))
+            .unwrap(),
+        );
+        let body = build_request_body_generic(&payload, &config, false);
+
+        assert_eq!(body["model"], json!("typesafe/jev-1.13"));
+        assert_eq!(body["state"], json!("text"));
     }
 
     #[test]

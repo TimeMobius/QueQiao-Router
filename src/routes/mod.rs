@@ -56,6 +56,12 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/rerank", post(extras::handle_rerank))
         .route("/score", post(extras::handle_score))
         .route("/classify", post(extras::handle_classify))
+        // OpenAI 生态客户端习惯带 `/v1` 前缀；网关历史上只提供裸路径，
+        // 这里补一个别名，避免客户端为此改路径或加反代 rewrite。
+        .route("/v1/classify", post(extras::handle_classify))
+        // System One 分类协议（TypeSafe / OpenRouter Jev）：兼容带与不带 `/v1` 的写法。
+        .route("/v1/systemone", post(extras::handle_systemone))
+        .route("/systemone", post(extras::handle_systemone))
         .route(
             "/v1/audio/transcriptions",
             post(audio::handle_audio_transcription),

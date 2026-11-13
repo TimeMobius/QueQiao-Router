@@ -123,6 +123,16 @@ pub async fn handle_request_logic(
                 return create_validation_error("Request param input is empty", &payload);
             }
         }
+        // System One 分类协议：`state` 是待分类文本（带图时为 parts 数组），
+        // `questions` 是题型定义。两者缺失上游必然拒绝，提前拦截可给出可读错误。
+        RequestPayload::SystemOne(p) => {
+            if is_empty_value(&p.state) {
+                return create_validation_error("Request param state is empty", &payload);
+            }
+            if is_empty_value(&p.questions) {
+                return create_validation_error("Request param questions is empty", &payload);
+            }
+        }
         RequestPayload::Responses(p) => {
             if is_empty_value(&p.input) {
                 return create_validation_error("Request param input is empty", &payload);
@@ -361,6 +371,7 @@ async fn dispatch_request(
         RequestPayload::Rerank(_) => ("rerank", false),
         RequestPayload::Score(_) => ("score", false),
         RequestPayload::Classify(_) => ("classify", false),
+        RequestPayload::SystemOne(_) => ("systemone", false),
         RequestPayload::Responses(_) => ("responses", false),
         RequestPayload::AnthropicMessages(_) => ("messages", false),
     };

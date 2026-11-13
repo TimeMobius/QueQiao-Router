@@ -407,6 +407,9 @@ pub fn extract_request(payload: &RequestPayload) -> RequestExtract {
         }
         RequestPayload::Embedding(p) => value_prompt(&p.input),
         RequestPayload::Classify(p) => value_prompt(&p.input),
+        // System One：`state` 是待分类文本；带图时是 parts 数组，
+        // `value_text` 只取带 text 的 part，image_url 自然被忽略。
+        RequestPayload::SystemOne(p) => value_prompt(&p.state),
         RequestPayload::Rerank(p) => {
             let text = p.query.clone();
             RequestExtract {
@@ -564,6 +567,13 @@ pub fn extract_response(response: &Value) -> ResponseExtract {
             }
         }
         return finish_response(parts, tools, None);
+    }
+
+    // System One 分类响应：`answers` 是结构化答案（noul/choice/score），
+    // 不是文本生成；序列化后落到审计库 answer 列，看板可直接看到分类结果。
+    if let Some(answers) = response.get("answers") {
+        let answer = serde_json::to_string(answers).unwrap_or_default();
+        return finish_response(vec![answer], Vec::new(), None);
     }
 
     ResponseExtract::default()
@@ -913,5 +923,46 @@ mod tests {
         ] {
             assert_eq!(body_session_meta(&body), BodySessionMeta::default());
         }
+    }
+
+    // ---- System One 分类（Jev）审计字段 ----
+
+    fn systemone(state: serde_json::Value) -> RequestPayload {
+        RequestPayload::SystemOne(crate::models::requests::SystemOneRequest {
+            model: "typesafe/jev-1.13".to_string(),
+            state,
+            questions: serde_json::json!({"refund": {"type": "noul"}}),
+            extra: serde_json::Map::new(),
+        })
+    }
+
+    #[test]
+    fn systemone_prompt_is_state_text() {
+        let r = extract_request(&systemone(serde_json::json!("charged twice")));
+        assert_eq!(r.prompt, "charged twice");
+        assert_eq!(r.request_tail, "charged twice");
+        assert_eq!(r.prompt_bytes, "charged twice".len() as i64);
+    }
+
+    #[test]
+    fn systemone_parts_array_skips_image_url() {
+        // 带图时 state 是 parts 数组：文本 part 进 prompt，image_url 不产生文本。
+        let r = extract_request(&systemone(serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            "what is shown?"
+        ])));
+        assert_eq!(r.prompt, "what is shown?");
+    }
+
+    #[test]
+    fn systemone_response_answers_are_recorded() {
+        // 分类结果不是文本生成，但审计库 answer 列应能看到结构化答案。
+        let response = serde_json::json!({
+            "answers": {"refund": {"type": "noul", "noul": 0.98}},
+            "usage": {"input_tokens": 12, "output_tokens": 0}
+        });
+        let r = extract_response(&response);
+        assert!(r.answer.contains("\"noul\":0.98"));
+        assert_eq!(r.answer_bytes, r.answer.len() as i64);
     }
 }

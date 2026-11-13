@@ -19,6 +19,7 @@ fn request_type_label(payload: &RequestPayload) -> &'static str {
         RequestPayload::Rerank(_) => "rerank",
         RequestPayload::Score(_) => "score",
         RequestPayload::Classify(_) => "classify",
+        RequestPayload::SystemOne(_) => "systemone",
         RequestPayload::Responses(_) => "responses",
         RequestPayload::AnthropicMessages(_) => "anthropic.messages",
     }
@@ -425,7 +426,7 @@ mod tests {
     use crate::db::extract::body_session_meta;
     use crate::models::requests::{
         AnthropicMessagesRequest, ChatCompletionRequest, ClassifyRequest, CompletionRequest,
-        EmbeddingRequest, RerankRequest, ResponsesRequest, ScoreRequest,
+        EmbeddingRequest, RerankRequest, ResponsesRequest, ScoreRequest, SystemOneRequest,
     };
     use axum::http::HeaderValue;
 
@@ -503,6 +504,15 @@ mod tests {
         RequestPayload::Classify(ClassifyRequest {
             model: "classify-model".to_string(),
             input: serde_json::json!("input text"),
+            extra: serde_json::Map::new(),
+        })
+    }
+
+    fn make_systemone_payload() -> RequestPayload {
+        RequestPayload::SystemOne(SystemOneRequest {
+            model: "typesafe/jev-1.13".to_string(),
+            state: serde_json::json!("state text"),
+            questions: serde_json::json!({"refund": {"type": "noul"}}),
             extra: serde_json::Map::new(),
         })
     }
@@ -623,6 +633,11 @@ mod tests {
     #[test]
     fn test_request_type_label_classify() {
         assert_eq!(request_type_label(&make_classify_payload()), "classify");
+    }
+
+    #[test]
+    fn test_request_type_label_systemone() {
+        assert_eq!(request_type_label(&make_systemone_payload()), "systemone");
     }
 
     #[test]

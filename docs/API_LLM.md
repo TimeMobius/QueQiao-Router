@@ -21,6 +21,9 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 | `POST` | `/rerank` | Rerank 重排序（兼容 vLLM） |
 | `POST` | `/score` | 文本评分（兼容 vLLM） |
 | `POST` | `/classify` | 文本分类（兼容 vLLM） |
+| `POST` | `/v1/classify` | `/classify` 的别名（兼容习惯带 `/v1` 前缀的客户端） |
+| `POST` | `/v1/systemone` | System One 分类协议（TypeSafe / OpenRouter Jev 等分类模型） |
+| `POST` | `/systemone` | System One 分类协议（不带 `/v1` 的写法） |
 
 ## 认证与凭据优先级
 
@@ -52,7 +55,7 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 ## 透传请求体字段
 
 网关**不丢弃**客户端发来的未声明字段。`/v1/chat/completions`、`/v1/completions`、
-`/v1/embeddings`、`/v1/rerank`、`/score`、`/classify` 的请求结构体都带
+`/v1/embeddings`、`/v1/rerank`、`/score`、`/classify`、`/v1/systemone` 的请求结构体都带
 `#[serde(flatten)] extra`，未在结构体中声明的键会原样带到上游。
 
 这对 vLLM / SGLang / OpenAI 生态的扩展参数是必需的，例如：
@@ -75,6 +78,85 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 > 透传意味着上游会看到客户端发来的一切字段。若某上游对未知字段严格校验并返回 422，
 > 那是客户端与上游之间的约定，网关不做过滤；可用后端 `extra_body` 反向覆盖，
 > 或让客户端不要发送该字段。
+
+## System One 分类（Jev）
+
+网关支持 TypeSafe 的 **System One** 分类协议（OpenRouter 转售的 Jev 决策/分类模型走同一协议），
+端点 `POST /v1/systemone`（兼容裸路径 `/systemone`），上游转发到 `{base_url}/systemone`。
+
+该协议与 OpenAI Chat 完全不同：不是文本生成，而是“给一段 state 文本 + 一组带类型的
+questions，返回每个问题的结构化答案（校准概率）”。
+
+### 请求
+
+```bash
+curl http://127.0.0.1:8000/v1/systemone \
+  -H 'Authorization: Bearer sk-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "typesafe/jev-1.13",
+    "state": "I was charged twice for my subscription.",
+    "questions": {
+      "refund":     {"type": "noul",   "instructions": "Is the customer asking for money back?"},
+      "department": {"type": "choice", "instructions": "Which team should handle this?",
+                     "criteria": {"billing": "Charges and refunds", "technical": "Bugs and outages"}}
+    }
+  }'
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+| :--- | :--- | :--- |
+| `model` | 是 | 分类模型名（OpenRouter 为 `typesafe/jev-1.13`、`~typesafe/jev-latest` 等） |
+| `state` | 是 | 待分类文本；带图片时是 `[{"type":"image_url",...}, "文本"]` 的 parts 数组 |
+| `questions` | 是 | id → 题型定义：`noul`（是/否，wire 层名，网关原样透传）、`choice`、`score` |
+| `images` / `assets` | 否 | 图片输入（不同服务形态不同），未声明字段由 `#[serde(flatten)] extra` 原样透传 |
+
+网关只做路由、鉴权、透传与审计，**不解析题型语义**：除 `model` 外字段一律原样到达上游，
+`model_rewrite` 同样生效；该协议非流式，审计库 `Type` 列记为 `systemone`，
+`answer` 列记录结构化 `answers`（便于看板直接看到分类结果）。
+
+### 响应
+
+上游响应体原样透传（不做格式转换）：
+
+```json
+{
+  "model": "typesafe/jev-1.13",
+  "answers": {
+    "refund":     {"type": "noul",   "noul": 0.98},
+    "department": {"type": "choice", "choice": "billing", "confidence": 0.91}
+  },
+  "usage": {"input_tokens": 42, "output_tokens": 0}
+}
+```
+
+### 后端配置示例
+
+```yaml
+openai_clients:
+  # OpenRouter 转售的 Jev（base_url 带 /v1，网关会拼成 .../v1/systemone）
+  - name: "typesafe-jev-openrouter"
+    api_key: "sk-or-v1-..."
+    base_url: "https://openrouter.ai/api/v1"
+    model_match:
+      type: "exact"
+      value: ["typesafe/jev-1.13", "typesafe/jev-1.14", "~typesafe/jev-latest"]
+
+  # TypeSafe 原生端点（裸模型 id，可用 model_rewrite 做入站别名）
+  - name: "typesafe-jev-native"
+    api_key: "ts-..."
+    base_url: "https://api.typesafe.ai/v1"
+    model_match:
+      type: "exact"
+      value: ["typesafe/jev-1.13"]
+    model_rewrite:
+      "typesafe/jev-1.13": "jev-1.13"
+```
+
+> 客户端（如 DSH 的 `typesafe-system-one` 传输）把 baseUrl 指向网关的 `/v1` 即可：
+> 请求路径 `{baseUrl}/systemone` → 网关 `/v1/systemone`。
 
 ## 思考格式（ThinkingFormat）
 

@@ -160,6 +160,9 @@ docker run -d \
 | `POST` | `/rerank` | Rerank 重排序 (兼容 vLLM) |
 | `POST` | `/score` | 文本评分接口 (兼容 vLLM) |
 | `POST` | `/classify` | 文本分类接口 (兼容 vLLM) |
+| `POST` | `/v1/classify` | 文本分类接口 (`/classify` 别名) |
+| `POST` | `/v1/systemone` | System One 分类协议 (TypeSafe / OpenRouter Jev) |
+| `POST` | `/systemone` | System One 分类协议 (不带 `/v1` 的写法) |
 
 ---
 

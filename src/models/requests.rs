@@ -29,6 +29,8 @@ pub enum RequestPayload {
     Rerank(RerankRequest),
     Score(ScoreRequest),
     Classify(ClassifyRequest),
+    /// TypeSafe / OpenRouter System One 分类协议（Jev 等分类模型）
+    SystemOne(SystemOneRequest),
     Responses(ResponsesRequest),
     /// Anthropic Messages API 透传模式（暂不接入路由/流式处理）
     AnthropicMessages(AnthropicMessagesRequest),
@@ -43,6 +45,7 @@ impl RequestPayload {
             RequestPayload::Rerank(p) => &p.model,
             RequestPayload::Score(p) => &p.model,
             RequestPayload::Classify(p) => &p.model,
+            RequestPayload::SystemOne(p) => &p.model,
             RequestPayload::Responses(p) => &p.model,
             RequestPayload::AnthropicMessages(p) => &p.model,
         }
@@ -56,6 +59,7 @@ impl RequestPayload {
             RequestPayload::Rerank(p) => p.model = model_name,
             RequestPayload::Score(p) => p.model = model_name,
             RequestPayload::Classify(p) => p.model = model_name,
+            RequestPayload::SystemOne(p) => p.model = model_name,
             RequestPayload::Responses(p) => p.model = model_name,
             RequestPayload::AnthropicMessages(p) => p.model = model_name,
         }
@@ -80,6 +84,7 @@ impl RequestPayload {
             RequestPayload::Rerank(_) => Some("rerank"),
             RequestPayload::Score(_) => Some("score"),
             RequestPayload::Classify(_) => Some("classify"),
+            RequestPayload::SystemOne(_) => Some("systemone"),
             RequestPayload::Responses(_) => Some("responses"),
             RequestPayload::AnthropicMessages(_) => Some("messages"),
         }
@@ -127,7 +132,7 @@ impl RequestPayload {
                     None
                 }
             }
-            // Embedding, Rerank, Score, Classify 等不需要内容路由，返回 None 回退随机
+            // Embedding, Rerank, Score, Classify, SystemOne 等不需要内容路由，返回 None 回退随机
             _ => None,
         }
     }
@@ -317,6 +322,30 @@ pub struct ClassifyRequest {
     pub extra: serde_json::Map<String, Value>,
 }
 
+/// TypeSafe System One 分类协议请求（Jev 等分类模型，OpenRouter 也转售同一协议）。
+///
+/// 协议要点：
+/// - 端点：客户端 `POST /v1/systemone`（也接受裸路径 `/systemone`），上游 `{base_url}/systemone`；
+/// - body：`{"model": "...", "state": "...", "questions": {...}}`，`state` 是待分类
+///   文本，带图片时演变为 `[{"type":"image_url",...}, "文本"]` 的 parts 数组；
+///   TypeSafe 原生协议用 `assets`，部分服务用 `images`；
+/// - 响应：`{"answers": {...}, "usage": {"input_tokens": N, "output_tokens": N}}`，
+///   按题型（`noul` / `choice` / `score`）返回结构化答案，**不是**文本生成。
+///
+/// 网关只负责路由、鉴权、透传与审计，不解析题型语义：除 `model` 外全部按原样透传，
+/// 未声明的字段（`images` / `assets` / 未来的扩展）经 `extra` 保留。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemOneRequest {
+    pub model: String,
+    /// 待分类文本；带图片时为 `[{type: "image_url", ...}, "文本"]` parts 数组。
+    pub state: Value,
+    /// 题型定义：id → `{type: "noul" | "choice" | "score", instructions, criteria?}`。
+    pub questions: Value,
+    /// 未在结构体中声明的字段，原样透传给上游（`images`、`assets` 等）。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
@@ -448,5 +477,92 @@ mod tests {
             request.extra.get("max_tokens").and_then(|v| v.as_i64()),
             Some(1024)
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // RequestPayload::SystemOne tests
+    // -------------------------------------------------------------------------
+
+    fn make_systemone_payload() -> RequestPayload {
+        RequestPayload::SystemOne(SystemOneRequest {
+            model: "typesafe/jev-1.13".to_string(),
+            state: serde_json::json!("I was charged twice for my subscription."),
+            questions: serde_json::json!({
+                "refund": {"type": "noul", "instructions": "Is the customer asking for money back?"}
+            }),
+            extra: serde_json::Map::new(),
+        })
+    }
+
+    #[test]
+    fn test_systemone_get_model() {
+        assert_eq!(make_systemone_payload().get_model(), "typesafe/jev-1.13");
+    }
+
+    #[test]
+    fn test_systemone_set_model() {
+        let mut payload = make_systemone_payload();
+        payload.set_model("~typesafe/jev-latest".to_string());
+        assert_eq!(payload.get_model(), "~typesafe/jev-latest");
+    }
+
+    #[test]
+    fn test_systemone_is_not_streaming() {
+        assert!(!make_systemone_payload().is_streaming());
+    }
+
+    #[test]
+    fn test_systemone_get_endpoint() {
+        assert_eq!(make_systemone_payload().get_endpoint(), Some("systemone"));
+    }
+
+    #[test]
+    fn test_systemone_no_content_routing() {
+        assert!(make_systemone_payload().get_routing_keys().is_none());
+    }
+
+    #[test]
+    fn test_systemone_extra_flattens_additional_fields() {
+        // `images`（Clef 风格）与 `assets`（TypeSafe 原生）都不在结构体声明里，
+        // 必须经 flatten 原样保留，否则带图请求会被网关静默丢字段。
+        let json_str = r#"{
+            "model": "typesafe/jev-1.13",
+            "state": "some text",
+            "questions": {"refund": {"type": "noul"}},
+            "images": ["data:image/png;base64,AAA"],
+            "assets": {"<image-1>": {"type": "image", "format": "png", "data_base64": "AAA"}}
+        }"#;
+        let request: SystemOneRequest = serde_json::from_str(json_str).unwrap();
+
+        assert_eq!(request.model, "typesafe/jev-1.13");
+        assert_eq!(request.state, serde_json::json!("some text"));
+        assert!(request.extra.contains_key("images"));
+        assert!(request.extra.contains_key("assets"));
+
+        // 重建请求体走的是内层结构体的序列化（见 build_request_body_generic），
+        // 未声明字段必须原样回到顶层。
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            body["images"][0],
+            serde_json::json!("data:image/png;base64,AAA")
+        );
+        assert!(body["assets"].get("<image-1>").is_some());
+    }
+
+    #[test]
+    fn test_systemone_state_can_be_parts_array() {
+        // 带图片时 state 变成 parts 数组（OpenRouter: image_url parts 在文本之前）。
+        let request: SystemOneRequest = serde_json::from_str(
+            r#"{
+                "model": "typesafe/jev-1.13",
+                "state": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    "what is shown?"
+                ],
+                "questions": {"is_chart": {"type": "noul"}}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(request.state.as_array().map(|a| a.len()), Some(2));
     }
 }

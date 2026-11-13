@@ -55,6 +55,9 @@ const LLM_METRIC_ENDPOINTS: &[&str] = &[
     "/rerank",
     "/score",
     "/classify",
+    "/v1/classify",
+    "/v1/systemone",
+    "/systemone",
 ];
 
 fn should_skip_metrics(endpoint: &str) -> bool {
@@ -159,6 +162,9 @@ mod tests {
         assert!(!should_skip_metrics("/rerank"));
         assert!(!should_skip_metrics("/score"));
         assert!(!should_skip_metrics("/classify"));
+        assert!(!should_skip_metrics("/v1/classify"));
+        assert!(!should_skip_metrics("/v1/systemone"));
+        assert!(!should_skip_metrics("/systemone"));
     }
 
     #[test]

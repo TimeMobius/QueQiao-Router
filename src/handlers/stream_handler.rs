@@ -725,6 +725,7 @@ pub async fn process_streaming_response(
         RequestPayload::Rerank(_) => "rerank".to_string(),
         RequestPayload::Score(_) => "score".to_string(),
         RequestPayload::Classify(_) => "classify".to_string(),
+        RequestPayload::SystemOne(c) => c.model.clone(),
         RequestPayload::Responses(c) => c.model.clone(),
         RequestPayload::AnthropicMessages(c) => c.model.clone(),
     };

@@ -354,6 +354,7 @@ fn parse_legacy_request(type_label: Option<&str>, body: &str) -> Option<RequestP
         Some("rerank") => m::RequestPayload::Rerank(serde_json::from_str(body).ok()?),
         Some("score") => m::RequestPayload::Score(serde_json::from_str(body).ok()?),
         Some("classify") => m::RequestPayload::Classify(serde_json::from_str(body).ok()?),
+        Some("systemone") => m::RequestPayload::SystemOne(serde_json::from_str(body).ok()?),
         Some("responses") => m::RequestPayload::Responses(serde_json::from_str(body).ok()?),
         Some("anthropic.messages") | Some("messages") => {
             m::RequestPayload::AnthropicMessages(serde_json::from_str(body).ok()?)
