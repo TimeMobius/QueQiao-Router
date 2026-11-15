@@ -310,7 +310,8 @@ HTTP 413 和 OpenAI 兼容的结构化错误体，`error.type` 为 `request_too_
 ## 🛠️ 本地编译与开发
 
 ### 环境要求
-- Rust 1.89+（自动迁移使用标准库文件锁；当前验证版本为 1.91.1）
+- **Rust 1.96.0**（与 CI、Dockerfile 固定版本一致；自动迁移使用标准库文件锁，最低要求 1.89）
+  - **不要使用 rustc 1.100+**：`turso_core 0.8.3` 的 allocator API 与之不兼容，编译会报 `E0308`（`DynVec::new_in`）。升级工具链前请先在本地验证 `cargo build`。
 - C 编译器 (gcc/clang)
 
 ### 编译 Release 版本
@@ -325,24 +326,30 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ### 本地检查与测试
 
+提交前至少通过以下三项（CI 也执行这三条）：
+
 ```bash
 # 格式检查
 cargo fmt --all -- --check
 
-# Clippy 静态检查
-cargo clippy --all-targets --all-features -- -D warnings
+# Clippy 静态检查（如需覆盖测试代码，可加 --all-targets）
+cargo clippy
 
-# 运行单元测试
+# 运行单元测试（全量约 30 秒）
 cargo test
 ```
 
+> - **不要加 `--all-features`**：`check-api-auth` feature 通过 `include!` 引用仓库外的
+>   `../Check_API/auth-lib`，独立克隆会编译失败。
+> - CI 的 clippy 目前不阻塞构建（未使用 `-D warnings`）；新增代码请至少不要增加告警。
+
 ### CI 与发布
 
-推送到 `main` 或创建针对 `main` 的 Pull Request 时，CI 会依次执行格式检查、Clippy 和 Rust 单元测试。推送到 `main` 且检查通过后，CI 还会构建并发布 `linux/amd64` 与 `linux/arm64` Docker 镜像到 GitHub Container Registry，并生成 `b<提交数>` 和 `latest` 标签。
+推送到 `main` 或创建针对 `main` 的 Pull Request 时，CI（固定 Rust 1.96.0）会依次执行 `cargo fmt --all -- --check`、`cargo clippy` 和 `cargo test --verbose`。推送到 `main` 且检查通过后，CI 还会构建并发布 `linux/amd64` 与 `linux/arm64` Docker 镜像到 GitHub Container Registry，并生成 `b<提交数>` 和 `latest` 标签。
 
 另一个发布工作流会根据提交数量创建 GitHub Release，并自动将 README 中的 Docker 镜像标签更新为
-`b<提交数>`、将 `Cargo.toml`/`Cargo.lock` 中的版本更新为 `0.2.<提交数>`。因此，这些版本信息
-可能会由 CI 自动更新。
+`b<提交数>`、将 `Cargo.toml` 中的版本更新为 `0.2.<提交数>`（`Cargo.lock` 未纳入版本控制，构建时由
+Cargo 自动重建）。因此，这些版本信息可能会由 CI 自动更新。
 
 ---
 
@@ -366,6 +373,19 @@ cargo test
 - **日志保留**: info/system 日志默认保留 10 天，error 日志默认保留 30 天。
 - **数据库**: Turso 数据库文件路径由 `RECD_PATH` 控制（见环境变量）。完整审计数据（IP、请求体、响应体、Token 统计）异步写入数据库，支持按月自动轮转。
 - **Token 脱敏**: 正常日志中 Token 仅显示前 8 字符；设置 `LOG_FULL_TOKEN_ON_ERROR=true` 后错误日志记录完整 Token 以便排查。
+
+---
+
+## 🔍 调试与排查
+
+- **先看日志**：`logs/error*.log` 记录 4xx/5xx 请求体；`logs/system*.log` 是运行日志，级别由 `RUST_LOG` 控制（如 `RUST_LOG=debug`）。
+- **看面板**：`/dashboard` 提供记录、分析与会话时间线；`/dashboard/api/error-log` 可直接取错误日志尾部。面板接口均为只读，可安全频繁轮询。
+- **看指标**：`/metrics` 提供请求数、活跃请求、成功率与延迟直方图；`least_connections` 策略读取的也是这里的活跃数。
+- **请求级细节**：`RUST_LOG=debug` 时，流式解析出错会额外打印上游响应尾部（最多 16 KiB），用于定位非标准 SSE。
+- **写入链路**：`ENABLE_TEST_API=1` 启用 `/internal/test/records|reset|stats`，可验证审计队列的入队、批量落库与队列深度。
+- **数据库诊断**：迁移与校验见 [docs/DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md)；分析结果与全量扫描对不上时，用 `ANALYSIS_ROLLUP=off` 关闭预聚合做对照。
+
+完整的"症状 → 工具 → 判断"流程见 [DEVELOPER.md](DEVELOPER.md#5-调试与排查)。
 
 ---
 
