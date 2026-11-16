@@ -21,6 +21,18 @@ use super::params::{
 use super::shards::{collect_shards, fetch_sliced, skipped_archive_warning};
 use super::sql::errors_db_sql;
 
+/// 错误排行最多回看 24 小时：审计行含完整请求/响应体，长时间跨度的
+/// `GROUP BY Error` 会退化为全量扫描（实测 7 天 >3 分钟）。
+const ERRORS_MAX_WINDOW_MS: i64 = 86_400_000;
+
+fn clamp_error_window(from: i64, to: i64) -> (i64, i64, bool) {
+    if to.saturating_sub(from) > ERRORS_MAX_WINDOW_MS {
+        (to.saturating_sub(ERRORS_MAX_WINDOW_MS), to, true)
+    } else {
+        (from, to, false)
+    }
+}
+
 pub async fn analysis_errors(
     State(app_state): State<Arc<AppState>>,
     Query(params): Query<AnalysisParams>,
@@ -49,6 +61,13 @@ async fn build_errors_db(
 ) -> Result<Value, (StatusCode, String)> {
     let (from, to) = resolve_range(p);
     let mut warnings: Vec<String> = Vec::new();
+    let (from, to, clamped) = clamp_error_window(from, to);
+    if clamped {
+        warnings.push(format!(
+            "error ranking is limited to the last {} hours",
+            ERRORS_MAX_WINDOW_MS / 3_600_000
+        ));
+    }
     let shards = collect_shards(app_state, from, to).await;
     if shards.len() > 1 {
         warnings.push("counts are summed across shards".to_string());
@@ -121,10 +140,11 @@ async fn build_errors_db(
 
 async fn build_errors_log(p: &AnalysisParams) -> Result<Value, (StatusCode, String)> {
     let limit = p.limit.unwrap_or(20).clamp(1, ERRORS_LIMIT_MAX) as usize;
-    let from = p.from;
-    let to = p.to;
-    let dir = std::path::PathBuf::from(crate::logging::DEFAULT_LOG_DIR);
     let (rf, rt) = resolve_range(p);
+    let (rf, rt, _) = clamp_error_window(rf, rt);
+    let from = Some(rf);
+    let to = Some(rt);
+    let dir = std::path::PathBuf::from(crate::logging::DEFAULT_LOG_DIR);
     let (interval, _) = effective_interval(p.interval.as_deref(), rf, rt);
 
     let scan_filters = to_list_params(p, rf, rt);
@@ -157,4 +177,22 @@ async fn build_errors_log(p: &AnalysisParams) -> Result<Value, (StatusCode, Stri
         "unparsed": scan.unparsed,
         "total": scan.total,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_window_is_clamped_to_24_hours() {
+        let now = 1_000_000_000_000i64;
+        let (from, to, clamped) = clamp_error_window(now - 7 * 86_400_000, now);
+        assert!(clamped);
+        assert_eq!(to, now);
+        assert_eq!(from, now - ERRORS_MAX_WINDOW_MS);
+
+        let (from, to, clamped) = clamp_error_window(now - 3_600_000, now);
+        assert!(!clamped);
+        assert_eq!((from, to), (now - 3_600_000, now));
+    }
 }
