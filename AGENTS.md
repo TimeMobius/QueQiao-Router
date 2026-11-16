@@ -47,7 +47,8 @@ QueQiao-Router 是 Rust 实现的高性能大模型智能路由网关。
 ```bash
 cd /mnt/data/Codes/GPT_API_gemini/QueQiao-Router && cargo build
 ```
-
+提交采用约定式提交（`fix(scope): ...` 等）；推送到 `main` 后由 GitHub CI + Release 工作流自动打 tag（`b<提交数>`）并升版本，**不要手改版本号**。
+需要交付带鉴权插件的镜像时，拉取最新版本号后在外部执行 `cd /mnt/data/Codes/GPT_API_gemini && bash build_multiarch.sh -o ./dist`（产物 `../dist/queqiao-router-<ver>-{amd64,arm64}.tar.gz`）。
 ---
 
 ## 外部测试套件（可选工具）
