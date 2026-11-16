@@ -1,8 +1,10 @@
 //! 归档汇总快路径：无筛选的分析请求直接读派生汇总库，避免重复全表扫描。
 //!
-//! 只有同时满足以下条件才启用：无任何筛选参数、`interval` 不是 hour、
+//! 只有同时满足以下条件才启用：无任何筛选参数、`interval` 不是 minute/hour、
 //! `dimension` 不是 hour、区间内每个归档都有指纹有效的汇总。
-//! 任一条不满足即返回 `None`，调用方走原有扫描路径，语义完全一致。
+//! active 分片额外使用“天桶读到增量水位 + 水位之后按 id 回扫原始库”，
+//! 避免每次查询都回扫当天全量数据。任一条不满足即返回 `None`，
+//! 调用方走原有扫描路径，语义完全一致。
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,9 +14,11 @@ use crate::db::engine::DbError;
 use super::aggregation::{
     col_i64, col_text, merge_summaries, metrics_from_row, summary_from_row, Metrics, SummaryAgg,
 };
+#[cfg(test)]
 use super::optimized::fetch_optimized;
+use super::optimized::fetch_optimized_after;
 use super::params::{AnalysisParams, DISTINCT_CAP, GROUP_CAP, LATENCY_COL, TTFT_COL};
-use super::shards::{fetch_sliced, ShardInput};
+use super::shards::{fetch_sliced_after, ShardInput};
 use super::sql::{dims_sql, distinct_sql, latency_hist_sql, summary_sql, trend_sql};
 
 #[derive(Default)]
@@ -62,7 +66,12 @@ pub(super) async fn analyse(
     dim: &str,
     dim_expr: &str,
 ) -> Result<Option<Data>, DbError> {
-    if !enabled() || !supports(params) || interval == "hour" || dim == "hour" {
+    if !enabled()
+        || !supports(params)
+        || interval == "minute"
+        || interval == "hour"
+        || dim == "hour"
+    {
         return Ok(None);
     }
     let audit_path = crate::db::resolve_db_path();
@@ -72,65 +81,23 @@ pub(super) async fn analyse(
 
     for shard in shards {
         if shard.is_active {
-            if let Some((first_full, full_end)) = full_day_bounds(from, to) {
-                if full_end > first_full
-                    && aggregate::active_caught_up(
-                        &audit_path,
-                        &shard.id,
-                        &shard.store,
-                        full_end - 1,
-                    )
-                    .await
-                {
-                    if let Some(slice) =
-                        aggregate::read_active_slice(&audit_path, &shard.id, first_full, full_end)
-                            .await
-                    {
-                        let mut per_shard = slice_to_scan(&slice, interval, dim);
-                        models.extend(
-                            slice
-                                .distinct
-                                .get("model")
-                                .into_iter()
-                                .flatten()
-                                .filter(|value| !value.is_empty())
-                                .cloned(),
-                        );
-                        ips.extend(
-                            slice
-                                .distinct
-                                .get("ip")
-                                .into_iter()
-                                .flatten()
-                                .filter(|value| !value.is_empty())
-                                .cloned(),
-                        );
-                        for (correction_from, correction_to) in
-                            correction_windows(from, to, first_full, full_end)
-                        {
-                            let scan = scan_shard(
-                                shard,
-                                params,
-                                correction_from,
-                                correction_to,
-                                interval,
-                                dim_expr,
-                            )
-                            .await?;
-                            models.extend(
-                                distinct_values(shard, correction_from, correction_to, "Model")
-                                    .await?,
-                            );
-                            ips.extend(
-                                distinct_values(shard, correction_from, correction_to, "IP")
-                                    .await?,
-                            );
-                            merge_scan(&mut per_shard, scan);
-                        }
-                        push_scan(&mut data, per_shard);
-                        continue;
-                    }
-                }
+            spawn_active_build_if_stale(audit_path.clone(), shard);
+            if let Some(rolled) = active_rollup_scan(
+                &audit_path,
+                shard,
+                params,
+                from,
+                to,
+                interval,
+                dim,
+                dim_expr,
+            )
+            .await?
+            {
+                models.extend(rolled.models);
+                ips.extend(rolled.ips);
+                push_scan(&mut data, rolled.scan);
+                continue;
             }
             spawn_active_build(audit_path.clone(), shard);
             let scan = scan_shard(shard, params, from, to, interval, dim_expr).await?;
@@ -218,6 +185,104 @@ pub(super) async fn analyse(
     Ok(Some(data))
 }
 
+struct ActiveRollup {
+    scan: ShardScan,
+    models: HashSet<String>,
+    ips: HashSet<String>,
+}
+
+/// active 分片的汇总快路径：完整自然日读天桶，末尾部分日读到增量水位，
+/// 水位之后的记录按 `id` 从原始库补齐，避免每次查询都重扫当天全量。
+///
+/// 返回 `None` 表示当前不可用（无完整自然日、汇总未追平、或只能回退扫描）。
+async fn active_rollup_scan(
+    audit_path: &std::path::Path,
+    shard: &ShardInput,
+    params: &AnalysisParams,
+    from: i64,
+    to: i64,
+    interval: &str,
+    dim: &str,
+    dim_expr: &str,
+) -> Result<Option<ActiveRollup>, DbError> {
+    let Some((first_full, full_end)) = full_day_bounds(from, to) else {
+        return Ok(None);
+    };
+    if full_end <= first_full
+        || !aggregate::active_caught_up(audit_path, &shard.id, &shard.store, full_end - 1).await
+    {
+        return Ok(None);
+    }
+    // 末尾的部分自然日（通常是“今天”）优先用增量水位截断。
+    let detail_end = aggregate::local_day_ms(to)
+        .and_then(aggregate::next_local_day)
+        .unwrap_or(full_end);
+    let tail_from_id = aggregate::active_watermark(audit_path, &shard.id)
+        .await
+        .filter(|watermark| to >= watermark.max_time_ms)
+        .map(|watermark| watermark.last_id);
+    let slice_end = if tail_from_id.is_some() {
+        detail_end
+    } else {
+        full_end
+    };
+    let Some(slice) =
+        aggregate::read_active_slice(audit_path, &shard.id, first_full, slice_end).await
+    else {
+        return Ok(None);
+    };
+
+    let mut scan = slice_to_scan(&slice, interval, dim);
+    let mut models: HashSet<String> = slice
+        .distinct
+        .get("model")
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect();
+    let mut ips: HashSet<String> = slice
+        .distinct
+        .get("ip")
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect();
+
+    // 首个不完整自然日仍按时间窗口回扫。
+    if from < first_full {
+        let edge = scan_shard(shard, params, from, first_full - 1, interval, dim_expr).await?;
+        models.extend(distinct_values(shard, from, first_full - 1, "Model").await?);
+        ips.extend(distinct_values(shard, from, first_full - 1, "IP").await?);
+        merge_scan(&mut scan, edge);
+    }
+    if full_end <= to {
+        let edge = scan_shard_after(
+            shard,
+            params,
+            full_end,
+            to,
+            tail_from_id,
+            interval,
+            dim_expr,
+        )
+        .await?;
+        models.extend(distinct_values_after(shard, full_end, to, "Model", tail_from_id).await?);
+        ips.extend(distinct_values_after(shard, full_end, to, "IP", tail_from_id).await?);
+        merge_scan(&mut scan, edge);
+    }
+
+    // 汇总里的去重计数需要覆盖“天桶 + 尾段”的并集，否则单分片查询会低估。
+    scan.summary.models = models.len() as i64;
+    scan.summary.ips = ips.len() as i64;
+
+    Ok(Some(ActiveRollup { scan, models, ips }))
+}
+
+/// active 汇总距上次增量构建超过该阈值即后台补齐，避免水位长期滞后。
+const ACTIVE_ROLLUP_MAX_AGE_MS: i64 = aggregate::ACTIVE_ROLLUP_MAX_AGE_MS;
+
 fn spawn_active_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
     if !aggregate::claim_build_spawn(30_000) {
         return;
@@ -227,6 +292,23 @@ fn spawn_active_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
     tokio::spawn(async move {
         if let Err(error) = aggregate::ensure_active(&audit_path, &shard_id, &store).await {
             tracing::warn!(%error, "active rollup unavailable; analysis uses scan path");
+        }
+    });
+}
+
+/// 水位超过 1 小时才触发一次后台补齐；查询本身不等待构建完成。
+fn spawn_active_build_if_stale(audit_path: std::path::PathBuf, shard: &ShardInput) {
+    if !aggregate::claim_build_spawn(30_000) {
+        return;
+    }
+    let shard_id = shard.id.clone();
+    let store = shard.store.clone();
+    tokio::spawn(async move {
+        if !aggregate::active_rollup_stale(&audit_path, &shard_id, ACTIVE_ROLLUP_MAX_AGE_MS).await {
+            return;
+        }
+        if let Err(error) = aggregate::ensure_active(&audit_path, &shard_id, &store).await {
+            tracing::warn!(%error, "active rollup stale refresh failed; analysis keeps scan path");
         }
     });
 }
@@ -292,14 +374,27 @@ async fn scan_shard(
     interval: &str,
     dim_expr: &str,
 ) -> Result<ShardScan, DbError> {
+    scan_shard_after(shard, params, from, to, None, interval, dim_expr).await
+}
+
+async fn scan_shard_after(
+    shard: &ShardInput,
+    params: &AnalysisParams,
+    from: i64,
+    to: i64,
+    after_id: Option<i64>,
+    interval: &str,
+    dim_expr: &str,
+) -> Result<ShardScan, DbError> {
     let single = std::slice::from_ref(shard);
-    let summary_rows = fetch_optimized(single, params, from, to, summary_sql).await?;
+    let summary_rows =
+        fetch_optimized_after(single, params, from, to, after_id, summary_sql).await?;
     let summaries: Vec<SummaryAgg> = summary_rows
         .iter()
         .flat_map(|rows| rows.iter().map(summary_from_row))
         .collect();
 
-    let trend_rows = fetch_sliced(single, params, from, to, |where_sql| {
+    let trend_rows = fetch_sliced_after(single, params, from, to, after_id, |where_sql| {
         trend_sql(interval, where_sql)
     })
     .await?;
@@ -312,7 +407,7 @@ async fn scan_shard(
             .add(metrics_from_row(row));
     }
 
-    let dim_rows = fetch_sliced(single, params, from, to, |where_sql| {
+    let dim_rows = fetch_sliced_after(single, params, from, to, after_id, |where_sql| {
         dims_sql(where_sql, dim_expr, GROUP_CAP + 1)
     })
     .await?;
@@ -323,7 +418,7 @@ async fn scan_shard(
     }
 
     let mut latency_hist = HashMap::new();
-    for row in fetch_optimized(single, params, from, to, |where_sql| {
+    for row in fetch_optimized_after(single, params, from, to, after_id, |where_sql| {
         latency_hist_sql(where_sql, LATENCY_COL)
     })
     .await?
@@ -333,7 +428,7 @@ async fn scan_shard(
         *latency_hist.entry(col_i64(row, "bucket")).or_insert(0) += col_i64(row, "c");
     }
     let mut ttft_hist = HashMap::new();
-    for row in fetch_optimized(single, params, from, to, |where_sql| {
+    for row in fetch_optimized_after(single, params, from, to, after_id, |where_sql| {
         latency_hist_sql(where_sql, TTFT_COL)
     })
     .await?
@@ -358,10 +453,25 @@ async fn distinct_values(
     to: i64,
     column: &str,
 ) -> Result<HashSet<String>, DbError> {
+    distinct_values_after(shard, from, to, column, None).await
+}
+
+async fn distinct_values_after(
+    shard: &ShardInput,
+    from: i64,
+    to: i64,
+    column: &str,
+    after_id: Option<i64>,
+) -> Result<HashSet<String>, DbError> {
     let single = std::slice::from_ref(shard);
-    let rows = fetch_optimized(single, &AnalysisParams::default(), from, to, |where_sql| {
-        distinct_sql(where_sql, column)
-    })
+    let rows = fetch_optimized_after(
+        single,
+        &AnalysisParams::default(),
+        from,
+        to,
+        after_id,
+        |where_sql| distinct_sql(where_sql, column),
+    )
     .await?;
     let mut values = HashSet::new();
     for row in rows.iter().flatten() {
@@ -905,5 +1015,113 @@ mod tests {
         assert_eq!(rolled.latency_hist, scanned.latency_hist);
         assert_eq!(rolled.ttft_hist, scanned.ttft_hist);
         std::fs::remove_dir_all(&fixture.dir).unwrap();
+    }
+
+    /// 末尾部分自然日：天桶只读到增量水位，水位之后的记录（含迟到行）按 id 回扫。
+    #[tokio::test]
+    async fn active_partial_day_reads_rollup_to_watermark_then_scans_tail() {
+        let dir = temp_dir("active-tail");
+        let audit_path = dir.join("record.db");
+        let store = AuditStore::open(&audit_path, false, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let day0 = aggregate::local_day_ms(now - 3 * 86_400_000).unwrap();
+        let day1 = aggregate::next_local_day(day0).unwrap();
+        let day2 = aggregate::next_local_day(day1).unwrap();
+        // day2 是“昨天”，把查询上界固定为昨天 23:00，避免依赖当前时刻。
+        let to = day2 + 23 * 3_600_000;
+        assert!(to < now);
+
+        let insert = |model: &str, ip: &str, time_ms: i64| {
+            let store = store.clone();
+            let model = model.to_string();
+            let ip = ip.to_string();
+            async move {
+                store
+                    .execute(
+                        "INSERT INTO records (Time, TimeMs, Model, IP, Status, PromptTokens, \
+                         CompletionTokens, TotalTokens, LatencyMs, TtftMs) \
+                         VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        vec![
+                            Value::Text("2026-11-16 00:00:00.000000".to_string()),
+                            Value::Integer(time_ms),
+                            Value::Text(model),
+                            Value::Text(ip),
+                            Value::Integer(200),
+                            Value::Integer(10),
+                            Value::Integer(20),
+                            Value::Integer(30),
+                            Value::Real(100.0),
+                            Value::Real(10.0),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // 水位之前的数据：两天 + 昨天 20:00 之前。
+        insert("m0", "10.0.0.1", day0 + 2 * 3_600_000).await;
+        insert("m0", "10.0.0.2", day1 + 3_600_000).await;
+        insert("m1", "10.0.0.3", day2 + 20 * 3_600_000 - 1).await;
+        aggregate::ensure_active(&audit_path, "active", &store)
+            .await
+            .unwrap();
+        let watermark = aggregate::active_watermark(&audit_path, "active")
+            .await
+            .unwrap();
+        assert!(to >= watermark.max_time_ms);
+
+        // 构建之后写入：一条迟到行（TimeMs 早于水位）+ 两条正常尾段。
+        insert("m-late", "10.0.0.4", day2 + 19 * 3_600_000).await;
+        insert("m1", "10.0.0.5", day2 + 21 * 3_600_000).await;
+        insert("m2", "10.0.0.6", day2 + 22 * 3_600_000).await;
+
+        let shard = ShardInput {
+            id: "active".to_string(),
+            store: store.clone(),
+            path: None,
+            min_ms: None,
+            max_ms: None,
+            is_active: true,
+            active_month: None,
+        };
+        let params = AnalysisParams::default();
+        let dim_expr = super::super::params::dimension_expr("model").unwrap();
+        let rolled = active_rollup_scan(
+            &audit_path,
+            &shard,
+            &params,
+            day0,
+            to,
+            "day",
+            "model",
+            dim_expr,
+        )
+        .await
+        .unwrap()
+        .expect("active rollup fast path should apply");
+        let scanned = scan_shard(&shard, &params, day0, to, "day", dim_expr)
+            .await
+            .unwrap();
+
+        assert_metrics(
+            "summary",
+            &rolled.scan.summary.metrics,
+            &scanned.summary.metrics,
+        );
+        assert_eq!(rolled.scan.summary.models, scanned.summary.models);
+        assert_eq!(rolled.scan.summary.ips, scanned.summary.ips);
+        assert_group_eq("trend", &rolled.scan.trend, &scanned.trend);
+        assert_group_eq("dims", &rolled.scan.dims, &scanned.dims);
+        assert_eq!(rolled.scan.latency_hist, scanned.latency_hist);
+        assert_eq!(rolled.scan.ttft_hist, scanned.ttft_hist);
+        // 迟到行不在天桶里，只能通过 id 尾扫补回。
+        assert!(rolled.models.contains("m-late"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

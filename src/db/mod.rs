@@ -67,7 +67,6 @@ pub async fn init_db() -> Result<std::sync::Arc<store::AuditStore>, engine::DbEr
     Ok(db)
 }
 
-/// 解析 `RECD_PATH` 得到数据库文件路径（去掉 `sqlite:` 前缀）。
 /// 启动时预热 active 分片的派生汇总；失败只记录日志。
 pub async fn warm_active_rollup(store: &std::sync::Arc<store::AuditStore>) {
     if let Err(error) =
@@ -77,6 +76,12 @@ pub async fn warm_active_rollup(store: &std::sync::Arc<store::AuditStore>) {
     }
 }
 
+/// 分析派生汇总是否启用（`ANALYSIS_ROLLUP=off` 时关闭）。
+pub fn rollup_enabled() -> bool {
+    aggregate::enabled()
+}
+
+/// 解析 `RECD_PATH` 得到数据库文件路径（去掉 `sqlite:` 前缀）。
 pub(crate) fn resolve_db_path() -> std::path::PathBuf {
     let url = std::env::var("RECD_PATH").unwrap_or_else(|_| "sqlite:./record.db".to_string());
     std::path::PathBuf::from(url.strip_prefix("sqlite:").unwrap_or(&url))

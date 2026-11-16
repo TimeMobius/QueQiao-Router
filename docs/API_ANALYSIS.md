@@ -58,7 +58,7 @@
 
 | 参数 | 取值 | 默认 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `interval` | `hour` \| `day` \| `month` | 自动 | 自动规则：跨度 ≤48h 用 `hour`，≤92d 用 `day`，否则 `month` |
+| `interval` | `minute` \| `hour` \| `day` \| `month` | 自动 | 自动规则：跨度 ≤1h 用 `minute`，≤48h 用 `hour`，≤92d 用 `day`，否则 `month` |
 | `dimension` | `model` \| `apikey` \| `ip` \| `type` \| `status` \| `backend` \| `client` \| `hour` | `model` | 分组维度；非法值回退 `model` |
 | `orderBy` | `requests` \| `errors` \| `tokens` | `requests` | 维度排序指标 |
 | `page` | i64 | `1` | 最小 1 |
@@ -66,7 +66,7 @@
 | `topLimit` | i64 | `8` | clamp 到 `1..=50` |
 
 `hour` 维度的分组标签为**一天内的小时**（`00:00`..`23:00`，本地时区），与参考 UI 一致；
-`interval` 的 `hour` 则是趋势的时间桶（含日期）。
+`interval` 的 `minute`/`hour` 则是趋势的时间桶（含日期，分别到分钟/小时）。
 
 ### 响应
 

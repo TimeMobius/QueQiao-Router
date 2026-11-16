@@ -7,6 +7,7 @@ use crate::handlers::records_api;
 
 use super::aggregation::Metrics;
 
+pub(super) const MINUTE_MS: i64 = 60_000;
 pub(super) const HOUR_MS: i64 = 3_600_000;
 pub(super) const DAY_MS: i64 = 86_400_000;
 pub(super) const MONTH_MS: i64 = 2_592_000_000;
@@ -88,7 +89,9 @@ pub(super) fn to_list_params(p: &AnalysisParams, from: i64, to: i64) -> records_
 }
 
 fn auto_interval(span: i64) -> String {
-    if span <= 48 * HOUR_MS {
+    if span <= HOUR_MS {
+        "minute".to_string()
+    } else if span <= 48 * HOUR_MS {
         "hour".to_string()
     } else if span <= 92 * DAY_MS {
         "day".to_string()
@@ -99,6 +102,7 @@ fn auto_interval(span: i64) -> String {
 
 fn bucket_count(interval: &str, span: i64) -> i64 {
     let unit = match interval {
+        "minute" => MINUTE_MS,
         "hour" => HOUR_MS,
         "day" => DAY_MS,
         _ => MONTH_MS,
@@ -114,6 +118,7 @@ pub(super) fn effective_interval(
 ) -> (String, Option<String>) {
     let span = to.saturating_sub(from).max(0);
     let mut interval = match requested {
+        Some("minute") => "minute",
         Some("hour") => "hour",
         Some("day") => "day",
         Some("month") => "month",
@@ -124,7 +129,9 @@ pub(super) fn effective_interval(
     let initial = interval.clone();
     let mut warning = None;
     while interval != "month" && bucket_count(&interval, span) > MAX_BUCKETS {
-        interval = if interval == "hour" {
+        interval = if interval == "minute" {
+            "hour".to_string()
+        } else if interval == "hour" {
             "day".to_string()
         } else {
             "month".to_string()
@@ -153,6 +160,7 @@ pub(super) fn dimension_expr(dim: &str) -> Option<&'static str> {
 
 pub(super) fn bucket_expr(interval: &str) -> &'static str {
     match interval {
+        "minute" => "strftime('%Y-%m-%d %H:%M', TimeMs/1000, 'unixepoch', 'localtime')",
         "hour" => "strftime('%Y-%m-%d %H', TimeMs/1000, 'unixepoch', 'localtime')",
         "month" => "strftime('%Y-%m', TimeMs/1000, 'unixepoch', 'localtime')",
         _ => "strftime('%Y-%m-%d', TimeMs/1000, 'unixepoch', 'localtime')",
@@ -194,13 +202,16 @@ mod tests {
 
     #[test]
     fn interval_auto_by_span_and_explicit_override() {
-        assert_eq!(effective_interval(None, 0, HOUR_MS).0, "hour");
+        assert_eq!(effective_interval(None, 0, 10 * MINUTE_MS).0, "minute");
+        assert_eq!(effective_interval(None, 0, HOUR_MS).0, "minute");
+        assert_eq!(effective_interval(None, 0, 2 * HOUR_MS).0, "hour");
         assert_eq!(effective_interval(None, 0, 10 * DAY_MS).0, "day");
         assert_eq!(effective_interval(None, 0, 200 * DAY_MS).0, "month");
         assert_eq!(effective_interval(Some("day"), 0, HOUR_MS).0, "day");
         assert_eq!(effective_interval(Some("month"), 0, HOUR_MS).0, "month");
+        assert_eq!(effective_interval(Some("minute"), 0, HOUR_MS).0, "minute");
         // 非法值回退为自动选择。
-        assert_eq!(effective_interval(Some("week"), 0, HOUR_MS).0, "hour");
+        assert_eq!(effective_interval(Some("week"), 0, HOUR_MS).0, "minute");
     }
 
     #[test]
@@ -211,6 +222,11 @@ mod tests {
         assert!(warning.is_some());
         // 60 天按天约 61 桶，未超限，不再继续粗化。
         assert!(bucket_count("day", span) <= MAX_BUCKETS);
+
+        // 分钟粒度超过桶数上限时按 minute -> hour -> day 逐步粗化。
+        let (interval, warning) = effective_interval(Some("minute"), 0, 30 * DAY_MS);
+        assert_eq!(interval, "day");
+        assert!(warning.is_some());
     }
 
     #[test]
@@ -253,6 +269,7 @@ mod tests {
 
     #[test]
     fn bucket_label_expr_matches_interval_granularity() {
+        assert!(bucket_expr("minute").contains("%Y-%m-%d %H:%M"));
         assert!(bucket_expr("hour").contains("%Y-%m-%d %H"));
         assert!(bucket_expr("day").contains("%Y-%m-%d'"));
         assert!(bucket_expr("month").contains("%Y-%m"));

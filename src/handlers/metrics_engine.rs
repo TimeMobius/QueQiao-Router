@@ -245,18 +245,36 @@ async fn rollup_groups(
     to: i64,
     metrics: &[MetricName],
 ) -> Result<Option<metrics_cache::GroupRows>, DbError> {
+    if shard.is_active {
+        spawn_active_build_if_stale(audit_path.to_path_buf(), shard);
+    }
     let Some((first_full, full_end)) = aggregate::full_day_bounds(from, to) else {
         return Ok(None);
     };
     if full_end <= first_full {
         return Ok(None);
     }
+    let mut tail_from_id = None;
     let slice = if shard.is_active {
         if !aggregate::active_caught_up(audit_path, &shard.id, &shard.store, full_end - 1).await {
             spawn_active_build(audit_path.to_path_buf(), shard);
             return Ok(None);
         }
-        aggregate::read_active_slice(audit_path, &shard.id, first_full, full_end).await
+        // 末尾部分自然日（通常是“今天”）用增量水位截断：天桶读到水位，
+        // 水位之后按 id 回扫原始库，避免每次查询都重扫当天全量。
+        let detail_end = aggregate::local_day_ms(to)
+            .and_then(aggregate::next_local_day)
+            .unwrap_or(full_end);
+        tail_from_id = aggregate::active_watermark(audit_path, &shard.id)
+            .await
+            .filter(|watermark| to >= watermark.max_time_ms)
+            .map(|watermark| watermark.last_id);
+        let slice_end = if tail_from_id.is_some() {
+            detail_end
+        } else {
+            full_end
+        };
+        aggregate::read_active_slice(audit_path, &shard.id, first_full, slice_end).await
     } else {
         let Some(path) = shard.path.clone() else {
             return Ok(None);
@@ -292,16 +310,37 @@ async fn rollup_groups(
         }
     }
     let group = GroupBy::Single(dim.to_string());
-    for (correction_from, correction_to) in
-        aggregate::correction_windows(from, to, first_full, full_end)
-    {
-        let (where_sql, binds) = build_filters_for(filters, correction_from, correction_to, false);
-        let sql = build_sql(&group_expression(&group), metrics, &where_sql);
-        let rows = fetch_one_shard(&shard.store, &sql, &binds).await?;
-        let edge = groups_from_rows(rows, metrics)?;
+    // 首个不完整自然日仍按时间窗口回扫。
+    if from < first_full {
+        let edge =
+            scan_edge_groups(shard, filters, &group, metrics, from, first_full - 1, None).await?;
+        merge_groups(&mut groups, &edge, metrics);
+    }
+    if full_end <= to {
+        let edge =
+            scan_edge_groups(shard, filters, &group, metrics, full_end, to, tail_from_id).await?;
         merge_groups(&mut groups, &edge, metrics);
     }
     Ok(Some(groups))
+}
+
+async fn scan_edge_groups(
+    shard: &ShardInput,
+    filters: &MetricFilters,
+    group: &GroupBy,
+    metrics: &[MetricName],
+    from: i64,
+    to: i64,
+    after_id: Option<i64>,
+) -> Result<metrics_cache::GroupRows, DbError> {
+    let (mut where_sql, mut binds) = build_filters_for(filters, from, to, false);
+    if let Some(after_id) = after_id {
+        where_sql.push_str(" AND id > ?");
+        binds.push(DbValue::Integer(after_id));
+    }
+    let sql = build_sql(&group_expression(group), metrics, &where_sql);
+    let rows = fetch_one_shard(&shard.store, &sql, &binds).await?;
+    groups_from_rows(rows, metrics)
 }
 
 fn spawn_active_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
@@ -313,6 +352,29 @@ fn spawn_active_build(audit_path: std::path::PathBuf, shard: &ShardInput) {
     tokio::spawn(async move {
         if let Err(error) = aggregate::ensure_active(&audit_path, &shard_id, &store).await {
             tracing::warn!(%error, "active rollup unavailable; metrics uses scan path");
+        }
+    });
+}
+
+/// 水位超过 1 小时才触发一次后台补齐；查询本身不等待构建完成。
+fn spawn_active_build_if_stale(audit_path: std::path::PathBuf, shard: &ShardInput) {
+    if !aggregate::claim_build_spawn(30_000) {
+        return;
+    }
+    let shard_id = shard.id.clone();
+    let store = shard.store.clone();
+    tokio::spawn(async move {
+        if !aggregate::active_rollup_stale(
+            &audit_path,
+            &shard_id,
+            aggregate::ACTIVE_ROLLUP_MAX_AGE_MS,
+        )
+        .await
+        {
+            return;
+        }
+        if let Err(error) = aggregate::ensure_active(&audit_path, &shard_id, &store).await {
+            tracing::warn!(%error, "active rollup stale refresh failed; metrics keeps scan path");
         }
     });
 }

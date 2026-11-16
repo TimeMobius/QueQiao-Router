@@ -47,6 +47,7 @@ fn bucket_label(ms: i64, interval: &str) -> Option<String> {
     use chrono::TimeZone;
     let dt = chrono::Local.timestamp_millis_opt(ms).single()?;
     Some(match interval {
+        "minute" => dt.format("%Y-%m-%d %H:%M").to_string(),
         "hour" => dt.format("%Y-%m-%d %H").to_string(),
         "month" => dt.format("%Y-%m").to_string(),
         _ => dt.format("%Y-%m-%d").to_string(),

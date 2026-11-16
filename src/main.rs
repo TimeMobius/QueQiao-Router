@@ -178,6 +178,38 @@ fn main() {
             });
         }
 
+        // 分析预聚合：默认每天本地凌晨（`ANALYSIS_ROLLUP_AT`，`off` 关闭）增量补齐
+        // active 分片；与 FTS 优化共用 db_rotation_lock，避免同时读写审计库。
+        if db::rollup_enabled() {
+            let rollup_at =
+                std::env::var("ANALYSIS_ROLLUP_AT").unwrap_or_else(|_| "04:00".to_string());
+            if let Some((hour, minute)) = schedule::parse_hhmm(&rollup_at) {
+                tracing::info!(
+                    hour,
+                    minute,
+                    "active rollup build scheduled nightly in local time"
+                );
+                let rollup_state = app_state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let now = chrono::Local::now().timestamp_millis();
+                        let Some(next) = schedule::next_daily_after(now, hour, minute) else {
+                            tracing::warn!("cannot compute the next active rollup build slot");
+                            return;
+                        };
+                        let wait_ms = u64::try_from(next - now).unwrap_or(0);
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        let _lock = rollup_state.db_rotation_lock.lock().await;
+                        let store = rollup_state.active_db().await;
+                        db::warm_active_rollup(&store).await;
+                        tracing::info!("nightly active rollup build finished");
+                    }
+                });
+            } else {
+                tracing::info!(value = %rollup_at, "nightly active rollup build disabled");
+            }
+        }
+
         let app = routes::create_router(app_state.clone()).layer(axum_middleware::from_fn(
             middleware::access_log::access_log_middleware,
         )); // Access Log 最外层

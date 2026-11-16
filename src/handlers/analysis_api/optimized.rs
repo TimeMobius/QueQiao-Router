@@ -1,4 +1,4 @@
-use crate::db::engine::{DbError, Row};
+use crate::db::engine::{DbError, Row, Value};
 use crate::db::records_query;
 
 use super::params::{to_list_params, AnalysisParams};
@@ -9,6 +9,24 @@ pub(super) async fn fetch_optimized<F>(
     params: &AnalysisParams,
     from: i64,
     to: i64,
+    make_sql: F,
+) -> Result<Vec<Vec<Row>>, DbError>
+where
+    F: Fn(&str) -> String,
+{
+    fetch_optimized_after(shards, params, from, to, None, make_sql).await
+}
+
+/// 与 `fetch_optimized` 相同，但额外限定 `id > after_id`。
+///
+/// 用于“天桶汇总 + 增量水位之后按 id 回扫原始库”：审计写入是异步批量的，
+/// `id` 水位之后仍可能出现 `TimeMs` 略早于水位的迟到行，按 id 截断不会漏数。
+pub(super) async fn fetch_optimized_after<F>(
+    shards: &[ShardInput],
+    params: &AnalysisParams,
+    from: i64,
+    to: i64,
+    after_id: Option<i64>,
     make_sql: F,
 ) -> Result<Vec<Vec<Row>>, DbError>
 where
@@ -25,9 +43,13 @@ where
             filters.from = None;
             filters.to = None;
         }
-        let (mut where_sql, binds) = records_query::build_filters(&filters);
+        let (mut where_sql, mut binds) = records_query::build_filters(&filters);
         if filters.from.is_none() {
             where_sql.push_str(" AND TimeMs IS NOT NULL");
+        }
+        if let Some(after_id) = after_id {
+            where_sql.push_str(" AND id > ?");
+            binds.push(Value::Integer(after_id));
         }
         let sql = make_sql(&where_sql);
         tasks.push(tokio::spawn(async move {

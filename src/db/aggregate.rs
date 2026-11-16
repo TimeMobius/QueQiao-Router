@@ -482,7 +482,39 @@ async fn active_state(db: &Db, shard_id: &str) -> Result<Option<ActiveState>, Db
     }
 }
 
-/// 完整自然日区间 `[first_full, full_end)`；无完整自然日时退化为 `(from, from)`。
+/// active 汇总允许的最大滞后：超过后查询路径会后台触发一次增量补齐。
+pub(crate) const ACTIVE_ROLLUP_MAX_AGE_MS: i64 = 3_600_000;
+
+/// active 分片的增量水位：`last_id` 之后的行尚未进入汇总，
+/// `max_time_ms` 是已汇总记录的最大时间戳。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveWatermark {
+    pub(crate) last_id: i64,
+    pub(crate) max_time_ms: i64,
+}
+
+/// 读取 active 分片当前的汇总水位；尚未构建过时返回 `None`。
+pub(crate) async fn active_watermark(audit_path: &Path, shard_id: &str) -> Option<ActiveWatermark> {
+    let db = open_store(audit_path).await.ok()?;
+    let state = active_state(&db, shard_id).await.ok()??;
+    Some(ActiveWatermark {
+        last_id: state.last_id,
+        max_time_ms: state.max_time_ms,
+    })
+}
+
+/// 距上次增量构建是否已超过 `max_age_ms`；从未构建过视为已过期。
+pub(crate) async fn active_rollup_stale(
+    audit_path: &Path,
+    shard_id: &str,
+    max_age_ms: i64,
+) -> bool {
+    match active_watermark(audit_path, shard_id).await {
+        Some(watermark) => now_ms().saturating_sub(watermark.max_time_ms) > max_age_ms,
+        None => true,
+    }
+}
+
 /// 是否启用派生汇总（`ANALYSIS_ROLLUP=off` 可关闭）。
 pub(crate) fn enabled() -> bool {
     !std::env::var("ANALYSIS_ROLLUP")
@@ -490,6 +522,7 @@ pub(crate) fn enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 完整自然日区间 `[first_full, full_end)`；无完整自然日时退化为 `(from, from)`。
 pub(crate) fn full_day_bounds(from: i64, to: i64) -> Option<(i64, i64)> {
     let from_day = local_day_ms(from)?;
     let first_full = if from == from_day {

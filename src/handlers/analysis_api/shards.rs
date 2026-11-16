@@ -161,6 +161,21 @@ pub(super) async fn fetch_sliced<F>(
 where
     F: Fn(&str) -> String,
 {
+    fetch_sliced_after(shards, p, from, to, None, make_sql).await
+}
+
+/// 与 `fetch_sliced` 相同，但额外限定 `id > after_id`（用于增量水位之后的尾段回扫）。
+pub(super) async fn fetch_sliced_after<F>(
+    shards: &[ShardInput],
+    p: &AnalysisParams,
+    from: i64,
+    to: i64,
+    after_id: Option<i64>,
+    make_sql: F,
+) -> Result<Vec<Vec<Row>>, DbError>
+where
+    F: Fn(&str) -> String,
+{
     let slices = range_slices(from, to);
     let mut tasks = Vec::with_capacity(shards.len().saturating_mul(slices.len()));
     for shard in shards {
@@ -172,8 +187,12 @@ where
             let mut params = to_list_params(p, from, to);
             params.from = None;
             params.to = None;
-            let (mut where_sql, binds) = records_query::build_filters(&params);
+            let (mut where_sql, mut binds) = records_query::build_filters(&params);
             where_sql.push_str(" AND TimeMs IS NOT NULL");
+            if let Some(after_id) = after_id {
+                where_sql.push_str(" AND id > ?");
+                binds.push(Value::Integer(after_id));
+            }
             let sql = make_sql(&where_sql);
             tasks.push(tokio::spawn(async move {
                 fetch_one_shard(&store, &sql, &binds).await
@@ -182,8 +201,13 @@ where
         }
         for &(slice_from, slice_to) in &slices {
             let store = shard.store.clone();
-            let (where_sql, binds) =
+            let (where_sql, mut binds) =
                 records_query::build_filters(&to_list_params(p, slice_from, slice_to));
+            let mut where_sql = where_sql;
+            if let Some(after_id) = after_id {
+                where_sql.push_str(" AND id > ?");
+                binds.push(Value::Integer(after_id));
+            }
             let sql = make_sql(&where_sql);
             tasks.push(tokio::spawn(async move {
                 let _permit = SHARD_SEM.acquire().await;

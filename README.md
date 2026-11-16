@@ -137,6 +137,7 @@ docker run -d \
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
 | `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时跳过旧 SQLite 归档的自动升级；v8 归档照常查询 |
 | `ANALYSIS_ROLLUP` | 开启 | 历史分析读取 `audit_aggregates.db` 预聚合；设为 `off` 时全部走原始扫描（用于对照与排查） |
+| `ANALYSIS_ROLLUP_AT` | `04:00` | active 分片预聚合每日增量构建时刻（本地时区，`HH:MM`）；`off` 关闭。与 FTS 优化共用轮转锁串行执行 |
 
 ---
 
