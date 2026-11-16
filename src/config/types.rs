@@ -24,11 +24,28 @@ pub struct LoadBalancingConfig {
     pub strategy: LoadBalancingStrategy,
 }
 
+/// 单个后端的 API Key 取值优先级。
+///
+/// 只决定“谁先”，另一侧仍作为回退：例如 `Config` 模式下配置 key 为空时用请求 key；
+/// `Client` 模式下请求没带 key 时用配置 key。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyPriority {
+    /// 后端配置的 `api_key` 优先，请求头 key 兜底（默认，与历史行为一致）。
+    #[default]
+    Config,
+    /// 请求头 key（`Authorization: Bearer` / `x-api-key`）优先，配置 `api_key` 兜底。
+    Client,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub name: String,
     pub base_url: String,
     pub api_key: Option<String>,
+    /// 本后端的 API Key 取值优先级，默认 `config`（配置 key 优先，请求 key 兜底）。
+    #[serde(default)]
+    pub api_key_priority: ApiKeyPriority,
     pub model_match: ModelMatch,
     pub priority: Option<u32>,
     pub fallback: Option<String>,
@@ -77,6 +94,7 @@ impl Default for ClientConfig {
             name: Default::default(),
             base_url: Default::default(),
             api_key: Default::default(),
+            api_key_priority: Default::default(),
             model_match: ModelMatch {
                 match_type: "exact".to_string(),
                 value: Default::default(),
@@ -289,6 +307,7 @@ mod tests {
             name: "test".to_string(),
             base_url: "http://localhost".to_string(),
             api_key: None,
+            api_key_priority: Default::default(),
             model_match: ModelMatch {
                 match_type: "exact".to_string(),
                 value: vec!["test".to_string()],
@@ -502,5 +521,41 @@ openai_clients:
         let unknown = client_with_rewrite("regex", &["deepseek"], &[("alias", "target")]);
         assert!(!unknown.matches_model("deepseek-flash"));
         assert!(unknown.matches_model("alias"));
+    }
+
+    fn parse_client_with_priority(priority_line: &str) -> Result<ClientConfig, serde_yaml::Error> {
+        let yaml = format!(
+            r#"
+openai_clients:
+  - name: "a"
+    base_url: "http://localhost"
+    {priority_line}
+    model_match:
+      type: "exact"
+      value: []
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml)?;
+        Ok(cfg.openai_clients.into_iter().next().expect("one client"))
+    }
+
+    #[test]
+    fn test_api_key_priority_defaults_to_config_when_omitted() {
+        let client = parse_client_with_priority("").expect("parse");
+        assert_eq!(client.api_key_priority, ApiKeyPriority::Config);
+    }
+
+    #[test]
+    fn test_api_key_priority_explicit_client_and_config() {
+        let client = parse_client_with_priority("api_key_priority: \"client\"").expect("parse");
+        assert_eq!(client.api_key_priority, ApiKeyPriority::Client);
+
+        let client = parse_client_with_priority("api_key_priority: \"config\"").expect("parse");
+        assert_eq!(client.api_key_priority, ApiKeyPriority::Config);
+    }
+
+    #[test]
+    fn test_api_key_priority_rejects_unknown_value() {
+        assert!(parse_client_with_priority("api_key_priority: \"user\"").is_err());
     }
 }

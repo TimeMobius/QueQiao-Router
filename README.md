@@ -62,7 +62,7 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
 - **CORS**: 默认配置 permissive，生产环境建议按需限制。
 - **审计数据**: 完整记录请求体、响应体、客户端 IP 等审计数据，敏感环境中请配置 `LOG_FULL_TOKEN_ON_ERROR=true` 以便追踪问题，同时注意日志访问权限控制。
 - **无内置速率限制**: 不提供请求频率限制，必要时借助外部网关或反向代理实现。
-- **API Key 优先级**: 客户端配置中的固定 `api_key` > 请求头 `Authorization: Bearer <token>` > 请求头 `x-api-key`（值本身即 Key，无需前缀）。正常日志中 Token 仅显示前 8 字符（缩略）；设置为 `LOG_FULL_TOKEN_ON_ERROR=true` 时，错误日志中记录完整 Token 以便排查。该变量仅建议在受控环境中临时启用。
+- **API Key 优先级**: 默认（`api_key_priority: "config"`）为 客户端配置中的固定 `api_key` > 请求头 `Authorization: Bearer <token>` > 请求头 `x-api-key`（值本身即 Key，无需前缀）；按后端设置 `api_key_priority: "client"` 可反转为请求头 key 优先、配置 key 兜底。正常日志中 Token 仅显示前 8 字符（缩略）；设置为 `LOG_FULL_TOKEN_ON_ERROR=true` 时，错误日志中记录完整 Token 以便排查。该变量仅建议在受控环境中临时启用。
 
 ---
 
@@ -192,6 +192,7 @@ connection_pool:
 openai_clients:
   - name: "client_name"
     api_key: "sk-xxx"            # 可选，为空时使用客户端传入的 Key
+    api_key_priority: "config"   # 可选：api key 取值优先级，config(默认，配置 key 优先) | client(请求 key 优先)
     base_url: "https://api.example.com/v1"
     model_match:
       type: "keyword"            # 或 "exact"
@@ -241,6 +242,30 @@ openai_clients:
 **`model_echo`**：默认 `upstream`，响应体里的 `model` 原样透传上游返回的名字（零额外开销）。
 设为 `inbound` 则改回客户端请求时用的名字——注意流式路径会因此对带 `model` 的
 SSE chunk 多做一次 JSON 解析，仅在确有必要时开启。
+
+### API Key 优先级 (api_key_priority) 说明
+
+每个后端可独立决定“配置里的固定 `api_key`”与“客户端请求带来的 key”谁先用，
+另一侧始终作为兜底（不会因为一个字都没匹配到就不发鉴权头）：
+
+| 取值 | 行为 |
+| :--- | :--- |
+| `config`（默认，缺省即此值） | 优先后端配置的 `api_key`；为空或未配置时用请求 key |
+| `client` | 优先请求 key（`Authorization: Bearer` > `x-api-key`）；未带时用配置 `api_key` |
+
+```yaml
+openai_clients:
+  - name: "passthrough-key"
+    base_url: "https://api.example.com/v1"
+    api_key: "sk-fallback"       # 客户端没带 key 时使用
+    api_key_priority: "client"   # 客户端带了 key 就优先用客户端的
+```
+
+无论哪种模式，网关最终都只向上游发送一个 `Authorization: Bearer <key>`，
+客户端原始的 `Authorization` / `x-api-key` 不会被原样透传。
+
+> `GET /v1/models` 是唯一例外：该入口固定为“客户端凭证优先、配置 `api_key` 兜底”，
+> 不受本设置影响（便于用调用方自己的凭证查询可用模型）。
 
 ### 思考格式 (ThinkingFormat) 说明
 

@@ -27,11 +27,24 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 
 ## 认证与凭据优先级
 
-本网关**默认无认证**，建议在前置反向代理/网关层做鉴权。API Key 取值优先级：
+本网关**默认无认证**，建议在前置反向代理/网关层做鉴权。API Key 取值优先级
+由每个后端的 `api_key_priority` 决定，缺省为 `config`（与历史行为一致）：
+
+`api_key_priority: "config"`（默认）：
 
 1. 客户端配置中的固定 `api_key`
 2. 请求头 `Authorization: Bearer <token>`
 3. 请求头 `x-api-key`（值本身即 Key，无需前缀）
+
+`api_key_priority: "client"`：
+
+1. 请求头 `Authorization: Bearer <token>`
+2. 请求头 `x-api-key`（值本身即 Key，无需前缀）
+3. 客户端配置中的固定 `api_key`（兜底）
+
+空字符串的配置 `api_key` 视为未配置。两种模式下网关都只向上游发送一个
+`Authorization: Bearer <key>`，请求里原始鉴权头不会被透传。
+`GET /v1/models` 例外：该入口固定客户端凭证优先，不受此设置影响。
 
 正常情况下日志中 Token 仅显示前 8 字符；设置 `LOG_FULL_TOKEN_ON_ERROR=true` 时错误日志
 记录完整 Token（仅建议受控环境临时启用）。

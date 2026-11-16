@@ -279,6 +279,7 @@ mod tests {
             name: "test".to_string(),
             base_url: "http://localhost/v1".to_string(),
             api_key: None,
+            api_key_priority: Default::default(),
             model_match: crate::config::types::ModelMatch {
                 match_type: "exact".to_string(),
                 value: vec!["m".to_string()],
@@ -633,6 +634,7 @@ mod tests {
             name: "test".to_string(),
             base_url: "http://localhost/v1".to_string(),
             api_key: None,
+            api_key_priority: Default::default(),
             model_match: crate::config::types::ModelMatch {
                 match_type: "exact".to_string(),
                 value: vec!["xiaoke-5".to_string()],

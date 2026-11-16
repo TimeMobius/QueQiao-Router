@@ -1,4 +1,4 @@
-use crate::config::types::ClientConfig;
+use crate::config::types::{ApiKeyPriority, ClientConfig};
 // Active request gauge is tracked at response body lifetime.
 use crate::state::app_state::AppState;
 use reqwest::multipart::Form;
@@ -13,20 +13,34 @@ use tokio::time::timeout;
 
 /// 从配置或请求头中获取 API Key
 ///
-/// 优先级：
-/// 1. 客户端配置中的固定 key (`client_config.api_key`)
-/// 2. 请求头中的 Authorization Bearer token (OpenAI 风格)
-/// 3. 请求头中的 x-api-key token (Anthropic 客户端标准)
+/// 两侧的先后顺序由后端配置 [`ClientConfig::api_key_priority`] 决定，
+/// 未配置时默认 `config`（与历史行为一致）：
+/// - `config`：客户端配置中的固定 key 优先，请求头 key 兜底
+/// - `client`：请求头 key 优先，客户端配置中的固定 key 兜底
+///
+/// 请求头 key 的兜底顺序固定为：
+/// 1. `Authorization: Bearer <token>`（OpenAI 风格）
+/// 2. `x-api-key`（Anthropic 客户端标准，值本身即 Key）
+///
+/// 空字符串的配置 key 视为未配置。
 pub fn get_api_key(
     client_config: &ClientConfig,
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
-    if let Some(ref key) = client_config.api_key {
-        if !key.is_empty() {
-            return Some(key.clone());
-        }
-    }
+    let configured = client_config
+        .api_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned);
 
+    match client_config.api_key_priority {
+        ApiKeyPriority::Config => configured.or_else(|| get_api_key_from_headers(headers)),
+        ApiKeyPriority::Client => get_api_key_from_headers(headers).or(configured),
+    }
+}
+
+/// 仅从请求头提取 API Key（不含后端配置）。
+fn get_api_key_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     // 尝试从 Authorization header 提取 (OpenAI 风格: "Bearer <key>")
     if let Some(key) = headers
         .get("authorization")
@@ -166,24 +180,19 @@ mod tests {
     }
 
     fn make_client_config(api_key: Option<&str>) -> ClientConfig {
+        make_client_config_with_priority(api_key, ApiKeyPriority::Config)
+    }
+
+    fn make_client_config_with_priority(
+        api_key: Option<&str>,
+        api_key_priority: ApiKeyPriority,
+    ) -> ClientConfig {
         ClientConfig {
             name: "test".to_string(),
             base_url: "http://localhost".to_string(),
             api_key: api_key.map(String::from),
-            model_match: crate::config::types::ModelMatch {
-                match_type: "exact".to_string(),
-                value: vec![],
-            },
-            priority: None,
-            fallback: None,
-            special_prefix: None,
-            stop: None,
-            max_tokens: None,
-            extra_body: None,
-            thinking_format: None,
-            model_rewrite: None,
-            model_echo: crate::config::types::ModelEcho::default(),
-            extra_body_cached: Default::default(),
+            api_key_priority,
+            ..Default::default()
         }
     }
 
@@ -280,5 +289,56 @@ mod tests {
 
         // No api key anywhere
         assert_eq!(get_api_key(&config, &headers), None);
+    }
+
+    #[test]
+    fn test_default_priority_is_config() {
+        assert_eq!(
+            ClientConfig::default().api_key_priority,
+            ApiKeyPriority::Config
+        );
+    }
+
+    #[test]
+    fn test_client_priority_prefers_header_over_config() {
+        let config = make_client_config_with_priority(Some("config-key"), ApiKeyPriority::Client);
+        let mut headers = make_headers();
+        with_authorization(&mut headers, "header-key");
+
+        assert_eq!(
+            get_api_key(&config, &headers),
+            Some("header-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_priority_falls_back_to_config_without_header() {
+        let config = make_client_config_with_priority(Some("config-key"), ApiKeyPriority::Client);
+        let headers = make_headers();
+
+        assert_eq!(
+            get_api_key(&config, &headers),
+            Some("config-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_priority_ignores_empty_config_key() {
+        let config = make_client_config_with_priority(Some(""), ApiKeyPriority::Client);
+        let headers = make_headers();
+
+        assert_eq!(get_api_key(&config, &headers), None);
+    }
+
+    #[test]
+    fn test_config_priority_falls_back_to_header_when_config_key_empty() {
+        let config = make_client_config_with_priority(Some(""), ApiKeyPriority::Config);
+        let mut headers = make_headers();
+        with_authorization(&mut headers, "header-key");
+
+        assert_eq!(
+            get_api_key(&config, &headers),
+            Some("header-key".to_string())
+        );
     }
 }
