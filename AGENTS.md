@@ -1,125 +1,241 @@
 # QueQiao-Router 项目指南
 
-本文档是 QueQiao-Router 项目的持久化记忆，整合了项目架构、开发规范和测试流程。
+QueQiao-Router 是 Rust 实现的高性能大模型智能路由网关（Axum + Tokio + simd-json + mimalloc），
+负责在多个上游 LLM 后端之间做路由、负载均衡、故障转移，并落地审计与指标。
 
-## 项目概述
-
-QueQiao-Router 是 Rust 实现的高性能大模型智能路由网关。
-
-### 部署架构
 ```
 [Client] -> [QueQiao-Router] -> [Backend Services]
 ```
 
----
+## 0. 本机环境速查
 
-## 开发指令与约束
+**本机就是开发机，不需要 SSH 到任何地方**——所有命令在当前 shell 直接执行。
 
-> **铁律**: 严禁修改 QueQiao-Router-Tests 测试套件的任何代码，其代码不可更改。
->
-> **测试定位**: 本项目以 Rust 内部单元测试（`cargo test`）为**必需的**质量门禁。QueQiao-Router-Tests 是**可选的黑盒端到端验收工具**，仅在需要验证真实 HTTP/SSE 线格式、路由装配、故障转移、热重载等跨进程行为时手动运行，**不属于**日常开发或提交的硬性流程。
+| 项 | 值 |
+| :--- | :--- |
+| 主机 | hostname `fedora`，内网 `192.168.6.169` |
+| 仓库根（= 本文件所在目录） | `/mnt/data/Codes/GPT_API_gemini/QueQiao-Router` |
+| 同级外部目录 | `../Check_API`（鉴权插件）、`../build_multiarch.sh`、`../dist`、`../QueQiao-Router-Tests` |
+| 工具链 | rustc / cargo **1.96.0**（与 CI、`Dockerfile` 一致，勿擅自升级） |
+| 分支 | `main` |
 
-1. **自主性**: 遇到问题时，优先通过在线搜索等方式独立解决，避免中断等待用户指令
-2. **范围限制**: 所有代码修改严格限制在当前指令目标的项目内
-3. **结果导向**: 专注于最终目标的实现，允许通过不断迭代和尝试不同方法来达成目的
-4. **版本控制**: 每次代码调整后，必须完成编译测试与单元测试。若通过，应立即将变更提交至 Git 仓库
-5. **提交约束**: 提交和推送 Git 仓库之前，必须先执行 `cargo fmt` 格式化代码，再进行编译测试与单元测试验证功能性。**不再要求每次提交前运行外部测试套件**
-6. **增量变更**: 避免一次性修改大量代码。进行小步、增量的变更，并频繁运行编译测试与单元测试以验证效果
-
----
-
-## 核心特性
-- **极致性能**: 基于 `Axum` 和 `Tokio` 异步运行时，利用 `simd-json` 和 `mimalloc` 优化
-- **智能流量调度**: 支持关键字匹配和精确匹配的多策略路由，加权负载均衡，自动故障转移
-- **深度可观测性**: 流式审计功能，完整的请求体和响应体记录，统一错误日志
-- **企业级功能**: 零停机热重载，数据清洗（移除思考标签），多模态支持
-
-### 核心架构
-- **入口点**: `src/main.rs` 初始化运行时、日志系统、配置管理、客户端管理、数据库连接池和路由
-- **路由层**: `src/routes/` 定义了所有支持的 API 端点
-- **处理层**: `src/handlers/` 包含各端点的具体处理逻辑
-- **服务层**: `src/services/dispatcher.rs` 实现核心请求分发逻辑
-- **客户端层**: `src/client/` 管理上游客户端连接
-- **配置层**: `src/config/` 负责加载和管理 YAML 配置文件
-- **数据层**: `src/db/` 处理 SQLite 数据库操作
-
-### 编译命令 (Debug 模式)
 ```bash
-cd /mnt/data/Codes/GPT_API_gemini/QueQiao-Router && cargo build
+cd /mnt/data/Codes/GPT_API_gemini/QueQiao-Router
+git status --short && git pull --ff-only && git fetch --tags origin
+cargo fmt --all && cargo build && cargo test
 ```
-提交采用约定式提交（`fix(scope): ...` 等）；推送到 `main` 后由 GitHub CI + Release 工作流自动打 tag（`b<提交数>`）并升版本，**不要手改版本号**。
-需要交付带鉴权插件的镜像时，拉取最新版本号后在外部执行 `cd /mnt/data/Codes/GPT_API_gemini && bash build_multiarch.sh -o ./dist`（产物 `../dist/queqiao-router-<ver>-{amd64,arm64}.tar.gz`）。
+
 ---
 
-## 外部测试套件（可选工具）
+## 1. 硬性约束（先读这一节）
 
-测试套件目录: `/mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests`
-
-> **性质**: 该套件为可选的端到端黑盒验收工具，不是必须执行的流程。日常开发与提交只需通过 `cargo fmt`、编译和 `cargo test`。仅在以下场景按需手动运行：
-> - 验证真实 HTTP / SSE 线格式（流式分帧、`[DONE]`、事件顺序）
-> - 验证路由与配置装配、故障转移、负载均衡、热重载等跨进程行为
-> - 发布前或重大改动后进行整体回归
+> **铁律**：严禁修改 `../QueQiao-Router-Tests` 测试套件的任何代码，其代码不可更改。
 >
-> 若该套件与本项目当前行为不一致，**不要为其修改产品代码**；应先确认产品行为是否确实有误，再按需更新测试（该目录代码受上方铁律保护）。
+> **测试定位**：以 Rust 内部单元测试（`cargo test`）为**必需的**质量门禁。
+> `QueQiao-Router-Tests` 是**可选的黑盒端到端验收工具**，仅当需要验证真实 HTTP/SSE 线格式、
+> 路由装配、故障转移、热重载等跨进程行为时手动运行，**不属于**日常开发或提交的硬性流程。
 
-### 环境设置（仅首次或可选运行时需要）
+1. **自主性**：遇到问题先独立排查（含在线搜索），避免无谓中断等待指令
+2. **范围限制**：代码修改严格限制在当前指令目标的项目内
+3. **结果导向**：专注最终目标，允许迭代尝试不同方法
+4. **版本控制**：每次代码调整后必须完成编译与单元测试；通过后立即提交 Git
+5. **提交约束**：提交/推送前必须先 `cargo fmt`，再编译测试与单元测试验证功能。
+   **不再要求每次提交前运行外部测试套件**
+6. **增量变更**：小步、增量的改动，频繁编译与测试验证
+
+---
+
+## 2. 标准开发闭环
+
+```text
+同步 main → 小步改码 → cargo fmt --all → cargo build → cargo test
+  → 手动/端到端验证（按改动类型）→ git commit（约定式）→ git push origin main
+  → GitHub CI + Release 自动打 tag / 升版本
+  → 需要鉴权版时：本机 bash ../build_multiarch.sh -o ../dist
+```
+
+### 2.1 提交规范
+
+采用 **Conventional Commits**：`type(scope): 摘要`
+（`feat` / `fix` / `perf` / `refactor` / `docs` / `chore`；scope 如 `gateway`、`handlers`、`db`、`config`）。
+
+- 摘要一句话说清“改了什么、为什么”；正文补根因、方案、验证结论
+- `git add <明确列出的文件>`，避免 `git add -A` 带入无关文件
+- `Cargo.lock` 未纳入版本控制（见 `.gitignore`）
+
+### 2.2 版本号（自动维护，勿手改）
+
+- 版本号 = 提交数：tag `b<git rev-list --count HEAD>`，Cargo 版本 `0.2.<提交数>`
+- 向 `main` push 一个**不含 `[skip ci]`** 的提交后：
+  - `Create Release and Update README` 创建 tag + Release，并把 `Cargo.toml` 版本、
+    README 镜像 tag 改成新值，提交 `chore(release): update build version to bN [skip ci]` 推回主干
+  - `Rust CI & Docker Build` 构建并推送普通版多架构镜像到 GHCR
+- **不要手改 `Cargo.toml` / README 里的版本行**；出现“本地落后 1 个提交”是正常的，`git pull --ff-only` 即可
+
+### 2.3 推送后确认完成的标准
+
 ```bash
-# 安装依赖
+gh run list -R TimeMobius/QueQiao-Router -L 6
+gh run view <run-id> -R TimeMobius/QueQiao-Router            # 作业级状态
+gh run view <run-id> --log-failed -R TimeMobius/QueQiao-Router
+git ls-remote --tags origin b<新版本>                          # tag 指向你的提交
+```
+
+1. `Rust CI & Docker Build`：completed / success
+2. `Create Release and Update README`：completed / success
+3. 新 tag 就位，且 `origin/main` 多出自动版本提交
+
+---
+
+## 3. 测试策略
+
+| 层级 | 命令 | 是否必需 |
+| :--- | :--- | :--- |
+| 单元测试 | `cargo test` | **必需**（提交门禁） |
+| 编译 | `cargo build` | **必需** |
+| 格式化 | `cargo fmt --all`（CI 跑 `--check`） | **必需** |
+| Clippy | `cargo clippy`（CI 只跑普通 lint，不加 `-D warnings`） | 推荐 |
+| 黑盒 E2E | 见 §6 | 可选，按需 |
+
+> `cargo clippy --all-targets --all-features -- -D warnings` 在当前工具链下有数十条**历史遗留**告警，
+> 只需确认本次改动文件无新增告警，不要顺手大改无关代码。
+
+涉及 HTTP 行为、配置、多模态、大请求体的改动，单测之外务必起本地网关验证（见 §6.3）。
+
+---
+
+## 4. 代码地图
+
+| 关注点 | 位置 |
+| :--- | :--- |
+| 进程入口、启动装配（配置/DB/metrics/路由） | `src/main.rs`、`src/lib.rs` |
+| 路由注册 | `src/routes/`（`mod.rs` + 各端点文件） |
+| JSON 请求体提取器 `CustomJson` | `src/handlers/extractors.rs` |
+| 请求体上限（`MAX_REQUEST_BODY_BYTES`，默认 64 MiB） | `src/config/body_limit.rs` |
+| 统一错误体 / 413 文案 | `src/app_error.rs` |
+| 核心调度、故障转移、熔断记账 | `src/services/dispatcher.rs` |
+| 非流式转发、审计落库 | `src/handlers/common_handler.rs` |
+| 流式（SSE）处理 | `src/handlers/stream_handler.rs`、`anthropic_stream_handler.rs`、`responses_stream_handler.rs` |
+| 上游 HTTP 客户端、鉴权头与透传白名单 | `src/client/proxy.rs`、`client_manager.rs` |
+| 配置加载 / 热重载 / 类型 | `src/config/config_manager.rs`、`types.rs` |
+| 审计库（Turso v8）、轮转、FTS | `src/db/` |
+| 访问日志中间件 | `src/middleware/access_log.rs` |
+| Prometheus 指标 | `src/metrics/` |
+| 内嵌监控面板（rust-embed） | `src/routes/dashboard.rs`、`web/` |
+| 鉴权插件（编译期注入，仓库外） | `../Check_API/auth-lib/src/lib.rs` |
+
+### 4.1 可选功能：鉴权插件
+
+普通版 `cargo build` 不含认证；`--features check-api-auth` 时 `src/main.rs` 用 `include!`
+引入 `../Check_API/auth-lib/src/lib.rs`，把鉴权中间件加在路由最外层，零运行时开销。
+
+> 注意：**不要用 `--all-features`**——该 feature 依赖仓库外的 sibling 目录，缺目录会编译失败。
+
+---
+
+## 5. 交付产物
+
+| 产物 | 构建者 | 内容 |
+| :--- | :--- | :--- |
+| `ghcr.io/timemobius/queqiao-router:bN` / `latest` | GitHub CI（根 `Dockerfile`） | 普通版，**无鉴权插件** |
+| `../dist/queqiao-router-<ver>-{amd64,arm64}.tar.gz` | 本机 `../build_multiarch.sh`（`../Check_API/Dockerfile`） | `FEATURES=check-api-auth`，**含鉴权插件** |
+
+```bash
+# 打鉴权版多架构镜像（版本号由本地 tag 自动识别，追加 -c）
+cd /mnt/data/Codes/GPT_API_gemini
+git -C QueQiao-Router fetch --tags origin          # 先同步 tag，否则版本会回落 latest-c
+bash build_multiarch.sh -o ./dist
+```
+
+- 产物校验：`gzip -t dist/*.tar.gz` + `sha256sum`，amd64 可 `docker load` 后冒烟
+- 磁盘建议 ≥20GB 空闲（BuildKit Min Free Space 约 19.5GB，过低会 GC 缓存触发全量重建）
+- arm64 走 QEMU 指令模拟（buildkit 内置，**不需要**宿主机 binfmt），耗时是 amd64 的数倍
+
+---
+
+## 6. 测试与环境
+
+### 6.1 外部黑盒测试套件（可选）
+
+```bash
+pkill -f queqiao_router || true           # 先清理遗留进程，避免端口冲突
+cd /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests
+source .venv/bin/activate                 # 已存在；若缺失见下
+python test_runner_enhanced.py --api-version rust --stage all
+# 报告：/mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/test_report.md
+```
+
+首次环境准备：
+
+```bash
 apt-get update && apt-get install -y python3-pip python3.11-venv
-
-# 创建虚拟环境
 python3 -m venv /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/.venv
-
-# 安装 Python 依赖
-/mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/.venv/bin/python3 -m pip install -r /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/requirements.txt
+/mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/.venv/bin/python3 -m pip install \
+  -r /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/requirements.txt
 ```
 
-### 测试运行（按需手动执行）
-**重要**: 运行测试套件前，必须先清理可能遗留的 `queqiao_router` 进程，避免端口冲突导致测试失败。
+> 若套件与产品当前行为不一致，**不要为其修改产品代码**；先确认产品行为是否确实有误，
+> 再按需调整测试（该目录代码受 §1 铁律保护）。
+
+### 6.2 Mock 服务器约定
+
+需要特定或异常后端行为时，**不要**在 Mock 服务器里新增 API 端点。
+正确做法是用**专用模型名**驱动分支：
+
+1. 调用标准 `/v1/chat/completions`
+2. `model` 设为专用名（如 `model-for-incomplete-stream`）
+3. Mock 识别该模型名并返回预设响应
+
+### 6.3 本地起网关验证
 
 ```bash
-# 清理遗留进程
-pkill -f queqiao_router || true
-
-# 运行测试
-cd /mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests && source .venv/bin/activate && python test_runner_enhanced.py --api-version rust --stage all
+WORK=/tmp/qq-dev; rm -rf $WORK; mkdir -p $WORK/config
+cat > $WORK/config/config.yaml <<'YAML'
+openai_clients:
+  - name: "mock"
+    api_key: "dummy"
+    base_url: "http://127.0.0.1:18001/v1"
+    model_match: { type: "keyword", value: ["dev-model"] }
+YAML
+cd $WORK && RECD_PATH="sqlite:$WORK/record.db" SERVER_PORT=18080 \
+  /mnt/data/Codes/GPT_API_gemini/QueQiao-Router/target/debug/queqiao-router
 ```
 
-### 测试报告
-测试报告生成位置: `/mnt/data/Codes/GPT_API_gemini/QueQiao-Router-Tests/test_report.md`
+调试二进制名是 `target/debug/queqiao-router`（连字符）。常用环境变量见本机 `知识库/04-部署与验证.md` §5。
+
+### 6.4 测试报告约定
+
+在 Markdown 测试报告补充信息：`TEST_EXPECTATIONS` 加预期输出，`TEST_STEP_LOGIC` 加测试步骤。
 
 ---
 
-### API 用法示例
+## 7. API 用法示例
 
-#### 非流式 Chat Completion
 ```bash
+# 非流式
 curl --location 'http://192.168.10.121:8000/v1/chat/completions' \
 --header 'Authorization: Bearer sk-token' \
 --header 'Content-Type: application/json' \
 --data '{"model": "RWKV-v7-G0-7.2B", "messages": [{"role": "user", "content": "你好"}]}'
-```
 
-#### 流式 Chat Completion
-```bash
+# 流式
 curl --location 'http://192.168.10.121:8000/v1/chat/completions' \
 --header 'Content-Type: application/json' \
 --data '{"model": "RWKV-v7-G0-7.2B", "stream": true, "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
-### Mock 服务器测试逻辑
+端点总览见 [`docs/API_LLM.md`](docs/API_LLM.md)；审计接口见 [`docs/API_RECORDS.md`](docs/API_RECORDS.md)。
 
-添加需要特定或异常后端行为的新测试时，**不应**在 Mock 服务器中创建新的 API 端点。
+---
 
-正确做法：使用**专用的模型名称**来触发特殊响应。
+## 8. 文档索引
 
-示例：测试网关如何处理不完整的流式响应
-1. 测试调用标准 `/v1/chat/completions` 端点
-2. `model` 参数设为 `model-for-incomplete-stream`
-3. 修改 Mock 服务器识别此模型名称并返回预设的特殊响应
+| 文档 | 内容 |
+| :--- | :--- |
+| [`README.md`](README.md) | 功能、配置参考、环境变量、部署 |
+| [`DEVELOPER.md`](DEVELOPER.md) | 架构深度解析 |
+| [`docs/`](docs/) | 接口协议、数据库 schema、专题调研 |
+| `知识库/`（**本机，不入库**） | 开发环境、日常流程、构建发布、部署验证、案例排障 |
 
-### 测试报告生成
-
-向 Markdown 测试报告添加详细信息：
-1. 在 `TEST_EXPECTATIONS` 字典中添加预期输出
-2. 在 `TEST_STEP_LOGIC` 字典中添加测试步骤
+> `知识库/` 含内网地址与交付细节，仅保存在本机、由 `.gitignore` 排除，不随仓库分发。
+> 该目录与本文件冲突时，以本文件与 `README.md`、`DEVELOPER.md` 为准。

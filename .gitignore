@@ -16,3 +16,6 @@ core.*
 # Local dev artifacts (should not be committed)
 .sisyphus/
 .omo/
+
+# 本机知识库（含内网地址与交付细节，不入库）
+/知识库/
