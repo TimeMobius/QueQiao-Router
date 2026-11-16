@@ -21,9 +21,9 @@ use super::params::{
 use super::shards::{collect_shards, fetch_sliced, skipped_archive_warning};
 use super::sql::errors_db_sql;
 
-/// 错误排行最多回看 24 小时：审计行含完整请求/响应体，长时间跨度的
-/// `GROUP BY Error` 会退化为全量扫描（实测 7 天 >3 分钟）。
-const ERRORS_MAX_WINDOW_MS: i64 = 86_400_000;
+/// 错误排行最多回看 2 小时：审计行含完整请求/响应体，长时间跨度的
+/// `GROUP BY Error` 会退化为全量扫描（实测约 3s/小时，7 天 >3 分钟）。
+const ERRORS_MAX_WINDOW_MS: i64 = 2 * 3_600_000;
 
 fn clamp_error_window(from: i64, to: i64) -> (i64, i64, bool) {
     if to.saturating_sub(from) > ERRORS_MAX_WINDOW_MS {
@@ -184,7 +184,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_window_is_clamped_to_24_hours() {
+    fn error_window_is_clamped_to_max_span() {
         let now = 1_000_000_000_000i64;
         let (from, to, clamped) = clamp_error_window(now - 7 * 86_400_000, now);
         assert!(clamped);
