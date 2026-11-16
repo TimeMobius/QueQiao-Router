@@ -25,7 +25,7 @@
         var d = new Date(ms), pad = function (n) { return n < 10 ? '0' + n : String(n); };
         return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
     }
-    function defaultRange() { return { from: Date.now() - 7 * 86400000, to: Date.now() }; }
+    function defaultRange() { var now = new Date(), from = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7, 0, 0, 0, 0); return { from: from.getTime(), to: now.getTime() }; }
     function range() { var d = defaultRange(), from = localToMs($('fromInput').value), to = localToMs($('toInput').value); return { from: from === null ? d.from : from, to: to === null ? d.to : to }; }
     function sharedParams() {
         var r = range(), p = new URLSearchParams();
@@ -62,7 +62,7 @@
         });
     }
     function compareEnabled() { return $('compareToggle').checked; }
-    function previousParams(p) { var r = range(), duration = r.to - r.from, previous = new URLSearchParams(p.toString()); previous.set('from', String(r.from - duration)); previous.set('to', String(r.from)); return previous; }
+    function previousParams(p) { var r = range(), duration = r.to - r.from, day = 86400000, days = Math.round(duration / day), start, previous = new URLSearchParams(p.toString()); start = (days >= 1 && Math.abs(duration - days * day) <= 2 * 3600000) ? r.from - days * day : r.from - duration; previous.set('from', String(start)); previous.set('to', String(r.from)); return previous; }
     function hasValue(object, key) { return !!object && object[key] !== null && object[key] !== undefined && isFinite(Number(object[key])); }
     function summaryRate(summary, key) { var requests = num(summary && summary.requests); return requests > 0 ? num(summary && summary[key]) / requests * 100 : null; }
     function summaryMetric(summary, key) { if (key === 'successRate') return summaryRate(summary, 'success'); if (key === 'errorRate') return summaryRate(summary, 'errors'); return hasValue(summary, key) ? num(summary[key]) : null; }
