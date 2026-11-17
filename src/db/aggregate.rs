@@ -279,12 +279,23 @@ async fn open_store(audit_path: &Path) -> Result<Arc<Db>, DbError> {
     Ok(db)
 }
 
-fn file_stamp(path: &Path) -> Option<(i64, i64)> {
+/// 文件指纹（大小 + mtime）。在 `spawn_blocking` 中调用：归档在 NFS 上时
+/// `metadata` 是同步 RPC，直接在 tokio worker 上调用会把执行线程卡住。
+fn file_stamp_sync(path: &Path) -> Option<(i64, i64)> {
     let metadata = fs::metadata(path).ok()?;
     let size = i64::try_from(metadata.len()).ok()?;
     let mtime = metadata.modified().ok()?;
     let mtime_ms = i64::try_from(mtime.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()?;
     Some((size, mtime_ms))
+}
+
+/// `file_stamp_sync` 的非阻塞包装。
+async fn file_stamp(path: &Path) -> Option<(i64, i64)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || file_stamp_sync(&path))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// 校验汇总是否与当前归档文件匹配。
@@ -295,7 +306,7 @@ async fn valid(
     min_ms: Option<i64>,
     max_ms: Option<i64>,
 ) -> bool {
-    let Some((size, mtime_ms)) = file_stamp(path) else {
+    let Some((size, mtime_ms)) = file_stamp(path).await else {
         return false;
     };
     let Ok(conn) = db.connect() else {
@@ -557,7 +568,7 @@ pub(crate) fn correction_windows(
     windows
 }
 
-fn file_identity(path: &Path) -> (i64, i64) {
+fn file_identity_sync(path: &Path) -> (i64, i64) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -566,6 +577,14 @@ fn file_identity(path: &Path) -> (i64, i64) {
         }
     }
     (0, 0)
+}
+
+/// `file_identity_sync` 的非阻塞包装（NFS 上的 `metadata` 是同步 RPC）。
+async fn file_identity(path: &Path) -> (i64, i64) {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || file_identity_sync(&path))
+        .await
+        .unwrap_or((0, 0))
 }
 
 async fn shard_rollup_rows(db: &Db, shard_id: &str) -> Result<i64, DbError> {
@@ -706,13 +725,19 @@ async fn clear_shard(db: &Db, shard_id: &str) -> Result<(), DbError> {
 
 async fn acquire_build_lock(audit_path: &Path) -> Result<std::fs::File, DbError> {
     let lock_path = PathBuf::from(format!("{}.lock", rollup_path(audit_path).display()));
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| DbError::Shape(format!("cannot open rollup lock: {error}")))?;
+    // 打开锁文件是同步 RPC（汇总库与审计库同在 NFS 上），放到阻塞线程池执行。
+    let open_path = lock_path.clone();
+    let lock = tokio::task::spawn_blocking(move || {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&open_path)
+    })
+    .await
+    .map_err(|error| DbError::Shape(format!("rollup lock task failed: {error}")))?
+    .map_err(|error| DbError::Shape(format!("cannot open rollup lock: {error}")))?;
     let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
     loop {
         match lock.try_lock() {
@@ -852,7 +877,7 @@ pub(crate) async fn ensure_active(
     let db = open_store(audit_path).await?;
     let _lock = acquire_build_lock(audit_path).await?;
     let max_id = max_record_id(store).await?;
-    let identity = file_identity(audit_path);
+    let identity = file_identity(audit_path).await;
     let state = active_state(&db, shard_id).await?;
     let mut last_id = state.as_ref().map(|state| state.last_id).unwrap_or(0);
     let mut max_time_ms = state.as_ref().map(|state| state.max_time_ms).unwrap_or(0);
@@ -1402,6 +1427,7 @@ async fn build(db: &Db, input: &BuildInput<'_>) -> Result<(i64, usize), DbError>
             .await?;
         }
         let (size, mtime_ms) = file_stamp(input.archive_path)
+            .await
             .ok_or_else(|| DbError::Shape("archive disappeared during rollup".to_string()))?;
         conn.execute(
             "INSERT INTO shard_meta (shard_id, path, size, mtime_ms, row_count, min_ms, max_ms, \

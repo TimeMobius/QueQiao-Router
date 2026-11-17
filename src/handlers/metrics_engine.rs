@@ -106,7 +106,7 @@ pub(super) async fn execute_queries(
     for (key, mut job) in jobs {
         job.metrics.sort_by_key(|metric| metric.alias());
         let sql = build_sql(&group_expression(&job.group), &job.metrics, &job.where_sql);
-        job.cache_key = archive_cache_key(&job, &sql);
+        job.cache_key = archive_cache_key(&job, &sql).await;
         if let Some(rows) = job.cache_key.as_deref().and_then(metrics_cache::get) {
             results.insert(key, rows);
             continue;
@@ -431,7 +431,10 @@ fn shard_is_complete(shard: &ShardInput, from: i64, to: i64, now: i64) -> bool {
             && shard.max_ms.is_some_and(|max| max <= to)
 }
 
-fn archive_cache_key(job: &Job, sql: &str) -> Option<String> {
+/// 归档缓存键：用文件指纹（大小 + mtime）区分内容。
+///
+/// `metadata` 在 NFS 上是同步 RPC，这里放到阻塞线程池，避免卡住 tokio worker。
+async fn archive_cache_key(job: &Job, sql: &str) -> Option<String> {
     if !job.full {
         return None;
     }
@@ -441,17 +444,22 @@ fn archive_cache_key(job: &Job, sql: &str) -> Option<String> {
             job.shard.active_month?, job.binds
         ));
     }
-    let path = job.shard.path.as_ref()?;
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()?
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?;
+    let path = job.shard.path.clone()?;
+    let (len, modified) = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || {
+            let metadata = std::fs::metadata(&path).ok()?;
+            let modified = metadata.modified().ok()?;
+            Some((metadata.len(), modified))
+        }
+    })
+    .await
+    .ok()??;
+    let modified = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
     Some(format!(
         "{}:{}:{}:{sql}:{:?}",
         path.display(),
-        metadata.len(),
+        len,
         modified.as_nanos(),
         job.binds
     ))

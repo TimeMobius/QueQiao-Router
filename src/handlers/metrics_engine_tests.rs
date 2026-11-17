@@ -240,9 +240,13 @@ async fn archive_cache_key_changes_when_file_changes() {
         to: 2,
         rollup_dim: None,
     };
-    let before = archive_cache_key(&job, "SELECT COUNT(*) FROM records").unwrap();
+    let before = archive_cache_key(&job, "SELECT COUNT(*) FROM records")
+        .await
+        .unwrap();
     std::fs::write(&path, b"changed and longer").unwrap();
-    let after = archive_cache_key(&job, "SELECT COUNT(*) FROM records").unwrap();
+    let after = archive_cache_key(&job, "SELECT COUNT(*) FROM records")
+        .await
+        .unwrap();
     assert_ne!(before, after);
     std::fs::remove_file(path).unwrap();
 }

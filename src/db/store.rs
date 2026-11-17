@@ -38,10 +38,21 @@ pub enum SchemaKind {
 
 /// Read-only schema probe. Never opens the file writable.
 pub async fn probe_schema(path: &Path) -> Result<SchemaKind, DbError> {
-    if !path.exists() {
+    // 存在性与大小的探测在 NFS 上是同步 RPC，放到阻塞线程池，避免卡住 tokio worker。
+    let probe_path = path.to_path_buf();
+    let (exists, empty) = tokio::task::spawn_blocking(move || {
+        let exists = probe_path.exists();
+        let empty = std::fs::metadata(&probe_path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false);
+        (exists, empty)
+    })
+    .await
+    .map_err(|error| DbError::Shape(format!("schema probe task failed: {error}")))?;
+    if !exists {
         return Ok(SchemaKind::Empty);
     }
-    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 {
+    if empty {
         return Ok(SchemaKind::Empty);
     }
     let db = Db::open(
@@ -125,29 +136,38 @@ impl AuditStore {
             vacuum: false,
             busy_timeout,
         };
-        if !read_only && path.exists() {
-            match probe_schema(&path).await? {
-                SchemaKind::Empty | SchemaKind::V8 => {}
-                SchemaKind::Legacy => {
-                    return Err(DbError::Shape(
-                        "legacy audit database; automatic startup migration is required"
-                            .to_string(),
-                    ))
-                }
-                SchemaKind::V7 => {
-                    return Err(DbError::Shape(
-                        "legacy v7 audit database; run --migrate-db before opening it".to_string(),
-                    ))
-                }
-                SchemaKind::Newer(version) => {
-                    return Err(DbError::Shape(format!(
-                        "audit schema v{version} is newer than this binary"
-                    )))
-                }
-                SchemaKind::Unknown => {
-                    return Err(DbError::Shape(
-                        "unrecognized audit schema; refusing to open writable".to_string(),
-                    ))
+        if !read_only {
+            let exists = {
+                let probe = path.clone();
+                tokio::task::spawn_blocking(move || probe.exists())
+                    .await
+                    .unwrap_or(true)
+            };
+            if exists {
+                match probe_schema(&path).await? {
+                    SchemaKind::Empty | SchemaKind::V8 => {}
+                    SchemaKind::Legacy => {
+                        return Err(DbError::Shape(
+                            "legacy audit database; automatic startup migration is required"
+                                .to_string(),
+                        ))
+                    }
+                    SchemaKind::V7 => {
+                        return Err(DbError::Shape(
+                            "legacy v7 audit database; run --migrate-db before opening it"
+                                .to_string(),
+                        ))
+                    }
+                    SchemaKind::Newer(version) => {
+                        return Err(DbError::Shape(format!(
+                            "audit schema v{version} is newer than this binary"
+                        )))
+                    }
+                    SchemaKind::Unknown => {
+                        return Err(DbError::Shape(
+                            "unrecognized audit schema; refusing to open writable".to_string(),
+                        ))
+                    }
                 }
             }
         }

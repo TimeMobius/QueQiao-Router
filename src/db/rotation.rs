@@ -91,7 +91,12 @@ pub async fn init_rotation_state(app_state: &Arc<AppState>) {
 /// 轮转动作；调用方必须已持有 db_rotation_lock。
 async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
     let db_path = resolve_db_path();
-    if !db_path.exists() {
+    // 存在性检查在 NFS 上是同步 RPC，放到阻塞线程池。
+    let probe = db_path.clone();
+    let db_exists = tokio::task::spawn_blocking(move || probe.exists())
+        .await
+        .unwrap_or(false);
+    if !db_exists {
         return;
     }
 
@@ -105,7 +110,13 @@ async fn rotate_locked(app_state: &Arc<AppState>, seal_yyyymm: i32) {
     );
 
     // 同名归档已存在时追加 unix 秒后缀，避免覆盖历史归档。
-    if archive_path.exists() {
+    let archive_exists = {
+        let probe = archive_path.clone();
+        tokio::task::spawn_blocking(move || probe.exists())
+            .await
+            .unwrap_or(false)
+    };
+    if archive_exists {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

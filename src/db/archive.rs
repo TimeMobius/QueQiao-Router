@@ -76,22 +76,29 @@ impl ArchiveRegistry {
     pub async fn ensure_scanned(&self) {
         let _guard = self.scan_lock.lock().await;
 
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(
-                    "archive scan: read_dir '{}' failed: {}",
-                    self.dir.display(),
-                    e
-                );
-                return;
-            }
+        // 目录枚举在 NFS 上是同步 RPC，放到阻塞线程池，避免卡住 tokio worker。
+        let read_result = {
+            let dir = self.dir.clone();
+            tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
+                match std::fs::read_dir(&dir) {
+                    Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+                    Err(error) => {
+                        warn!(
+                            "archive scan: read_dir '{}' failed: {}",
+                            dir.display(),
+                            error
+                        );
+                        Vec::new()
+                    }
+                }
+            })
+            .await
+            .unwrap_or_default()
         };
 
         let mut archive_stems: HashSet<String> = HashSet::new();
         let mut pending: Vec<(String, PathBuf)> = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in read_result {
             if path == self.active_path {
                 continue;
             }
@@ -355,7 +362,14 @@ fn archive_stem_for_path(path: &Path) -> Option<&str> {
 /// 以只读方式打开归档；缺少 `TimeMs` 的遗留库返回 `Ok(None)` 并告警。
 async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard>, DbError> {
     let journal_path = PathBuf::from(format!("{}-journal", path.display()));
-    if journal_path.exists() {
+    // 存在性检查与 journal 清理都是 NFS 同步 RPC，统一放到阻塞线程池。
+    let has_journal = {
+        let probe = journal_path.clone();
+        tokio::task::spawn_blocking(move || probe.exists())
+            .await
+            .unwrap_or(false)
+    };
+    if has_journal {
         // Legacy archives can carry a hot rollback journal. A writable open is
         // required on NFS to replay it; keep this on sqlx because the recovery
         // semantics (and journal removal) are part of the legacy format.
@@ -379,13 +393,25 @@ async fn open_archive_shard(path: &Path, id: &str) -> Result<Option<ArchiveShard
                 .fetch_optional(&mut *connection)
                 .await
                 .map_err(crate::db::map_sqlx_error)?;
-            if journal_path.exists() {
-                std::fs::remove_file(&journal_path).map_err(|error| {
-                    DbError::Shape(format!(
-                        "archive rollback journal cleanup failed for '{}': {error}",
-                        journal_path.display()
-                    ))
-                })?;
+            let journal_exists = {
+                let probe = journal_path.clone();
+                tokio::task::spawn_blocking(move || probe.exists())
+                    .await
+                    .unwrap_or(false)
+            };
+            if journal_exists {
+                let removal_path = journal_path.clone();
+                tokio::task::spawn_blocking(move || std::fs::remove_file(&removal_path))
+                    .await
+                    .map_err(|error| {
+                        DbError::Shape(format!("archive journal cleanup task failed: {error}"))
+                    })?
+                    .map_err(|error| {
+                        DbError::Shape(format!(
+                            "archive rollback journal cleanup failed for '{}': {error}",
+                            journal_path.display()
+                        ))
+                    })?;
             }
             sqlx::query("ROLLBACK")
                 .execute(&mut *connection)
