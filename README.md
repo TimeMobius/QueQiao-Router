@@ -138,6 +138,7 @@ docker run -d \
 | `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时跳过旧 SQLite 归档的自动升级；v8 归档照常查询 |
 | `ANALYSIS_ROLLUP` | 开启 | 历史分析读取 `audit_aggregates.db` 预聚合；设为 `off` 时全部走原始扫描（用于对照与排查） |
 | `ANALYSIS_ROLLUP_AT` | `04:00` | active 分片预聚合每日增量构建时刻（本地时区，`HH:MM`）；`off` 关闭。与 FTS 优化共用轮转锁串行执行 |
+| `ANALYSIS_ROLLUP_INTERVAL_SEC` | `300` | active 分片预聚合的周期增量构建间隔（秒，默认 5 分钟）；`0` 关闭。周期越短，分析查询需要回扫的“水位之后”数据越少 |
 
 ---
 
