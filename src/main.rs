@@ -178,33 +178,9 @@ fn main() {
             });
         }
 
-        // 分析预聚合：周期性增量补齐 active 分片（`ANALYSIS_ROLLUP_INTERVAL_SEC`，
-        // 默认 300s；0/off 关闭），让分析查询的“水位之后尾扫”始终只有几分钟数据；
-        // 夜间再用 `ANALYSIS_ROLLUP_AT` 做一次兜底补建。与 FTS 优化共用
-        // db_rotation_lock，避免同时读写审计库。
+        // 分析预聚合：默认每天本地凌晨（`ANALYSIS_ROLLUP_AT`，`off` 关闭）增量补齐
+        // active 分片；与 FTS 优化共用 db_rotation_lock，避免同时读写审计库。
         if db::rollup_enabled() {
-            let interval_sec = std::env::var("ANALYSIS_ROLLUP_INTERVAL_SEC")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(300);
-            if interval_sec > 0 {
-                tracing::info!(interval_sec, "active rollup periodic build enabled");
-                let rollup_state = app_state.clone();
-                tokio::spawn(async move {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(interval_sec));
-                    interval.tick().await; // 消费首次立即到期的 tick
-                    loop {
-                        interval.tick().await;
-                        let _lock = rollup_state.db_rotation_lock.lock().await;
-                        let store = rollup_state.active_db().await;
-                        db::warm_active_rollup(&store).await;
-                    }
-                });
-            } else {
-                tracing::info!("active rollup periodic build disabled");
-            }
-
             let rollup_at =
                 std::env::var("ANALYSIS_ROLLUP_AT").unwrap_or_else(|_| "04:00".to_string());
             if let Some((hour, minute)) = schedule::parse_hhmm(&rollup_at) {
