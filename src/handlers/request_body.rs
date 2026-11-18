@@ -392,6 +392,55 @@ mod tests {
         );
     }
 
+    // ---- 采样参数精度 ----
+
+    #[test]
+    fn chat_float_params_keep_client_precision() {
+        // 线上案例：temperature 0.7 曾因 f32 存储被改写成 0.699999988079071，
+        // 上游收到的 body 与 error.log 里的请求体都跟着变形。
+        // 这里走与真实入口一致的 simd-json 解析路径。
+        let mut raw = br#"{
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.2,
+            "repetition_penalty": 1.1
+        }"#
+        .to_vec();
+        let req: crate::models::requests::ChatCompletionRequest =
+            simd_json::from_slice(&mut raw).unwrap();
+        let payload = RequestPayload::Chat(req);
+
+        // 转发体：build_request_body_generic 重建后必须与客户端数值一致。
+        let body = build_request_body_generic(&payload, &test_client(), false);
+        assert_eq!(body["temperature"], json!(0.7));
+        assert_eq!(body["top_p"], json!(0.9));
+        assert_eq!(body["frequency_penalty"], json!(0.1));
+        assert_eq!(body["presence_penalty"], json!(0.2));
+        assert_eq!(body["repetition_penalty"], json!(1.1));
+
+        // 结构体自身序列化（审计/错误日志用）也不能变形。
+        let RequestPayload::Chat(inner) = &payload else {
+            unreachable!()
+        };
+        let logged = serde_json::to_value(inner).unwrap();
+        assert_eq!(logged["temperature"], json!(0.7));
+        assert_eq!(logged["repetition_penalty"], json!(1.1));
+    }
+
+    #[test]
+    fn completion_temperature_keeps_client_precision() {
+        let mut raw = br#"{"model": "m", "prompt": "hi", "temperature": 0.3}"#.to_vec();
+        let req: crate::models::requests::CompletionRequest =
+            simd_json::from_slice(&mut raw).unwrap();
+        let payload = RequestPayload::Completion(req);
+
+        let body = build_request_body_generic(&payload, &test_client(), false);
+        assert_eq!(body["temperature"], json!(0.3));
+    }
+
     #[test]
     fn chat_stream_options_not_duplicated() {
         // extra 里即使出现 stream_options，也必须被已知字段覆盖，不能并存两份。
@@ -704,10 +753,10 @@ mod tests {
 
         let body = build_request_body_generic(&payload, &client_config, false);
 
-        assert_eq!(body["top_p"], json!(0.37_f32));
-        assert_eq!(body["frequency_penalty"], json!(0.11_f32));
-        assert_eq!(body["presence_penalty"], json!(0.22_f32));
-        assert_eq!(body["repetition_penalty"], json!(1.15_f32));
+        assert_eq!(body["top_p"], json!(0.37));
+        assert_eq!(body["frequency_penalty"], json!(0.11));
+        assert_eq!(body["presence_penalty"], json!(0.22));
+        assert_eq!(body["repetition_penalty"], json!(1.15));
         assert_eq!(body["seed"], json!(42));
     }
 
