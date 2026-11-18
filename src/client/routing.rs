@@ -129,6 +129,14 @@ fn select_clients_by_least_connections(
     clients: Vec<ClientConfig>,
     active_counts: Option<&HashMap<String, i64>>,
 ) -> Vec<ClientConfig> {
+    select_clients_by_least_connections_with_rng(clients, active_counts, &mut rand::thread_rng())
+}
+
+fn select_clients_by_least_connections_with_rng(
+    clients: Vec<ClientConfig>,
+    active_counts: Option<&HashMap<String, i64>>,
+    rng: &mut impl Rng,
+) -> Vec<ClientConfig> {
     let empty_map = HashMap::new();
     let counts = active_counts.unwrap_or(&empty_map);
 
@@ -146,11 +154,9 @@ fn select_clients_by_least_connections(
         })
         .collect();
 
-    scored_clients.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.1.name.cmp(&a.1.name))
-    });
+    // 先打散，再按负载稳定排序：同负载（尤其全部空闲）时不固定偏向某个名字。
+    scored_clients.shuffle(rng);
+    scored_clients.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     scored_clients.into_iter().map(|(_, c)| c).collect()
 }
@@ -378,6 +384,25 @@ mod tests {
         assert_eq!(selected[1].name, "client2");
         // client1 has 50/10 = 5.0 -> third
         assert_eq!(selected[2].name, "client1");
+    }
+
+    #[test]
+    fn test_least_connections_breaks_idle_ties_without_name_bias() {
+        use rand::{rngs::StdRng, SeedableRng};
+        let clients = vec![
+            create_test_client("backend-1", 1),
+            create_test_client("backend-2", 1),
+            create_test_client("backend-fp8", 1),
+        ];
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut winners = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let ranked =
+                select_clients_by_least_connections_with_rng(clients.clone(), None, &mut rng);
+            assert_eq!(ranked.len(), clients.len());
+            winners.insert(ranked[0].name.clone());
+        }
+        assert_eq!(winners.len(), clients.len());
     }
 
     #[test]
