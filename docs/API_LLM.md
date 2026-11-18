@@ -80,6 +80,13 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 | 结构化输出 | `response_format`、`json_schema` |
 | 缓存/路由 | `prompt_cache_key`、`prompt_cache_retention`、`metadata`、`user` |
 
+嵌套结构同样透传：`messages[]` 的未声明字段（如 `name`）与 `messages[].content[]` 中每个
+part 的未声明字段都会原样保留。多模态 part 的形态远多于 `text` / `image_url`：
+`video_url`、`input_audio`、`video`、`cache_control` 等。历史上 `ContentPart` 是逐字段定义的，
+serde 会把未声明字段**静默丢弃**，于是带 `video_url.url` 的视频请求到了上游只剩
+`{"type":"video_url"}`，上游报 `video_url Field required`，错误日志里的请求体也看不到 `url`。
+现已由 `ContentPart::extra` / `Message::extra` 兜住，不再改写这几层结构。
+
 **网关保留最终决定权的字段**（客户端无法经未知字段绕过）：
 
 - `model` —— 若配置了 `model_rewrite`，改写发生在重建之后，是最终值；

@@ -10,6 +10,15 @@ pub struct ContentPart {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<Value>,
+    /// 未在结构体中声明的 part 字段，原样透传给上游。
+    ///
+    /// 与顶层请求体同理：多模态生态里的 part 形态远超 `text` / `image_url`
+    /// （`video_url`、`input_audio`、`video`、`cache_control`…），逐字段声明必然滞后，
+    /// 而 serde 默认**静默丢弃**未声明字段。丢 `video_url.url` 会让上游直接报
+    /// `video_url Field required`（错误日志里也只剩 `{"type":"video_url"}`），
+    /// 排查成本极高，因此这里必须兜住。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -153,6 +162,11 @@ pub struct Message {
     pub tool_calls: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 未在结构体中声明的 message 字段，原样透传给上游（如 `name`、
+    /// 以及后续协议新增的 message 级扩展）。理由见 `ContentPart::extra`：
+    /// serde 静默丢弃未声明字段是线上最隐蔽的一类“请求被改写”。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

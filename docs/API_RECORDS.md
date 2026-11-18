@@ -177,6 +177,17 @@ v8 归档不受影响。无法解析的时间戳保留为 NULL 隔离，并被�
 | `error_truncated` / `error_bytes` | 是否发生截断 / 截断前的原始字节数（未截断时为 `false`/`null`） |
 | `request_body` | 请求体（`http_error` 且日志行带请求体时） |
 
+> `request_body` **不是客户端发来的原始字节流**，而是网关解析请求后重建的请求体
+> （`build_request_body_generic` 的产物，与真正转发给上游的内容一致）：
+>
+> - 字段顺序按重建顺序输出（`messages` / `model` / `stream` …），与客户端原始 JSON 的顺序无关；
+> - 未配置的已知字段被省略，`model` 若命中 `model_rewrite` 则记录**改写后**的上游名；
+> - 单个字符串超过 500 字符会被截断为 `...[TRUNCATED]`，数组超过 10 项会截断并标注总项数
+>   （见 `handlers::log_utils::truncate_json`），因此长 base64 data URL 在日志里看不到完整内容。
+>
+> 因为日志体反映的是“网关实际转发的内容”，它适合定位网关链路问题；要确认客户端**原始**
+> payload，请在客户端侧抓包或自行记录请求体。
+
 某字段为 `null` 表示该行不含此信息，不是错误。`nextBefore` 为 `null` 表示已到文件开头。
 
 ---

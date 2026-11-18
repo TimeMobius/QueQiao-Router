@@ -341,6 +341,57 @@ mod tests {
         assert_eq!(body["stream"], json!(true));
     }
 
+    // ---- 多模态 content part 的字段透传 ----
+
+    #[test]
+    fn chat_preserves_video_part_url() {
+        // 线上故障复现：客户端发 `{"type":"video_url","video_url":{"url":...}}`，
+        // 网关按 ContentPart 重建 messages 时只留下 type → 上游 pydantic 报
+        // `video_url Field required`，错误日志里的请求体也只剩 {"type":"video_url"}。
+        let payload = chat_payload(json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请帮我描述视频中内容"},
+                    {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+                ]
+            }]
+        }));
+        let body = build_request_body_generic(&payload, &test_client(), false);
+
+        assert_eq!(
+            body["messages"][0]["content"][1],
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}})
+        );
+    }
+
+    #[test]
+    fn chat_preserves_unknown_part_fields() {
+        // input_audio / video 等 OpenAI 生态新 part，以及 image_url 之外的自定义键，
+        // 都不在 ContentPart 的声明里，必须原样透传。
+        let payload = chat_payload(json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAA", "format": "wav"}},
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        }));
+        let body = build_request_body_generic(&payload, &test_client(), false);
+
+        assert_eq!(
+            body["messages"][0]["content"][0],
+            json!({"type": "input_audio", "input_audio": {"data": "AAA", "format": "wav"}})
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
     #[test]
     fn chat_stream_options_not_duplicated() {
         // extra 里即使出现 stream_options，也必须被已知字段覆盖，不能并存两份。

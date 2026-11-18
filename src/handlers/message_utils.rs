@@ -101,6 +101,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            extra: Default::default(),
         }
     }
 
@@ -175,6 +176,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(json!([{"id": "call_123"}])),
             tool_call_id: None,
+            extra: Default::default(),
         }];
 
         let result = filter_empty_messages(messages);
@@ -190,6 +192,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(json!([{"id": "call_123"}])),
             tool_call_id: None,
+            extra: Default::default(),
         }];
 
         let result = filter_empty_messages(messages);
@@ -205,6 +208,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            extra: Default::default(),
         }];
 
         let result = filter_empty_messages(messages);
@@ -222,6 +226,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Some(json!([{"id": "call_1", "type": "function"}])),
                 tool_call_id: None,
+                extra: Default::default(),
             },
         ];
 
@@ -242,6 +247,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            extra: Default::default(),
         }];
 
         let result = remove_think_tags(messages);
@@ -262,6 +268,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            extra: Default::default(),
         }];
 
         let result = remove_think_tags(messages);

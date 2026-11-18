@@ -677,6 +677,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
+            extra: Default::default(),
         }
     }
 
