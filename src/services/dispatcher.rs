@@ -142,7 +142,7 @@ impl DispatcherService {
     async fn resolve_clients(
         &self,
         model_name: &str,
-        routing_keys: &Option<Vec<(String, usize)>>,
+        routing_keys: &Option<Vec<(String, usize, usize)>>,
         endpoint: Option<&str>,
     ) -> Result<Vec<ClientConfig>, AppError> {
         let config_guard = self.config_manager.get_config_guard().await;
@@ -183,7 +183,7 @@ impl DispatcherService {
     pub async fn execute<F, Fut>(
         &self,
         initial_model: &str,
-        routing_keys: Option<Vec<(String, usize)>>,
+        routing_keys: Option<Vec<(String, usize, usize)>>,
         endpoint: Option<&str>,
         request_callback: F,
     ) -> Response

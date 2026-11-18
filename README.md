@@ -28,7 +28,7 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
 ### 🔀 智能流量调度
 - **多策略路由**: 支持关键字匹配 (`keyword`) 和精确匹配 (`exact`)。
 - **三种负载均衡策略**:
-  - **Deterministic**（默认）: 基于内容的 **Multi-Anchor Voting (Rendezvous Hashing)** 算法。相同的提示词（Prompt）永远路由到同一后端，显著提升 **KV Cache 命中率**。集成 **Efraimidis-Spirakis** 加权采样，确保长期流量分布严格遵循 `priority` 权重比例。
+  - **Deterministic**（默认）: 基于内容的 **Multi-Anchor Voting (Rendezvous Hashing)** 算法。相同的提示词（Prompt）永远路由到同一后端，显著提升 **KV Cache 命中率**。每条 `role=user` 消息是一个锚点（前 64 字符做哈希、字节长度作票权），并叠加**轮次几何衰减**：每往回一轮票权乘以 `0.85`（约 4 轮半衰期），越近的轮次影响越大，避免首轮或早期长消息把整条会话永久锁死。集成 **Efraimidis-Spirakis** 加权采样，确保长期流量分布严格遵循 `priority` 权重比例。
   - **Random**: 纯加权随机路由，无状态调度。
   - **LeastConnections**: 加权最少连接路由，实时读取活跃请求数（Prometheus gauge），将新请求调度至当前负载最低的后端。
 - **自动故障转移 (Failover)**: 当前端客户端返回 5xx 错误或网络错误时，自动并发尝试后续客户端（多后端场景）；若所有后端均失败且配置了 `fallback`，则切换至指定的后备模型。

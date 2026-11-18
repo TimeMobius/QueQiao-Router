@@ -64,8 +64,12 @@ Request
 
 - **职责**：路由匹配、负载均衡排序、熔断、**故障转移循环**与 fallback 模型切换。
 - **负载均衡**：`deterministic`（默认）使用按 `priority` 加权的多锚点 Rendezvous Hashing，
-  相同 routing key 稳定命中同一后端以提升 KV Cache 命中率；请求未提供 `routing_keys` 时
-  自动回退 `random`（Efraimidis–Spirakis 加权采样）；`least_connections` 按实时活跃请求数选择。
+  相同 routing key 稳定命中同一后端以提升 KV Cache 命中率。每条 `role=user` 消息是一个锚点
+  （文本前 64 字符做哈希，完整 UTF-8 字节长度作基础票权），并叠加**轮次几何衰减**：
+  每往回一轮票权乘以固定系数 `0.85`（约 4.3 轮半衰期），让最近几轮对路由的影响更大，
+  避免首轮或早期长消息把整条会话永久锁死；最新一轮的 `turns_after = 0`，权重不被打折。
+  请求未提供 `routing_keys` 时自动回退 `random`（Efraimidis–Spirakis 加权采样）；
+  `least_connections` 按实时活跃请求数选择。
 - **熔断与 4xx 语义**：只有 **429** 计入后端故障；401/403/404 会尝试下一个后端（别的后端可能
   有权限或支持该模型），但不冷却后端；其余 4xx（400/422/413）是请求本身的问题，直接透传。
   5xx 与网络错误进入故障转移链。

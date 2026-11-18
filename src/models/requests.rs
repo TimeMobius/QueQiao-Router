@@ -99,9 +99,16 @@ impl RequestPayload {
         }
     }
 
-    /// 提取用于路由决策的特征键值对 (key_content, weight)
+    /// 提取用于路由决策的特征键值对 (key_content, length_bytes, turns_after)
+    ///
+    /// - `key_content`：消息文本前 64 个字符，作为哈希锚点（按字符而非字节截断，
+    ///   避免把多字节字符切坏）；
+    /// - `length_bytes`：该条消息完整文本的 UTF-8 字节长度，作为基础票权；
+    /// - `turns_after`：其后还有多少条 user 消息（最新一轮为 0），供确定性路由
+    ///   做轮次几何衰减（每往回一轮票权乘以固定系数）。
+    ///
     /// 返回 None 表示不使用确定性路由，回退到随机模式。
-    pub fn get_routing_keys(&self) -> Option<Vec<(String, usize)>> {
+    pub fn get_routing_keys(&self) -> Option<Vec<(String, usize, usize)>> {
         match self {
             RequestPayload::Chat(p) => {
                 let mut keys = Vec::new();
@@ -118,10 +125,8 @@ impl RequestPayload {
                             };
 
                             if !text.is_empty() {
-                                // 提取前 64 个字符作为哈希锚点，完整长度作为权重
                                 let key = text.chars().take(64).collect::<String>();
-                                let weight = text.len();
-                                keys.push((key, weight));
+                                keys.push((key, text.len()));
                             }
                         }
                     }
@@ -129,14 +134,19 @@ impl RequestPayload {
                 if keys.is_empty() {
                     None
                 } else {
-                    Some(keys)
+                    let n = keys.len();
+                    Some(
+                        keys.into_iter()
+                            .enumerate()
+                            .map(|(i, (key, length_bytes))| (key, length_bytes, n - 1 - i))
+                            .collect(),
+                    )
                 }
             }
             RequestPayload::Completion(p) => {
                 if !p.prompt.is_empty() {
                     let key = p.prompt.chars().take(64).collect::<String>();
-                    let weight = p.prompt.len();
-                    Some(vec![(key, weight)])
+                    Some(vec![(key, p.prompt.len(), 0)])
                 } else {
                     None
                 }
@@ -578,5 +588,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.state.as_array().map(|a| a.len()), Some(2));
+    }
+
+    // -------------------------------------------------------------------------
+    // RequestPayload::get_routing_keys tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_routing_keys_include_turn_distance_and_bytes() {
+        let payload: RequestPayload = RequestPayload::Chat(
+            serde_json::from_str(
+                r#"{
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "system", "content": "sys"},
+                        {"role": "user", "content": "first user turn"},
+                        {"role": "assistant", "content": "ok"},
+                        {"role": "user", "content": [{"type": "text", "text": "second 用户轮次"}]}
+                    ]
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        let keys = payload
+            .get_routing_keys()
+            .expect("chat 请求应参与确定性路由");
+        assert_eq!(keys.len(), 2);
+        // 旧轮在前，turns_after = 1；最新一轮 turns_after = 0；票权用完整字节长度
+        assert_eq!(keys[0].0, "first user turn");
+        assert_eq!(keys[0].1, "first user turn".len());
+        assert_eq!(keys[0].2, 1);
+        assert_eq!(keys[1].0, "second 用户轮次");
+        assert_eq!(keys[1].1, "second 用户轮次".len());
+        assert_eq!(keys[1].2, 0);
+    }
+
+    #[test]
+    fn test_chat_routing_key_truncates_to_64_chars_not_bytes() {
+        let long_text = "中".repeat(80);
+        let expected_bytes = long_text.len();
+
+        let payload: RequestPayload = RequestPayload::Chat(
+            serde_json::from_str(
+                &serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": long_text}]
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+
+        let keys = payload.get_routing_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0.chars().count(), 64);
+        // 锚点按字符截断，票权仍取完整文本的 UTF-8 字节数
+        assert_eq!(keys[0].1, expected_bytes);
+        assert_eq!(keys[0].2, 0);
+    }
+
+    #[test]
+    fn test_completion_routing_key_single_turn() {
+        let payload: RequestPayload = RequestPayload::Completion(
+            serde_json::from_str(r#"{"model": "test-model", "prompt": "hello completion"}"#)
+                .unwrap(),
+        );
+
+        let keys = payload.get_routing_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "hello completion");
+        assert_eq!(keys[0].1, "hello completion".len());
+        assert_eq!(keys[0].2, 0);
     }
 }
