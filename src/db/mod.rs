@@ -170,3 +170,7 @@ mod tests {
 
 #[cfg(test)]
 mod migration_tests;
+
+#[cfg(test)]
+#[path = "next_id_plan_tests.rs"]
+mod next_id_plan_tests;

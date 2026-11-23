@@ -39,6 +39,11 @@ pub struct AuditItem {
     pub headers: Compressed,
 }
 
+/// A resolved id lookup should take single-digit milliseconds on any sane
+/// audit database; crossing this threshold means the query regressed into a
+/// scan and startup is about to stall.
+const SLOW_NEXT_ID_MS: u64 = 1_000;
+
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
     pub batch_size: usize,
@@ -128,7 +133,27 @@ pub struct AuditWriter {
 
 impl AuditWriter {
     pub async fn start(store: Arc<AuditStore>, cfg: WriterConfig) -> Result<Arc<Self>, DbError> {
+        // This is the only I/O on the startup path that scales with the audit
+        // history, so time it: a regression here used to hide behind a single
+        // "writer initialized" line printed minutes later.
+        let started = Instant::now();
         let next_id = next_id(&store).await?;
+        let next_id_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if next_id_ms >= SLOW_NEXT_ID_MS {
+            tracing::warn!(
+                elapsed_ms = next_id_ms,
+                next_id,
+                "audit writer id lookup is slow; `records` is probably being scanned instead of \
+                 read through the rowid index"
+            );
+        } else {
+            tracing::info!(
+                elapsed_ms = next_id_ms,
+                next_id,
+                "audit writer id lookup resolved"
+            );
+        }
+
         let (data_tx, data_rx) = mpsc::channel(cfg.queue_capacity);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(32);
         let stats = Arc::new(WriterStats::default());
@@ -142,6 +167,10 @@ impl AuditWriter {
             task_stats,
             task_cfg,
         ));
+        tracing::info!(
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "audit writer task started"
+        );
         Ok(Arc::new(Self {
             data_tx,
             ctrl_tx,
@@ -229,14 +258,37 @@ impl AuditWriter {
     }
 }
 
+/// The id lookup statement. Kept as a named constant so
+/// `db::next_id_plan_tests` can `EXPLAIN` the exact SQL this module runs;
+/// asserting on the compiled plan is what stops a future edit from silently
+/// reintroducing the full scan.
+///
+/// The natural formulation, `SELECT COALESCE(MAX(id), 0) + 1 FROM records`,
+/// looks like an O(1) rowid lookup but is not one. Wrapping `MAX(id)` in an
+/// expression defeats the min/max rowid optimization, so Turso compiles it to
+/// `Rewind` → `AggStep(max)` → `Next`: a full scan of `records`. On the
+/// production audit database (41 GB, ~10.5M pages, NFS-backed) that single
+/// query blocked startup for ~620 s before the listener ever bound.
+///
+/// This form compiles to `Last` → `RowId` → `ResultRow`/`Prev` on the rowid
+/// B-tree and reads a single page, so startup no longer scales with the size
+/// of the audit history.
+pub(crate) const NEXT_ID_SQL: &str = "SELECT id FROM records ORDER BY id DESC LIMIT 1";
+
 async fn next_id(store: &AuditStore) -> Result<i64, DbError> {
-    let row = store
-        .query_one(
-            "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM records",
-            Vec::new(),
-        )
-        .await?;
-    Ok(row.map(|row| row.get_i64(0).unwrap_or(1)).unwrap_or(1))
+    let row = store.query_one(NEXT_ID_SQL, Vec::new()).await?;
+    // Empty table (fresh shard after rotation) starts at 1; otherwise continue
+    // right after the highest id.
+    match row {
+        Some(row) => Ok(row.get_i64(0)? + 1),
+        None => Ok(1),
+    }
+}
+
+/// Exercise the real id lookup from tests in sibling modules.
+#[cfg(test)]
+pub(crate) async fn next_id_for_test(store: &AuditStore) -> Result<i64, DbError> {
+    next_id(store).await
 }
 
 async fn run(
