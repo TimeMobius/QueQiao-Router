@@ -6,6 +6,7 @@ use axum::{
 use futures::future::join_all;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use std::{sync::Arc, time::Duration};
 
 use crate::config::types::ClientConfig;
@@ -25,6 +26,39 @@ const LEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(35);
 /// failed, so follow-up requests serve the stale value quickly and retry
 /// upstream at most every 30 seconds.
 const STALE_RETRY_TTL: Duration = Duration::from_secs(30);
+
+/// Short TTL used for a *successful but empty* aggregation.
+///
+/// An empty list is a legitimate response (an upstream may genuinely serve no
+/// models), but it must never be cached for the full TTL: a backend that is
+/// restarting, rate limiting its model-list endpoint, or temporarily returning
+/// `{"data":[]}` would otherwise blank every client's model picker for up to
+/// ten minutes after it recovered. A short TTL keeps the serving cost bounded
+/// while letting the list reappear within seconds.
+const EMPTY_RESULT_TTL: Duration = Duration::from_secs(30);
+
+/// Shared HTTP client for upstream `/models` probes.
+///
+/// The timeout is part of the client. Building one client per request only
+/// re-created TLS configuration and an empty connection pool every time.
+fn models_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(MODELS_FETCH_TIMEOUT)
+            .build()
+            .expect("Failed to build HTTP client")
+    })
+}
+
+/// Whether an aggregated `/models` body contains no model entries.
+fn is_empty_model_list(value: &Value) -> bool {
+    value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .map(|models| models.is_empty())
+        .unwrap_or(true)
+}
 
 /// 上游返回的模型 id 是否应对外暴露。
 ///
@@ -249,12 +283,6 @@ pub async fn list_models(
         extract_credential_bytes(&headers).and_then(|bytes| String::from_utf8(bytes).ok());
     let api_keys = resolve_upstream_api_keys(&config.openai_clients, client_credential.as_deref());
 
-    let build_http_client = || {
-        Client::builder()
-            .timeout(MODELS_FETCH_TIMEOUT)
-            .build()
-            .expect("Failed to build HTTP client")
-    };
     let upstream_error_body = || {
         Json(crate::app_error::build_error_body(
             "failed to fetch model list from all upstreams",
@@ -263,9 +291,9 @@ pub async fn list_models(
     };
 
     if ttl_seconds == 0 {
-        let http_client = build_http_client();
+        let http_client = models_http_client();
         let (aggregated, any_success) =
-            aggregate_models(&config.openai_clients, &http_client, &api_keys).await;
+            aggregate_models(&config.openai_clients, http_client, &api_keys).await;
         return if any_success {
             (StatusCode::OK, Json(aggregated))
         } else {
@@ -309,16 +337,37 @@ pub async fn list_models(
     let cache = app_state.models_cache.clone();
     let guard = cache.refresh_guard(key, inflight);
     let clients = config.openai_clients.clone();
-    let http_client = build_http_client();
+    let http_client = models_http_client();
     let refresh_keys = api_keys.clone();
     let ttl = Duration::from_secs(ttl_seconds);
 
     let refresh: tokio::task::JoinHandle<Result<Value, ()>> = tokio::spawn(async move {
         let _guard = guard;
         let (aggregated, any_success) =
-            aggregate_models(&clients, &http_client, &refresh_keys).await;
+            aggregate_models(&clients, http_client, &refresh_keys).await;
 
         if any_success {
+            if is_empty_model_list(&aggregated) {
+                // Successful but empty: a backend may be restarting, rate
+                // limiting its model-list endpoint, or filtering everything
+                // out. Do not pin that emptiness for the full TTL — serve the
+                // last non-empty value when we have one, and otherwise let the
+                // next request retry upstream shortly.
+                tracing::warn!(
+                    generation,
+                    empty_ttl_secs = EMPTY_RESULT_TTL.as_secs(),
+                    configured_ttl_secs = ttl_seconds,
+                    "upstream /v1/models aggregation is empty; caching it only briefly"
+                );
+                if let Some(previous) = cache.previous_value(key) {
+                    if !is_empty_model_list(&previous) {
+                        cache.insert(key, previous.clone(), STALE_RETRY_TTL);
+                        return Ok(previous);
+                    }
+                }
+                cache.insert(key, aggregated.clone(), EMPTY_RESULT_TTL);
+                return Ok(aggregated);
+            }
             cache.insert(key, aggregated.clone(), ttl);
             return Ok(aggregated);
         }
@@ -508,6 +557,15 @@ mod tests {
             encode_effective_keys(&none_vs_empty),
             encode_effective_keys(&[Some(String::new())])
         );
+    }
+
+    #[test]
+    fn empty_aggregation_is_detected() {
+        assert!(is_empty_model_list(&json!({"object": "list", "data": []})));
+        assert!(is_empty_model_list(&json!({"object": "list"})));
+        assert!(!is_empty_model_list(
+            &json!({"object": "list", "data": [{"id": "m"}]})
+        ));
     }
 
     #[test]

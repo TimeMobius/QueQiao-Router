@@ -9,7 +9,7 @@ use crate::models::AccessLogMeta;
 use crate::services::circuit_breaker::{AttemptPermission, CircuitBreakerRegistry};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -88,6 +88,70 @@ pub struct DispatcherService {
 
 fn select_fallback_model(clients: &[ClientConfig]) -> Option<String> {
     clients.iter().find_map(|client| client.fallback.clone())
+}
+
+/// Safety cap on the number of models a single request may fall back through.
+///
+/// A well-formed configuration uses at most one hop. Chains deeper than this
+/// are almost always a misconfiguration (usually a cycle), and every hop costs
+/// a full upstream attempt before the request can even fail.
+const MAX_FALLBACK_HOPS: usize = 5;
+
+/// Result of proposing one fallback hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackDecision {
+    /// The target model has not been visited yet: follow it.
+    Follow,
+    /// The target model was already visited: the config contains a cycle.
+    Cycle,
+    /// The chain grew past [`MAX_FALLBACK_HOPS`].
+    TooManyHops,
+}
+
+/// Tracks which models a request has already fallen back to.
+///
+/// Model names are the routing identity here: each hop re-resolves the client
+/// list for `current_model`, so a repeated model would re-run the exact same
+/// upstream attempts. Without this guard a two-step cycle
+/// (`model-a -> model-b -> model-a`) loops forever, hammering the upstreams,
+/// growing `all_tried_clients` without bound and emitting a log line per hop.
+#[derive(Debug)]
+struct FallbackChain {
+    visited: HashSet<String>,
+}
+
+impl FallbackChain {
+    fn new(initial_model: &str) -> Self {
+        let mut visited = HashSet::new();
+        visited.insert(initial_model.to_string());
+        Self { visited }
+    }
+
+    fn advance(&mut self, fallback_model: &str) -> FallbackDecision {
+        if self.visited.contains(fallback_model) {
+            return FallbackDecision::Cycle;
+        }
+        if self.visited.len() >= MAX_FALLBACK_HOPS {
+            return FallbackDecision::TooManyHops;
+        }
+        self.visited.insert(fallback_model.to_string());
+        FallbackDecision::Follow
+    }
+}
+
+/// Terminal 500 for a fallback chain we refuse to keep following.
+fn fallback_abort_response(model: &str, tried: &[String], message: String) -> Response {
+    let mut response = AppError::InternalServerError(message.clone()).into_response();
+    response.extensions_mut().insert(AccessLogMeta {
+        model: model.to_string(),
+        backend: tried
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string()),
+        error: Some(message),
+        request_body: None,
+    });
+    response
 }
 
 impl DispatcherService {
@@ -196,6 +260,7 @@ impl DispatcherService {
         let cb = Arc::new(Mutex::new(request_callback));
         let mut current_model = initial_model.to_string();
         let mut all_tried_clients = Vec::new();
+        let mut fallback_chain = FallbackChain::new(&current_model);
 
         loop {
             let clients = match self
@@ -245,14 +310,44 @@ impl DispatcherService {
 
                 // 触发了 Fallback
                 Err(Some(fallback_model)) => {
-                    info!(
-                        "All clients for model '{}' failed or triggered fallback. Switching to fallback model: '{}'",
-                        current_model, fallback_model
-                    );
-                    // Record failover event
-                    FAILOVER_TOTAL.with_label_values(&[&current_model]).inc();
-                    current_model = fallback_model;
-                    continue;
+                    match fallback_chain.advance(&fallback_model) {
+                        FallbackDecision::Follow => {
+                            info!(
+                                "All clients for model '{}' failed or triggered fallback. Switching to fallback model: '{}'",
+                                current_model, fallback_model
+                            );
+                            // Record failover event
+                            FAILOVER_TOTAL.with_label_values(&[&current_model]).inc();
+                            current_model = fallback_model;
+                            continue;
+                        }
+                        FallbackDecision::Cycle => {
+                            let error_message = format!(
+                                "Fallback cycle detected: model '{}' would fall back to '{}' again. \
+                                 Refusing to loop. Tried clients: {:?}",
+                                current_model, fallback_model, all_tried_clients
+                            );
+                            warn!("{}", error_message);
+                            return fallback_abort_response(
+                                &current_model,
+                                &all_tried_clients,
+                                error_message,
+                            );
+                        }
+                        FallbackDecision::TooManyHops => {
+                            let error_message = format!(
+                                "Fallback chain exceeded {MAX_FALLBACK_HOPS} hops at model '{}' \
+                                 (next would be '{}'). Refusing to continue. Tried clients: {:?}",
+                                current_model, fallback_model, all_tried_clients
+                            );
+                            warn!("{}", error_message);
+                            return fallback_abort_response(
+                                &current_model,
+                                &all_tried_clients,
+                                error_message,
+                            );
+                        }
+                    }
                 }
 
                 // 所有尝试都失败，且没有 Fallback
@@ -262,21 +357,11 @@ impl DispatcherService {
                         current_model, all_tried_clients
                     );
                     warn!("{}", error_message);
-
-                    let mut response =
-                        AppError::InternalServerError(error_message.clone()).into_response();
-
-                    // 尝试注入错误日志元数据
-                    response.extensions_mut().insert(AccessLogMeta {
-                        model: current_model.clone(),
-                        backend: all_tried_clients
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        error: Some(error_message),
-                        request_body: None,
-                    });
-                    return response;
+                    return fallback_abort_response(
+                        &current_model,
+                        &all_tried_clients,
+                        error_message,
+                    );
                 }
             }
         }
@@ -533,6 +618,39 @@ mod tests {
         let clients = vec![client_with_fallback(None), client_with_fallback(None)];
 
         assert_eq!(select_fallback_model(&clients), None);
+    }
+
+    #[test]
+    fn fallback_chain_follows_unvisited_models() {
+        let mut chain = FallbackChain::new("primary");
+        assert_eq!(chain.advance("backup"), FallbackDecision::Follow);
+        assert_eq!(chain.advance("tertiary"), FallbackDecision::Follow);
+    }
+
+    #[test]
+    fn fallback_chain_detects_two_step_cycle() {
+        // a -> b -> a used to loop forever: each hop re-resolved the same
+        // client list and re-ran the same failing upstream attempts.
+        let mut chain = FallbackChain::new("a");
+        assert_eq!(chain.advance("b"), FallbackDecision::Follow);
+        assert_eq!(chain.advance("a"), FallbackDecision::Cycle);
+    }
+
+    #[test]
+    fn fallback_chain_caps_chain_length() {
+        let mut chain = FallbackChain::new("m0");
+        for index in 1..MAX_FALLBACK_HOPS {
+            assert_eq!(
+                chain.advance(&format!("m{index}")),
+                FallbackDecision::Follow,
+                "hop {index} is within the cap"
+            );
+        }
+        assert_eq!(
+            chain.advance("beyond-cap"),
+            FallbackDecision::TooManyHops,
+            "a chain longer than {MAX_FALLBACK_HOPS} models must be refused"
+        );
     }
 
     #[test]

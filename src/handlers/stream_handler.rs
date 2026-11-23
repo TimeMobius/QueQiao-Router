@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, Level};
 
@@ -39,6 +39,55 @@ use tracing::{debug, error, Level};
 const STREAM_UPSTREAM_ERROR_SENTINEL: &str = "\u{0}__STREAM_UPSTREAM_ERROR__\u{0}";
 const DEBUG_RAW_BODY_TAIL_LIMIT: usize = 16 * 1024;
 type RawBodyTail = Arc<Mutex<Vec<u8>>>;
+
+/// Default maximum silence from the upstream SSE body.
+///
+/// The 60s TTFB timeout in `client/proxy.rs` only covers the response headers;
+/// once a stream is established an upstream that stops sending bytes (but
+/// keeps the connection open) would hold the client until the 30-minute
+/// global HTTP timeout. 300s is far above any normal inter-token gap while
+/// still converting a dead stream into a visible error chunk.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SEC: u64 = 300;
+
+/// SSE idle timeout from `STREAM_IDLE_TIMEOUT_SEC`; `0` disables it.
+fn stream_idle_timeout() -> Option<Duration> {
+    let seconds = std::env::var("STREAM_IDLE_TIMEOUT_SEC")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SEC);
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+/// Boxed upstream byte stream with one timeout budget per received chunk.
+type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+/// Turn a stalled-byte gap into a regular stream error.
+///
+/// `eventsource-stream` and the SSE handler already know how to surface a
+/// stream error as an `upstream stream interrupted` chunk and an audit row;
+/// this adapter only supplies the deadline.
+fn idle_guarded_body_stream<S>(stream: S, idle: Option<Duration>) -> UpstreamByteStream
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    let map_error = |error: reqwest::Error| std::io::Error::new(std::io::ErrorKind::Other, error);
+    match idle {
+        Some(idle) => Box::pin(futures::StreamExt::map(
+            tokio_stream::StreamExt::timeout(stream, idle),
+            move |item| match item {
+                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Err(error)) => Err(map_error(error)),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("upstream sent no SSE data for {idle:?}"),
+                )),
+            },
+        )),
+        None => Box::pin(futures::StreamExt::map(stream, move |item| {
+            item.map_err(map_error)
+        })),
+    }
+}
 
 /// 流式请求的最终结局。上游读取由下游驱动：客户端断开时整条上游流被 drop，
 /// 既无 `None` 也无 `Err`，结局停在 `RUNNING`，由 logger 判定为客户端中断。
@@ -696,8 +745,10 @@ pub async fn process_streaming_response(
 
         return Ok(resp);
     }
-    let (stream, raw_body_tail) =
-        make_upstream_body_stream(response.bytes_stream(), tracing::enabled!(Level::DEBUG));
+    let (stream, raw_body_tail) = make_upstream_body_stream(
+        idle_guarded_body_stream(response.bytes_stream(), stream_idle_timeout()),
+        tracing::enabled!(Level::DEBUG),
+    );
     let special_prefix = client_config.special_prefix.clone().unwrap_or_default();
     let mut prefix_applied = false;
 
@@ -1016,6 +1067,24 @@ fn is_chat_completion_ping(event: &UpstreamEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_guarded_body_stream_reports_timeout() {
+        let silent = futures::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            b"data: hi\n\n",
+        ))])
+        .chain(futures::stream::pending::<Result<Bytes, reqwest::Error>>());
+        let mut guarded = idle_guarded_body_stream(silent, Some(Duration::from_millis(20)));
+
+        assert!(guarded.next().await.expect("first chunk").is_ok());
+        let next = tokio::time::timeout(Duration::from_secs(2), guarded.next())
+            .await
+            .expect("the idle guard must fire instead of waiting forever");
+        match next {
+            Some(Err(error)) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected an idle-timeout error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn marker_detects_empty_choices_variants() {

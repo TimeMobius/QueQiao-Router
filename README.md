@@ -135,6 +135,7 @@ docker run -d \
 | `RUST_LOG` | `info` | 日志级别 (`error`, `warn`, `info`, `debug`, `trace`) |
 | `TZ` | 镜像默认（通常为 UTC） | 日志文件名轮转与所有日志时间戳均跟随该时区；部署时应设为宿主机时区（如 `TZ=Asia/Shanghai`），或挂载 `-v /etc/localtime:/etc/localtime:ro` 自动跟随宿主机 |
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
+| `STREAM_IDLE_TIMEOUT_SEC` | `300` | 上游 SSE 空闲超时（秒）：超过该时长收不到任何字节即中断流并返回 `upstream stream interrupted`，避免上游半开连接把请求挂到 30 分钟全局超时；`0` 关闭 |
 | `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时跳过旧 SQLite 归档的自动升级；v8 归档照常查询 |
 | `ANALYSIS_ROLLUP` | 开启 | 历史分析读取 `audit_aggregates.db` 预聚合；设为 `off` 时全部走原始扫描（用于对照与排查） |
 | `ANALYSIS_ROLLUP_AT` | `04:00` | active 分片预聚合每日增量构建时刻（本地时区，`HH:MM`）；`off` 关闭。与 FTS 优化共用轮转锁串行执行 |
