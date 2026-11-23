@@ -202,7 +202,31 @@ SELECT id FROM records ORDER BY id DESC LIMIT 1
 
 ---
 
-## 8. 后续可选优化（本次未做）
+## 8. 启动路径全量审计（确认 `next_id` 是唯一扫描点）
+
+逐步核对了 `main.rs` 绑定 listener 之前的所有 DB/IO 操作：
+
+| 启动阶段 | 执行的 SQL / IO | 复杂度 | 证据 |
+| :--- | :--- | :--- | :--- |
+| `ConfigManager::new` | YAML 读文件 | O(1) | `main.rs:68` |
+| `init_db` → `detect_schema` | `PRAGMA user_version` + schema 元数据 | O(1) | `migrate.rs` |
+| `init_db` → `AuditStore::open` | `probe_schema` + `init_v8_schema`（`PRAGMA table_info`、`CREATE TABLE/INDEX IF NOT EXISTS`） | O(1)，仅元数据 | `turso_schema.rs:111-157` |
+| **`AuditWriter::start` → `next_id`** | **旧 `COALESCE(MAX(id))+1`** | **全表扫描 ❌** | 本文 §2 |
+| `AppState::new` | 内存构造 + `resolve_db_path`（无 stat） | O(1) | `app_state.rs:27-54` |
+| **`init_rotation_state` → `current_data_yyyymm`** | **`SELECT MAX(TimeMs) FROM records`** | **O(1) ✅**（走 `idx_records_time`） | 实测 0.6ms / 读 17KB |
+| `warm_active_rollup` | `tokio::spawn` 异步，listening 之后 | 不阻塞 | `main.rs:99-105` |
+| `ArchiveRegistry::new` | 仅存路径，不扫目录 | O(1) | `archive.rs:55-69` |
+| `ensure_scanned` | 目录枚举 | **惰性触发**，不在启动路径 | `archive.rs:76` |
+
+关键发现：`current_data_yyyymm` 的 `MAX(TimeMs)` 是**裸 `MAX()`**，不像 `next_id` 那样被表达式包裹，
+所以能正常走索引优化（`Last` + `Column` + `Prev`，0.6ms / 17KB）。
+这正好反证了 §2 的根因判定：**问题不是"取 MAX"，而是"把 MAX 包进表达式"**。
+
+结论：**`next_id` 是启动路径上唯一的扫描型操作**，修复它即可消除 620s 量级的启动延迟。
+
+---
+
+## 9. 后续可选优化（本次未做）
 
 1. **listener 提前 + readiness gate**：在 `init_db` 后先 bind `:8000`，`/health` 返回 503 直到 writer ready；
    避免"连接被拒/超时"。注意未 ready 时审计写入必须排队或拒绝，需要单独评审就绪语义。
@@ -212,7 +236,7 @@ SELECT id FROM records ORDER BY id DESC LIMIT 1
 
 ---
 
-## 9. 复现命令
+## 10. 复现命令
 
 ```bash
 # 1) 当前容器启动时间与日志断点
@@ -231,7 +255,7 @@ ssh root@192.168.8.68 'cd /nfs/openai-api/logs; grep -h "id lookup resolved" inf
 
 ---
 
-## 10. 文件/改动
+## 11. 文件/改动
 
 - 修改：`src/db/writer.rs`（`next_id` 查询形态 + 计时日志 + `NEXT_ID_SQL` 常量）
 - 修改：`src/db/mod.rs`（注册测试模块）
