@@ -275,6 +275,22 @@ ssh root@192.168.8.68 'cd /nfs/openai-api/logs; grep -h "id lookup resolved" inf
 - **验收判据**（部署后立刻可查，不必等一次完整启动）：
   `id lookup resolved elapsed_ms=<个位数>` 视为生效；若仍为几千毫秒，说明还存在别的扫描点。
 
+### 交付产物（本机已构建完成）
+
+| 文件 | 大小 | SHA256 |
+| :--- | ---: | :--- |
+| `../dist/queqiao-router-b725-c-amd64.tar.gz` | 45M | `5aa75fb109f7226a0034201a78983f11273f7e011b06daedef88b7d78eb39709` |
+| `../dist/queqiao-router-b725-c-arm64.tar.gz` | 44M | `fd7dffd22517f3f3462358c3805fe1a06379345a8cc4488cb5ae12656fa2469e` |
+
+产物校验记录：
+- `gzip -t` 两个文件均通过。
+- 解层核对二进制（`app/queqiao-router`）：两个架构均**含**
+  `ORDER BY id DESC LIMIT 1` 与 `audit writer id lookup resolved`，且**已无** `COALESCE(MAX(id)`。
+- amd64 镜像 `docker load` 后实跑：803MB / 200k 行库启动正常，`/health` 返回 200，
+  日志 `id lookup resolved elapsed_ms=0 next_id=200001`（id 正确延续）。
+- arm64 二进制经 `file` 确认为 `ELF 64-bit ... ARM aarch64`，但**本机无法运行**
+  （内核未注册 binfmt，脚本的设计前提是不依赖它；arm64 仅构建、不本地实跑）。
+
 ---
 
 ## 11. 文件/改动
