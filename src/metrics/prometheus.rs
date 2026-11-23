@@ -1,6 +1,7 @@
 use prometheus::{
     exponential_buckets, register_counter_vec, register_gauge_vec, register_histogram_vec,
-    register_int_gauge_vec, CounterVec, GaugeVec, HistogramVec, IntGaugeVec,
+    register_int_gauge, register_int_gauge_vec, CounterVec, GaugeVec, HistogramVec, IntGauge,
+    IntGaugeVec,
 };
 
 pub static REQUESTS_TOTAL: once_cell::sync::Lazy<CounterVec> = once_cell::sync::Lazy::new(|| {
@@ -245,6 +246,36 @@ pub static TOKENS_MISSING_TOTAL: once_cell::sync::Lazy<CounterVec> =
             "gpt_api_tokens_missing_total",
             "Total requests without token usage info (embeddings, rerank, etc.)",
             &["endpoint", "model", "backend"]
+        )
+        .unwrap()
+    });
+
+/// `1` while the config on disk is usable, `0` when it is not
+/// (missing/unreadable/invalid/backend-less). Mirrors the `/health` status.
+pub static CONFIG_HEALTHY: once_cell::sync::Lazy<IntGauge> = once_cell::sync::Lazy::new(|| {
+    register_int_gauge!(
+        "gpt_api_config_healthy",
+        "Config file usability (1 = ok, 0 = unusable)"
+    )
+    .unwrap()
+});
+
+/// Config generation currently serving requests (bumped by each successful reload).
+pub static CONFIG_GENERATION: once_cell::sync::Lazy<IntGauge> = once_cell::sync::Lazy::new(|| {
+    register_int_gauge!(
+        "gpt_api_config_generation",
+        "Config generation currently serving requests"
+    )
+    .unwrap()
+});
+
+/// Failed config loads since start, split by failure kind (read/parse/validate).
+pub static CONFIG_LOAD_FAILURES: once_cell::sync::Lazy<IntGaugeVec> =
+    once_cell::sync::Lazy::new(|| {
+        register_int_gauge_vec!(
+            "gpt_api_config_load_failures_total",
+            "Config load failures since start",
+            &["kind"]
         )
         .unwrap()
     });

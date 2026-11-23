@@ -16,6 +16,7 @@ pub fn create_metrics_router() -> Router<Arc<AppState>> {
 
 async fn metrics_endpoint(State(app_state): State<Arc<AppState>>) -> Response {
     crate::metrics::db_writer::update(&app_state.audit_writer.snapshot());
+    crate::metrics::config_health::update(&app_state.config_manager.health().await);
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
 

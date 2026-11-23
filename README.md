@@ -150,7 +150,7 @@ docker run -d \
 
 | 方法 | 路径 | 描述 |
 | :--- | :--- | :--- |
-| `GET` | `/health` | 健康检查 |
+| `GET` | `/health` | 健康检查（配置可用性纳入判定，见[健康检查](#-健康检查)） |
 | `GET` | `/v1/models` | 获取聚合模型列表 |
 | `GET` | `/metrics` | Prometheus 监控指标 |
 | `POST` | `/v1/chat/completions` | 对话接口 (支持流式、多模态、工具调用) |
@@ -289,14 +289,54 @@ openai_clients:
 | 超时场景 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | TCP 连接建立 | 10s | 快速失败，避免长时间等待不可达主机 |
-| 流式 TTFB（首字节） | 60s | 流式请求（`stream: true`）发送后 60s 内未收到响应则超时 |
+| 流式响应头（首 token 前的硬上限） | 60s | 流式请求（`stream: true`）发出后等待上游**响应头**的上限；`STREAM_HEADER_TIMEOUT_SEC` 可调，`0` 关闭（仅剩 1800s 全局超时） |
+| 流式空闲（首字节之后） | 300s | 上游 SSE 已开始出字节后，相邻 chunk 之间允许的最大静默；`STREAM_IDLE_TIMEOUT_SEC` 可调，`0` 关闭。**不计入 TTFT** |
 | 客户端全局超时 | 1800s（30min） | 非流式请求的整体超时上限，防止永久挂起 |
 | 连接池空闲淘汰 | 15s | 短于常见云 LB/网关的 keepalive 窗口（5~30s），避免取出已被对端关闭的陈旧连接 |
 | TCP keepalive | 30s | 防止 NAT/负载均衡器静默切断长连接 |
 
 连接池相关参数（每 host 最大空闲连接数、空闲淘汰时间、TCP keepalive 间隔）由顶层 `connection_pool` 配置项控制，默认值如上表。由于共享 HTTP 客户端仅在启动时构建一次，修改 `connection_pool` 后需重启服务才会生效。
 
-**重试行为**: 仅在发送阶段遇到连接/请求错误（非超时）时自动重建连接重试一次。流式请求使用 60s TTFB 超时快速失败；非流式请求受 1800s 全局超时限制。上游失败时，调度器会尝试其他匹配客户端；所有候选客户端失败后才使用配置的 `fallback`。
+**重试行为**: 仅在发送阶段遇到连接/请求错误（非超时）时自动重建连接重试一次。流式请求默认用 60s 响应头超时快速失败；非流式请求受 1800s 全局超时限制。上游失败时，调度器会尝试其他匹配客户端；所有候选客户端失败后才使用配置的 `fallback`。
+
+---
+
+## ❤️ 健康检查
+
+`GET /health` 同时是**存活**和**配置就绪**探针。除进程存活外，它还检查磁盘上的配置文件当前是否可用：
+
+| 状态 | HTTP | `status` | 触发条件 |
+| :--- | :--- | :--- | :--- |
+| 正常 | `200` | `ok` | 配置文件可读、可解析、校验通过，且至少配置了一个后端 |
+| 降级 | `503` | `degraded` | 运行中文件被删除 / 不可读 / YAML 非法 / 校验失败 / `openai_clients: []` |
+
+响应体（降级时带错误详情；正常时省略 `config_error*` 字段）：
+
+```json
+{
+  "status": "degraded",
+  "config": "unusable",
+  "config_generation": 1,
+  "config_failures": 4,
+  "config_error": "cannot stat config/config.yaml: No such file or directory (os error 2)",
+  "config_error_kind": "read"
+}
+```
+
+- `config_error_kind` 取值为 `read`（读文件失败）/ `parse`（YAML 非法）/ `validate`（校验失败或后端为空），并通过 `x-config-error-kind`、`x-config-failures` 响应头暴露，便于只看状态码/头的探针使用。
+- **运行中**配置失效时，内存里的旧配置继续服务（请求不受影响），`/health` 立刻降级；每 30s 重试一次，恢复后自动回到 `200` 并记录 `config file recovered`。
+- **启动期**配置不可用直接 panic 退出（不 bind 端口），因此此时 `/health` 是连接被拒（`000`）而非 503——带着空配置启动只会把错误推迟到第一个请求。
+- 相同的失败原因只记录一条 `WARN`（`config file is unusable (...)`），后续重复尝试降到 `debug`，避免 30s 轮询刷屏；失败次数累计在 `config_failures` / `gpt_api_config_load_failures_total` 中。
+
+配置健康同时暴露为 Prometheus 指标（`/metrics`）：
+
+| 指标 | 说明 |
+| :--- | :--- |
+| `gpt_api_config_healthy` | `1` 可用 / `0` 不可用，与 `/health` 状态一致 |
+| `gpt_api_config_generation` | 当前生效的配置代数（每次成功热重载 +1） |
+| `gpt_api_config_load_failures_total{kind}` | 按 `read`/`parse`/`validate` 统计的失败次数 |
+
+> 容器默认 HEALTHCHECK 为 `curl -f http://localhost:8000/health`，因此配置失效会让容器变为 `unhealthy`（配合 `--restart` 策略即可触发自动恢复）。
 
 ---
 
