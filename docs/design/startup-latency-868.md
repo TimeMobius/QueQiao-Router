@@ -255,6 +255,21 @@ ssh root@192.168.8.68 'cd /nfs/openai-api/logs; grep -h "id lookup resolved" inf
 
 ---
 
+## 10.1 上线须知
+
+- **必须用带鉴权插件的镜像**：8.68 跑的是 `b722-c-v61`（`FEATURES=check-api-auth`）。
+  CI 推送到 GHCR 的是**普通版**（无鉴权），不能直接替换；需用
+  `../build_multiarch.sh -o ./dist` 产出 `queqiao-router-b<N>-c-{amd64,arm64}.tar.gz`。
+- **id 分配语义未变**：`next_id` 只是换了一种更便宜的取法，返回值定义完全一致
+  （空表 → 1，否则 max+1）。进程内 id 由 `next_id_value` 单调递增，只在启动与轮转 `resume`
+  时解析一次，因此跨分片的 id 序列行为与修复前相同，无需迁移数据、无需改配置。
+- **回滚安全**：本次不涉及 schema 变更、不改 DB 文件格式、不改环境变量。回滚只需把镜像
+  换回 `b722-c-v61`，新旧二进制可读写同一份 DB。
+- **验收判据**（部署后立刻可查，不必等一次完整启动）：
+  `id lookup resolved elapsed_ms=<个位数>` 视为生效；若仍为几千毫秒，说明还存在别的扫描点。
+
+---
+
 ## 11. 文件/改动
 
 - 修改：`src/db/writer.rs`（`next_id` 查询形态 + 计时日志 + `NEXT_ID_SQL` 常量）
