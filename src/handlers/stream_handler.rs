@@ -25,6 +25,7 @@ use eventsource_stream::{Event as UpstreamEvent, Eventsource};
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,53 +41,149 @@ const STREAM_UPSTREAM_ERROR_SENTINEL: &str = "\u{0}__STREAM_UPSTREAM_ERROR__\u{0
 const DEBUG_RAW_BODY_TAIL_LIMIT: usize = 16 * 1024;
 type RawBodyTail = Arc<Mutex<Vec<u8>>>;
 
-/// Default maximum silence from the upstream SSE body.
+/// Default maximum silence *between* upstream SSE chunks.
 ///
-/// The 60s TTFB timeout in `client/proxy.rs` only covers the response headers;
-/// once a stream is established an upstream that stops sending bytes (but
-/// keeps the connection open) would hold the client until the 30-minute
-/// global HTTP timeout. 300s is far above any normal inter-token gap while
-/// still converting a dead stream into a visible error chunk.
+/// This budget deliberately starts only after the first body byte: a slow
+/// model that needs a long prefill before its first token is TTFT, not a
+/// stalled stream, and must not be killed by the idle guard. Once bytes have
+/// started flowing, 300s of silence is far above any normal inter-token gap
+/// while still turning a dead stream into a visible error chunk instead of
+/// waiting for the 30-minute global HTTP timeout.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SEC: u64 = 300;
 
-/// SSE idle timeout from `STREAM_IDLE_TIMEOUT_SEC`; `0` disables it.
-fn stream_idle_timeout() -> Option<Duration> {
-    let seconds = std::env::var("STREAM_IDLE_TIMEOUT_SEC")
+/// Default maximum wait for the *first* upstream SSE byte.
+///
+/// `0` (disabled) preserves the pre-existing behavior: the 60s response-header
+/// timeout in `client/proxy.rs` plus the 1800s global HTTP timeout decide when
+/// to give up. Enable it only when a hard cap on time-to-first-token is
+/// desired.
+pub const DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_SEC: u64 = 0;
+
+fn env_timeout(name: &str, default_secs: u64) -> Option<Duration> {
+    let seconds = std::env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SEC);
+        .unwrap_or(default_secs);
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
-/// Boxed upstream byte stream with one timeout budget per received chunk.
+/// Mid-stream idle budget from `STREAM_IDLE_TIMEOUT_SEC`; `0` disables it.
+fn stream_idle_timeout() -> Option<Duration> {
+    env_timeout("STREAM_IDLE_TIMEOUT_SEC", DEFAULT_STREAM_IDLE_TIMEOUT_SEC)
+}
+
+/// First-byte budget from `STREAM_FIRST_BYTE_TIMEOUT_SEC`; `0` disables it.
+fn stream_first_byte_timeout() -> Option<Duration> {
+    env_timeout(
+        "STREAM_FIRST_BYTE_TIMEOUT_SEC",
+        DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_SEC,
+    )
+}
+
+/// Boxed upstream byte stream with the SSE stall guard applied.
 type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
-/// Turn a stalled-byte gap into a regular stream error.
+/// Guards the upstream SSE body without capping time-to-first-token.
 ///
+/// Two independent budgets:
+/// - `first_byte`: max wait before the first body byte. `None` (the default)
+///   leaves slow first tokens to the existing header/global timeouts.
+/// - `idle`: max gap between body bytes once the stream has started.
+struct IdleGuardedStream<S> {
+    inner: Pin<Box<S>>,
+    idle: Option<Duration>,
+    first_byte: Option<Duration>,
+    seen_first_byte: bool,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> IdleGuardedStream<S> {
+    fn new(inner: S, idle: Option<Duration>, first_byte: Option<Duration>) -> Self {
+        let mut guarded = Self {
+            inner: Box::pin(inner),
+            idle,
+            first_byte,
+            seen_first_byte: false,
+            timer: None,
+        };
+        guarded.arm();
+        guarded
+    }
+
+    /// (Re)arm the timer for the phase the stream is currently in.
+    fn arm(&mut self) {
+        let budget = if self.seen_first_byte {
+            self.idle
+        } else {
+            self.first_byte
+        };
+        self.timer = budget.map(|budget| Box::pin(tokio::time::sleep(budget)));
+    }
+
+    fn timeout_error(&self) -> std::io::Error {
+        let (budget, phase) = if self.seen_first_byte {
+            (self.idle, "between upstream SSE chunks")
+        } else {
+            (self.first_byte, "before the first upstream SSE byte")
+        };
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "upstream sent no SSE data for {:?} {phase}",
+                budget.unwrap_or_default()
+            ),
+        )
+    }
+}
+
+impl<S> Stream for IdleGuardedStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // Poll the body first: buffered bytes must win over an expired timer.
+        // The timer may have aged while a slow client was not reading the
+        // response, which is not an upstream stall.
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                this.seen_first_byte = true;
+                this.arm();
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                error,
+            )))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if let Some(timer) = this.timer.as_mut() {
+                    if timer.as_mut().poll(cx).is_ready() {
+                        let error = this.timeout_error();
+                        this.timer = None;
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
 /// `eventsource-stream` and the SSE handler already know how to surface a
 /// stream error as an `upstream stream interrupted` chunk and an audit row;
-/// this adapter only supplies the deadline.
-fn idle_guarded_body_stream<S>(stream: S, idle: Option<Duration>) -> UpstreamByteStream
+/// this adapter only supplies the deadlines.
+fn idle_guarded_body_stream<S>(
+    stream: S,
+    idle: Option<Duration>,
+    first_byte: Option<Duration>,
+) -> UpstreamByteStream
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    let map_error = |error: reqwest::Error| std::io::Error::new(std::io::ErrorKind::Other, error);
-    match idle {
-        Some(idle) => Box::pin(futures::StreamExt::map(
-            tokio_stream::StreamExt::timeout(stream, idle),
-            move |item| match item {
-                Ok(Ok(bytes)) => Ok(bytes),
-                Ok(Err(error)) => Err(map_error(error)),
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("upstream sent no SSE data for {idle:?}"),
-                )),
-            },
-        )),
-        None => Box::pin(futures::StreamExt::map(stream, move |item| {
-            item.map_err(map_error)
-        })),
-    }
+    Box::pin(IdleGuardedStream::new(stream, idle, first_byte))
 }
 
 /// 流式请求的最终结局。上游读取由下游驱动：客户端断开时整条上游流被 drop，
@@ -746,7 +843,11 @@ pub async fn process_streaming_response(
         return Ok(resp);
     }
     let (stream, raw_body_tail) = make_upstream_body_stream(
-        idle_guarded_body_stream(response.bytes_stream(), stream_idle_timeout()),
+        idle_guarded_body_stream(
+            response.bytes_stream(),
+            stream_idle_timeout(),
+            stream_first_byte_timeout(),
+        ),
         tracing::enabled!(Level::DEBUG),
     );
     let special_prefix = client_config.special_prefix.clone().unwrap_or_default();
@@ -1074,16 +1175,67 @@ mod tests {
             b"data: hi\n\n",
         ))])
         .chain(futures::stream::pending::<Result<Bytes, reqwest::Error>>());
-        let mut guarded = idle_guarded_body_stream(silent, Some(Duration::from_millis(20)));
+        let mut guarded = idle_guarded_body_stream(silent, Some(Duration::from_millis(20)), None);
 
         assert!(guarded.next().await.expect("first chunk").is_ok());
         let next = tokio::time::timeout(Duration::from_secs(2), guarded.next())
             .await
             .expect("the idle guard must fire instead of waiting forever");
         match next {
-            Some(Err(error)) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+            Some(Err(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                assert!(
+                    error.to_string().contains("between upstream SSE chunks"),
+                    "{error}"
+                );
+            }
             other => panic!("expected an idle-timeout error, got {other:?}"),
         }
+    }
+
+    /// A slow first token is TTFT, not a stalled stream: when
+    /// `STREAM_FIRST_BYTE_TIMEOUT_SEC` is unset (`0`), the idle budget must
+    /// not start until the first body byte arrives.
+    #[tokio::test]
+    async fn slow_first_byte_is_not_capped_by_idle_timeout() {
+        let delayed = futures::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: hi\n\n"))
+        })
+        .chain(futures::stream::pending::<Result<Bytes, reqwest::Error>>());
+        let mut guarded = idle_guarded_body_stream(delayed, Some(Duration::from_millis(10)), None);
+
+        let first = tokio::time::timeout(Duration::from_secs(2), guarded.next())
+            .await
+            .expect("waiting for the first byte must not be capped by the idle timer");
+        assert!(
+            first.expect("first item").is_ok(),
+            "the delayed first byte must be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_byte_budget_applies_only_when_configured() {
+        let delayed = futures::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: hi\n\n"))
+        });
+        let mut guarded = idle_guarded_body_stream(
+            delayed,
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_millis(10)),
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(2), guarded.next())
+            .await
+            .expect("the configured first-byte budget must fire")
+            .expect("an item must be produced")
+            .expect_err("expected a first-byte timeout");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("first upstream SSE byte"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -98,15 +98,39 @@ fn forward_identity_headers(
     rb
 }
 
+/// Upper bound on waiting for the upstream *response headers* of a streaming
+/// request (time-to-first-byte before the SSE stream starts).
+///
+/// Default 60s, configurable via `STREAM_HEADER_TIMEOUT_SEC`; `0` disables it
+/// and leaves the 1800s global client timeout as the only limit. This is the
+/// only budget that can cut a request before the SSE body begins — the body
+/// idle guard in `stream_handler` deliberately starts after the first byte.
+fn stream_header_timeout() -> Option<Duration> {
+    let seconds = std::env::var("STREAM_HEADER_TIMEOUT_SEC")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
 async fn send_json_once(
     request_builder: reqwest::RequestBuilder,
     is_streaming: bool,
 ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
     if is_streaming {
-        timeout(Duration::from_secs(60), request_builder.send())
-            .await
-            .map_err(|_| "Upstream service timeout: No response received within 60 seconds")?
-            .map_err(Into::into)
+        let send = request_builder.send();
+        match stream_header_timeout() {
+            Some(limit) => timeout(limit, send)
+                .await
+                .map_err(|_| {
+                    format!(
+                        "Upstream service timeout: No response received within {} seconds",
+                        limit.as_secs()
+                    )
+                })?
+                .map_err(Into::into),
+            None => send.await.map_err(Into::into),
+        }
     } else {
         request_builder.send().await.map_err(Into::into)
     }

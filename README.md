@@ -135,7 +135,9 @@ docker run -d \
 | `RUST_LOG` | `info` | 日志级别 (`error`, `warn`, `info`, `debug`, `trace`) |
 | `TZ` | 镜像默认（通常为 UTC） | 日志文件名轮转与所有日志时间戳均跟随该时区；部署时应设为宿主机时区（如 `TZ=Asia/Shanghai`），或挂载 `-v /etc/localtime:/etc/localtime:ro` 自动跟随宿主机 |
 | `LOG_FULL_TOKEN_ON_ERROR` | `false` | 错误日志中是否记录完整 Token（默认 false，仅缩略显示） |
-| `STREAM_IDLE_TIMEOUT_SEC` | `300` | 上游 SSE 空闲超时（秒）：超过该时长收不到任何字节即中断流并返回 `upstream stream interrupted`，避免上游半开连接把请求挂到 30 分钟全局超时；`0` 关闭 |
+| `STREAM_IDLE_TIMEOUT_SEC` | `300` | **首字节之后**、相邻两次上游 SSE 数据之间允许的最大静默（秒）：超时即中断流并返回 `upstream stream interrupted`，避免上游半开连接把请求挂到 30 分钟全局超时；`0` 关闭。**不限制 TTFT**（首 token 等待不计入此预算） |
+| `STREAM_FIRST_BYTE_TIMEOUT_SEC` | `0`（关闭） | 上游 SSE **首字节**的最大等待（秒）。默认关闭，交给 60s 响应头超时与 1800s 全局超时；需要给“首 token 很慢”的模型设硬上限时再开启 |
+| `STREAM_HEADER_TIMEOUT_SEC` | `60` | 流式请求等待上游**响应头**的上限（秒）；`0` 关闭（只剩 1800s 全局超时）。它决定“首 token 前”的硬上限，与 `STREAM_IDLE_TIMEOUT_SEC`（首字节之后）相互独立 |
 | `ARCHIVE_LEGACY_MIGRATION` | 迁移（未设置） | 设为 `skip` 时跳过旧 SQLite 归档的自动升级；v8 归档照常查询 |
 | `ANALYSIS_ROLLUP` | 开启 | 历史分析读取 `audit_aggregates.db` 预聚合；设为 `off` 时全部走原始扫描（用于对照与排查） |
 | `ANALYSIS_ROLLUP_AT` | `04:00` | active 分片预聚合每日增量构建时刻（本地时区，`HH:MM`）；`off` 关闭。与 FTS 优化共用轮转锁串行执行 |
