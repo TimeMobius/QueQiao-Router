@@ -181,9 +181,16 @@ SELECT id FROM records ORDER BY id DESC LIMIT 1
 | `cargo test`（全量） | **408 passed / 0 failed** |
 | 新增回归测试 | 3 passed |
 | 本地起网关（空库） | 启动 <1s，日志含 `id lookup resolved elapsed_ms=0 next_id=1` |
-| 本地起网关（803MB / 200k 行真实 v8 库） | 启动 <1s，`elapsed_ms=0 next_id=200001`（旧代码此库约 1.9s，41GB 则约 620s） |
+| 本地起网关（803MB / 200k 行真实 v8 库） | 启动 <1s，`elapsed_ms=0 next_id=200001`；对照旧代码单独测该查询为 1936.6ms，41GB 生产库外推约 620s |
 | 端到端写审计行 | `/v1/chat/completions` 正常记账；新分片 id 从 1 递增，老库延续 max+1 |
 | 轮转路径 | `record.db` → `record_197001.db` 归档后 `resume` 正确解析 id（`elapsed_ms=11`） |
+
+> ⚠️ **对照实验的坑**：在本地用容器对比新旧镜像时，**看不出耗时差异**。
+> 原因是本地页缓存是热的、磁盘是本地 SSD，41GB 扫描在这里不到 2 秒；
+> 生产慢是因为 41GB 要走 NFS 单流（约 69MB/s）。
+> 因此本地能验证的是**语义正确**（id 延续、写入正常），能证明代价的是
+> **读取量**（旧 821MB vs 新 4.7KB，见 §2.3），而不是本地耗时数字。
+> 真正的耗时收益只在生产 NFS 上体现。
 
 ---
 
