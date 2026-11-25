@@ -182,6 +182,11 @@ pub fn update_success_windows(success: bool, model: &str, backend: &str) {
     get_window_ref(&SUCCESS_WINDOWS_1H, &key).push(value);
 }
 
+pub fn get_ttft_1m_avg(model: &str, backend: &str) -> f64 {
+    let key = make_key(model, backend);
+    TTFT_WINDOWS_1M.get(&key).map(|w| w.avg()).unwrap_or(0.0)
+}
+
 pub fn get_ttft_1m_max(model: &str, backend: &str) -> f64 {
     let key = make_key(model, backend);
     TTFT_WINDOWS_1M.get(&key).map(|w| w.max()).unwrap_or(0.0)
@@ -193,6 +198,11 @@ pub fn get_ttft_10m_max(model: &str, backend: &str) -> f64 {
 pub fn get_ttft_1h_max(model: &str, backend: &str) -> f64 {
     let key = make_key(model, backend);
     TTFT_WINDOWS_1H.get(&key).map(|w| w.max()).unwrap_or(0.0)
+}
+
+pub fn get_latency_1m_avg(model: &str, backend: &str) -> f64 {
+    let key = make_key(model, backend);
+    LATENCY_WINDOWS_1M.get(&key).map(|w| w.avg()).unwrap_or(0.0)
 }
 
 pub fn get_latency_1m_max(model: &str, backend: &str) -> f64 {

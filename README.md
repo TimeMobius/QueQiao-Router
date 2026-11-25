@@ -27,10 +27,11 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
 
 ### 🔀 智能流量调度
 - **多策略路由**: 支持关键字匹配 (`keyword`) 和精确匹配 (`exact`)。
-- **三种负载均衡策略**:
+- **四种负载均衡策略**:
   - **Deterministic**（默认）: 基于内容的 **Multi-Anchor Voting (Rendezvous Hashing)** 算法。相同的提示词（Prompt）永远路由到同一后端，显著提升 **KV Cache 命中率**。每条 `role=user` 消息是一个锚点（前 64 字符做哈希、字节长度作票权），并叠加**轮次几何衰减**：每往回一轮票权乘以 `0.85`（约 4 轮半衰期），越近的轮次影响越大，避免首轮或早期长消息把整条会话永久锁死。集成 **Efraimidis-Spirakis** 加权采样，确保长期流量分布严格遵循 `priority` 权重比例。
   - **Random**: 纯加权随机路由，无状态调度。
   - **LeastConnections**: 加权最少连接路由，实时读取活跃请求数（Prometheus gauge），将新请求调度至当前负载最低的后端。
+  - **CacheWeave**: 有状态复合路由。与其他策略同作用域：只接收候选、`routing_keys`、模型名与 `ACTIVE_REQUESTS`，不埋 handler/main/请求模型。v6.4 按「prefill 成本 + queue 成本 + decode/TPS 成本 + 实例繁忙度」排序；cache 命中通过减少 uncached tokens 折入 prefill，不再单独加权。长 prompt 偏 prefill、短请求偏 queue；引擎指标缺失时降权并回退到网关 active/审计。自动探测 vLLM/SGLang `/metrics`，兼容二级网关、外部 API 与不开前缀缓存的后端。**无额外配置**，只需 `strategy: cache_weave`。详见 [`docs/CACHE_WEAVE.md`](docs/CACHE_WEAVE.md)。
 - **自动故障转移 (Failover)**: 当前端客户端返回 5xx 错误或网络错误时，自动并发尝试后续客户端（多后端场景）；若所有后端均失败且配置了 `fallback`，则切换至指定的后备模型。
 - **灵活的客户端配置**: 支持提示词前缀 (`special_prefix`)、停止序列 (`stop`)、最大令牌数 (`max_tokens`) 和请求体字段注入 (`extra_body`)。
 
@@ -74,7 +75,7 @@ QueQiao-Router 的名字源自“鹊桥相会”的传说：如同喜鹊搭桥�
 ```yaml
 # === 全局负载均衡策略 ===
 load_balancing:
-  strategy: deterministic   # deterministic | random | least_connections
+  strategy: deterministic   # deterministic | random | least_connections | cache_weave
 
 # === 全局思考格式（可选，每客户端可覆盖）===
 # thinking_format: "reasoning"  # passthrough | think_tag | reasoning | reasoning_content
@@ -177,7 +178,7 @@ docker run -d \
 ```yaml
 # 负载均衡策略（默认：deterministic）
 load_balancing:
-  strategy: deterministic   # deterministic | random | least_connections
+  strategy: deterministic   # deterministic | random | least_connections | cache_weave
 
 # 全局思考格式归一化（可选，每客户端可覆盖）
 # thinking_format: "reasoning"   # passthrough | think_tag | reasoning | reasoning_content
