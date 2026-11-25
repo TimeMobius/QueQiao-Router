@@ -6,7 +6,7 @@ use crate::config::types::{ClientConfig, HealthCheckConfig};
 use crate::metrics::active_requests::get_active_counts_for_clients;
 use crate::metrics::prometheus::FAILOVER_TOTAL;
 use crate::models::AccessLogMeta;
-use crate::services::circuit_breaker::{AttemptPermission, CircuitBreakerRegistry};
+use crate::services::circuit_breaker::{AttemptPermission, CircuitBreakerRegistry, ProbeLease};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use std::collections::{HashMap, HashSet};
@@ -432,13 +432,16 @@ impl DispatcherService {
         let mut last_client_error: Option<(UpstreamClientErrorKind, Response)> = None;
 
         for client in clients {
-            match registry.allow(client) {
+            // 半开探测会授予租约：必须一直持有到给出结论，否则请求被取消时
+            // Drop 会负责回收许可（见 ProbeLease），避免后端被永久熔断。
+            let mut probe = match registry.allow(client) {
                 AttemptPermission::Blocked { .. } => {
                     debug!("Skipping cooling backend {}", client.name);
                     continue;
                 }
-                AttemptPermission::Allowed | AttemptPermission::HalfOpen => {}
-            }
+                AttemptPermission::Allowed => None,
+                AttemptPermission::HalfOpen(lease) => Some(lease),
+            };
 
             attempted_client = true;
             tried_clients_accumulator.push(client.name.clone());
@@ -458,7 +461,7 @@ impl DispatcherService {
                     // 成功响应，或“不值得换后端”的请求级错误（400/422/413）：
                     // 后者是调用方请求本身不合法，不能因此冷却后端。
                     if status.is_success() || (status.is_client_error() && !should_fallback) {
-                        registry.record_success(client);
+                        Self::settle_circuit_outcome(registry, probe.take(), client, true);
                         if resp.extensions().get::<AccessLogMeta>().is_none() {
                             resp.extensions_mut().insert(AccessLogMeta {
                                 model: model_name.to_string(),
@@ -481,9 +484,9 @@ impl DispatcherService {
                     // 注意：服务真正宕机走的是 Err 分支（连接失败/超时），那条路
                     // 记 failure，与此处无关。
                     if kind.counts_as_backend_failure() {
-                        registry.record_failure(client);
+                        Self::settle_circuit_outcome(registry, probe.take(), client, false);
                     } else {
-                        registry.record_success(client);
+                        Self::settle_circuit_outcome(registry, probe.take(), client, true);
                     }
                     let hint = match kind {
                         UpstreamClientErrorKind::CredentialInvalid => {
@@ -526,7 +529,7 @@ impl DispatcherService {
                     last_client_error = Some((kind, resp));
                 }
                 Err(e) => {
-                    registry.record_failure(client);
+                    Self::settle_circuit_outcome(registry, probe.take(), client, false);
                     warn!(
                         "Client {} failed with error: {}. Continuing ordered fallback...",
                         client.name, e
@@ -583,6 +586,34 @@ impl DispatcherService {
         }
 
         Err(None)
+    }
+
+    /// 把一次后端尝试的结果记入熔断器。
+    ///
+    /// 若本次尝试持有半开探测租约，必须通过租约归还；请求在归还前被取消/丢弃时，
+    /// 租约的 `Drop` 会自动回收许可，不会让后端永久停留在“探测中”。
+    fn settle_circuit_outcome(
+        registry: &CircuitBreakerRegistry,
+        probe: Option<ProbeLease>,
+        client: &ClientConfig,
+        success: bool,
+    ) {
+        match probe {
+            Some(lease) => {
+                if success {
+                    lease.record_success();
+                } else {
+                    lease.record_failure();
+                }
+            }
+            None => {
+                if success {
+                    registry.record_success(client);
+                } else {
+                    registry.record_failure(client);
+                }
+            }
+        }
     }
 }
 
