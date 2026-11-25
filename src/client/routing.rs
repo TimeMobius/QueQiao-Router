@@ -1,3 +1,4 @@
+use crate::client::cache_weave;
 use crate::config::types::{ClientConfig, LoadBalancingStrategy};
 use rand::prelude::*;
 use std::collections::HashMap;
@@ -16,15 +17,40 @@ fn anchor_weight(length_bytes: usize, turns_after: usize) -> f64 {
     length_bytes as f64 * TURN_DECAY.powi(turns_after as i32)
 }
 
-/// 选择客户端的策略函数
+/// 选择客户端的策略函数（兼容没有 model 的旧调用）。
 pub fn select_clients(
     clients: Vec<ClientConfig>,
     routing_keys: Option<Vec<(String, usize, usize)>>,
     strategy: &LoadBalancingStrategy,
     active_counts: Option<&HashMap<String, i64>>,
 ) -> Vec<ClientConfig> {
+    select_clients_with_model(clients, routing_keys, strategy, active_counts, "")
+}
+
+/// 带模型名的策略入口：CacheWeave 需要 model 读取按 `model:backend` 聚合的
+/// TTFT/TPS 窗口；其他策略忽略该参数，行为不变。
+pub fn select_clients_with_model(
+    clients: Vec<ClientConfig>,
+    routing_keys: Option<Vec<(String, usize, usize)>>,
+    strategy: &LoadBalancingStrategy,
+    active_counts: Option<&HashMap<String, i64>>,
+    model: &str,
+) -> Vec<ClientConfig> {
     if clients.is_empty() {
         return clients;
+    }
+
+    if strategy.is_cache_weave() {
+        let order = cache_weave::order(&clients, active_counts, model, routing_keys.as_deref());
+        let mut slots: Vec<Option<ClientConfig>> = clients.into_iter().map(Some).collect();
+        let mut ordered = Vec::with_capacity(slots.len());
+        for idx in order {
+            if let Some(client) = slots.get_mut(idx).and_then(Option::take) {
+                ordered.push(client);
+            }
+        }
+        ordered.extend(slots.into_iter().flatten());
+        return ordered;
     }
 
     match strategy {
@@ -38,6 +64,9 @@ pub fn select_clients(
             select_clients_by_random_weight(clients)
         }
         LoadBalancingStrategy::LeastConnections => {
+            select_clients_by_least_connections(clients, active_counts)
+        }
+        LoadBalancingStrategy::CacheWeave => {
             select_clients_by_least_connections(clients, active_counts)
         }
     }

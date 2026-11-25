@@ -16,6 +16,26 @@ pub enum LoadBalancingStrategy {
     Random,
     /// 加权最少连接路由，仅在该策略下读取 ACTIVE_REQUESTS metric
     LeastConnections,
+    /// CacheWeave：前缀缓存亲和 + 实例繁忙度 + 实测推理速度的复合路由。
+    ///
+    /// 无额外配置项；是否使用完全由 `load_balancing.strategy: cache_weave`
+    /// 决定。前缀索引与引擎探测状态由 `client::cache_weave` 模块自行维护。
+    CacheWeave,
+}
+
+impl LoadBalancingStrategy {
+    /// 该策略是否需要读取 `ACTIVE_REQUESTS` gauge。
+    pub fn needs_active_counts(&self) -> bool {
+        matches!(
+            self,
+            LoadBalancingStrategy::LeastConnections | LoadBalancingStrategy::CacheWeave
+        )
+    }
+
+    /// 是否走 CacheWeave 的复合排序。
+    pub fn is_cache_weave(&self) -> bool {
+        matches!(self, LoadBalancingStrategy::CacheWeave)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

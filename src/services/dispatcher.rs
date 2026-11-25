@@ -1,8 +1,8 @@
 use crate::app_error::AppError;
 use crate::client::client_manager::ClientManager;
-use crate::client::routing::select_clients;
+use crate::client::routing::select_clients_with_model;
 use crate::config::config_manager::ConfigManager;
-use crate::config::types::{ClientConfig, HealthCheckConfig, LoadBalancingStrategy};
+use crate::config::types::{ClientConfig, HealthCheckConfig};
 use crate::metrics::active_requests::get_active_counts_for_clients;
 use crate::metrics::prometheus::FAILOVER_TOTAL;
 use crate::models::AccessLogMeta;
@@ -217,24 +217,24 @@ impl DispatcherService {
 
         let strategy = &config_guard.load_balancing.strategy;
 
-        // 最少连接策略需要读取 active counts
-        let active_counts: Option<HashMap<String, i64>> =
-            if matches!(strategy, LoadBalancingStrategy::LeastConnections) {
-                Some(get_active_counts_for_clients(
-                    &matching_clients,
-                    model_name,
-                    endpoint,
-                ))
-            } else {
-                None
-            };
+        // LeastConnections / CacheWeave 需要读取 active counts
+        let active_counts: Option<HashMap<String, i64>> = if strategy.needs_active_counts() {
+            Some(get_active_counts_for_clients(
+                &matching_clients,
+                model_name,
+                endpoint,
+            ))
+        } else {
+            None
+        };
 
-        // 应用负载均衡策略（支持确定路由、加权随机、最少连接）
-        let matching_clients = select_clients(
+        // 应用负载均衡策略（确定路由 / 加权随机 / 最少连接 / CacheWeave）
+        let matching_clients = select_clients_with_model(
             matching_clients,
             routing_keys.clone(),
             strategy,
             active_counts.as_ref(),
+            model_name,
         );
 
         if matching_clients.is_empty() {
