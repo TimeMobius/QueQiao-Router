@@ -6,7 +6,9 @@ use crate::config::types::{ClientConfig, HealthCheckConfig};
 use crate::metrics::active_requests::get_active_counts_for_clients;
 use crate::metrics::prometheus::FAILOVER_TOTAL;
 use crate::models::AccessLogMeta;
-use crate::services::circuit_breaker::{AttemptPermission, CircuitBreakerRegistry, ProbeLease};
+use crate::services::circuit_breaker::{
+    AttemptPermission, BackendHealth, CircuitBreakerRegistry, ProbeLease,
+};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use std::collections::{HashMap, HashSet};
@@ -163,6 +165,11 @@ impl DispatcherService {
         }
     }
 
+    /// 供 `/metrics` 导出使用的后端健康快照（只读）。
+    pub fn backend_health_snapshot(&self) -> Vec<BackendHealth> {
+        self.circuit_breakers.snapshot()
+    }
+
     /// 上游 4xx 的语义分类。
     ///
     /// 这四类错误的“责任方”完全不同，混为一谈会同时造成误判和误熔断：
@@ -214,6 +221,13 @@ impl DispatcherService {
             .client_manager
             .find_matching_clients(&config_guard, model_name)
             .await;
+
+        // /metrics 的模型维度需要“实际路由过的模型→后端”组合：熔断注册表只按
+        // 后端记录状态，这里把本次解析出的匹配关系登记下来，供指标导出做关联。
+        // 已登记的组合零分配，热路径只多一次 DashMap 查找。
+        for client in &matching_clients {
+            crate::metrics::model_backends::record(model_name, &client.name);
+        }
 
         let strategy = &config_guard.load_balancing.strategy;
 

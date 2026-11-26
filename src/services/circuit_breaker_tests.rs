@@ -175,3 +175,58 @@ fn backoff_increases_after_repeated_open_state_failure() {
     registry.record_failure(&backend);
     assert_eq!(registry.cooldown_for(&backend), Duration::from_secs(20));
 }
+
+#[test]
+fn snapshot_reports_closed_open_and_half_open_states() {
+    // 从未失败过的后端不会出现在快照里，调用方按 Closed 兜底。
+    let registry = registry_with(0, 1);
+    assert!(registry.snapshot().is_empty());
+
+    let healthy = client("healthy");
+    registry.record_success(&healthy);
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].name, "healthy");
+    assert_eq!(snapshot[0].state, BackendCircuitState::Closed);
+    assert_eq!(snapshot[0].cooldown_remaining, Duration::ZERO);
+
+    // open：冷却 60s，剩余时间应落在 (0, 60]。
+    let registry = CircuitBreakerRegistry::new(HealthCheckConfig {
+        failure_threshold: 1,
+        cooldown_seconds: 60,
+        ..HealthCheckConfig::default()
+    });
+    let cooling = client("cooling");
+    registry.record_failure(&cooling);
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot[0].state, BackendCircuitState::Open);
+    assert!(snapshot[0].cooldown_remaining > Duration::ZERO);
+    assert!(snapshot[0].cooldown_remaining <= Duration::from_secs(60));
+
+    // half_open：冷却 0，拿到探测租约后状态为 HalfOpen。
+    let registry = registry_with(0, 1);
+    let probing = client("probing");
+    registry.record_failure(&probing);
+    let lease = expect_half_open(&registry, &probing);
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot[0].state, BackendCircuitState::HalfOpen);
+    assert!(snapshot[0].probe_in_flight);
+    drop(lease);
+}
+
+#[test]
+fn snapshot_reports_disabled_when_breaker_is_disabled() {
+    let registry = registry_with(30, 1);
+    let backend = client("primary");
+    registry.record_failure(&backend);
+    assert_eq!(registry.snapshot()[0].state, BackendCircuitState::Open);
+
+    // 热加载关闭熔断后，已有条目统一报告 Disabled（不再做健康判定）。
+    registry.configure(HealthCheckConfig {
+        enabled: false,
+        ..HealthCheckConfig::default()
+    });
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot[0].state, BackendCircuitState::Disabled);
+    assert_eq!(snapshot[0].cooldown_remaining, Duration::ZERO);
+}

@@ -19,6 +19,54 @@ pub enum AttemptPermission {
     Blocked { retry_after: Duration },
 }
 
+/// 熔断器视角的后端状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCircuitState {
+    /// 健康，正常接流量。
+    Closed,
+    /// 熔断打开，冷却中，暂时不会接到新请求。
+    Open,
+    /// 冷却已到期：等待探测，或探测正在进行。
+    HalfOpen,
+    /// `health_check.enabled == false`，不做健康判定。
+    Disabled,
+}
+
+impl BackendCircuitState {
+    /// 稳定的短标识，用于日志。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half_open",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// 数值编码，用于 Prometheus gauge：
+    /// `0 = closed`、`1 = open`、`2 = half_open`、`3 = disabled`。
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Closed => 0,
+            Self::Open => 1,
+            Self::HalfOpen => 2,
+            Self::Disabled => 3,
+        }
+    }
+}
+
+/// 单个后端的健康快照（只读副本，供指标导出使用）。
+#[derive(Debug, Clone)]
+pub struct BackendHealth {
+    pub name: String,
+    pub state: BackendCircuitState,
+    /// 距离可再次探测还剩多久；`Closed` / `HalfOpen` / `Disabled` 时为 0。
+    pub cooldown_remaining: Duration,
+    pub consecutive_failures: u32,
+    pub backoff_level: u32,
+    pub probe_in_flight: bool,
+}
+
 /// 半开探测的所有权凭据。
 ///
 /// `allow()` 返回 `HalfOpen(lease)` 时，本次请求独占该后端的探测许可；只有调用
@@ -205,6 +253,47 @@ impl CircuitBreakerRegistry {
         backend.probe_in_flight = true;
         backend.probe_started_at = Some(Instant::now());
         AttemptPermission::HalfOpen(ProbeLease::new(self.clone(), client, epoch))
+    }
+
+    /// 导出所有已跟踪后端的健康状态快照（只读，不影响路由状态）。
+    ///
+    /// 从未失败过的后端不会出现在这里（注册表按需创建条目），调用方应把缺失的
+    /// 后端视为 `Closed`；`health_check.enabled == false` 时统一返回 `Disabled`。
+    pub fn snapshot(&self) -> Vec<BackendHealth> {
+        let state = lock_state(&self.state);
+        let enabled = state.config.enabled;
+        let mut snapshot: Vec<BackendHealth> = state
+            .backends
+            .iter()
+            .map(|(name, backend)| {
+                let (circuit_state, cooldown_remaining) = if !enabled {
+                    (BackendCircuitState::Disabled, Duration::ZERO)
+                } else {
+                    match backend.opened_at {
+                        None => (BackendCircuitState::Closed, Duration::ZERO),
+                        Some(opened_at) => {
+                            let cooldown = cooldown_for_state(&state.config, backend);
+                            let elapsed = opened_at.elapsed();
+                            if elapsed < cooldown {
+                                (BackendCircuitState::Open, cooldown.saturating_sub(elapsed))
+                            } else {
+                                (BackendCircuitState::HalfOpen, Duration::ZERO)
+                            }
+                        }
+                    }
+                };
+                BackendHealth {
+                    name: name.clone(),
+                    state: circuit_state,
+                    cooldown_remaining,
+                    consecutive_failures: backend.consecutive_failures,
+                    backoff_level: backend.backoff_level,
+                    probe_in_flight: backend.probe_in_flight,
+                }
+            })
+            .collect();
+        snapshot.sort_by(|left, right| left.name.cmp(&right.name));
+        snapshot
     }
 
     pub fn record_success(&self, client: &ClientConfig) {

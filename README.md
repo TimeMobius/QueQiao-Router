@@ -337,6 +337,22 @@ openai_clients:
 | `gpt_api_config_generation` | 当前生效的配置代数（每次成功热重载 +1） |
 | `gpt_api_config_load_failures_total{kind}` | 按 `read`/`parse`/`validate` 统计的失败次数 |
 
+熔断器的后端健康状态也按「模型 × 后端」和「后端」两个维度暴露（`/metrics`）：
+
+| 指标 | 标签 | 说明 |
+| :--- | :--- | :--- |
+| `gpt_api_model_backend_health` | `model,backend` | `1` 可接流量（closed/disabled） / `0` 冷却中或半开 |
+| `gpt_api_model_backend_circuit_state` | `model,backend` | `0` closed / `1` open / `2` half_open / `3` disabled |
+| `gpt_api_model_backend_cooldown_remaining_seconds` | `model,backend` | 距下一次可探测的剩余秒数（0 表示无需等待） |
+| `gpt_api_backend_health` | `backend` | 不依赖模型的兜底视图，含义同上 |
+| `gpt_api_backend_circuit_state` | `backend` | 同上 |
+| `gpt_api_backend_cooldown_remaining_seconds` | `backend` | 同上 |
+
+- `model` 维度 = 配置中 `model_match.type: exact` 的模型名、`model_rewrite` 的别名，加上运行期实际路由过的（模型，后端）组合；`keyword` 匹配出的具体模型名只有产生流量后才会出现，冷启动阶段可用 `gpt_api_backend_*` 按后端查看。
+- 从未失败过的后端不在熔断注册表里，按 `closed` 导出；`health_check.enabled: false` 时统一导出 `disabled`。
+- 每次抓取会重置并重建这些序列（移除已删除的后端/模型）；序列数量上限为 512 个模型 × 每模型 64 个后端，防止异常入站模型名撑爆基数。
+- 半开探测被取消/超时回收时，剩余冷却为 0 且 `state=half_open`，下一次请求会重新探测。
+
 > 容器默认 HEALTHCHECK 为 `curl -f http://localhost:8000/health`，因此配置失效会让容器变为 `unhealthy`（配合 `--restart` 策略即可触发自动恢复）。
 
 ---
