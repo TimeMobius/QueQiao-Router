@@ -24,8 +24,10 @@ struct DashboardAssets;
 pub fn dashboard_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(index_handler))
+        .route("/classic", get(classic_page))
         .route("/records", get(records_page))
         .route("/analysis", get(analysis_page))
+        .route("/api/live", get(live_snapshot))
         .route("/api/records", get(records_api::list_records))
         .route("/api/records/facets", get(records_api::record_facets))
         .route(
@@ -40,8 +42,17 @@ pub fn dashboard_router() -> Router<Arc<AppState>> {
         .route("/*path", get(assets_handler))
 }
 
+/// 实时监控快照（3D 面板轮询；未订阅时采样器仍在跑，但事件 emit 为零成本）
+async fn live_snapshot() -> axum::Json<serde_json::Value> {
+    axum::Json(crate::metrics::live::snapshot())
+}
+
 async fn index_handler(headers: HeaderMap) -> Response {
     serve_asset("index.html", &headers)
+}
+
+async fn classic_page(headers: HeaderMap) -> Response {
+    serve_asset("classic.html", &headers)
 }
 
 async fn records_page(headers: HeaderMap) -> Response {

@@ -3,6 +3,7 @@ pub mod backend_health;
 pub mod config_health;
 pub mod db_writer;
 pub mod exporter;
+pub mod live;
 pub mod middleware;
 pub mod model_backends;
 pub mod prometheus;

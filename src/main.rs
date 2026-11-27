@@ -119,6 +119,10 @@ fn main() {
         });
         println!("Metrics worker started.");
 
+        // 实时面板采样器（每 2s 采样一次 Prometheus proto，供 /dashboard/api/live）
+        queqiao_router::metrics::live::start_sampler();
+        println!("Live metrics sampler started.");
+
         // Add a small delay to ensure the database is fully initialized on disk
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 

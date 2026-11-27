@@ -461,6 +461,8 @@ impl DispatcherService {
             tried_clients_accumulator.push(client.name.clone());
             debug!("Dispatching request to client: {}", client.name);
 
+            crate::metrics::live::emit_start(model_name, &client.name);
+
             let result = {
                 let mut cb = request_callback.lock().await;
                 cb(client, model_name).await

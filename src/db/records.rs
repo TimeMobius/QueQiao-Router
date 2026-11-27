@@ -415,6 +415,30 @@ pub async fn log_non_streaming_request(
         response: response_str,
     };
 
+    // 实时面板事件：没有订阅者时连 RequestMeta 都不构造（一次原子读即返回）
+    if crate::metrics::live::active() {
+        crate::metrics::live::emit_record(crate::metrics::live::RequestMeta {
+            ts_ms: record.time_ms,
+            model: record.model.clone(),
+            backend: record.backend.clone().unwrap_or_default(),
+            endpoint: record.endpoint.clone().unwrap_or_default(),
+            format: record.r#type.clone(),
+            status: record.status.unwrap_or(0),
+            latency_ms: record.latency_ms.unwrap_or(0.0),
+            ttft_ms: record.ttft_ms,
+            prompt_tokens: record.prompt_tokens as i64,
+            completion_tokens: record.completion_tokens as i64,
+            ctx_bytes: record.prompt_bytes.max(record.request_bytes),
+            multimodal: record.multimodal,
+            tools: record.tool || record.tool_count > 0,
+            tool_count: record.tool_count,
+            images: record.image_count,
+            messages: record.message_count,
+            stream: record.stream_ms.is_some(),
+            error: record.error.clone(),
+            request_id: record.request_id.clone(),
+        });
+    }
     if let Err(e) = log_request(app_state, record).await {
         error!("Failed to log request to database: {}", e);
     }
