@@ -250,6 +250,32 @@ impl Default for ModelsCacheConfig {
     }
 }
 
+/// `/v1/tools/fetch` 与 `/v1/tools/search` 的直通代理配置。
+///
+/// 这两个端点由中间件直接转发到上游，不参与模型路由、不解析请求体、
+/// 不写审计库、不产生 Prometheus 指标。`base_url` 是上游根地址，缺省时
+/// 直连 DeepSeek 官方端点 (`https://api.deepseek.com`)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolsProxyConfig {
+    /// 替换用的上游根地址；空值或未配置时使用 [`Self::DEFAULT_BASE_URL`]。
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+impl ToolsProxyConfig {
+    /// 默认上游：DeepSeek 官方 API 根地址。
+    pub const DEFAULT_BASE_URL: &'static str = "https://api.deepseek.com";
+
+    /// 生效的上游根地址：配置值优先，空白/未配置时回退 DeepSeek。
+    pub fn resolved_base_url(&self) -> &str {
+        self.base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|base| !base.is_empty())
+            .unwrap_or(Self::DEFAULT_BASE_URL)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub openai_clients: Vec<ClientConfig>,
@@ -264,6 +290,9 @@ pub struct Config {
     /// Global backend health and circuit-breaker policy.
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// `/v1/tools/*` 直通代理配置（缺省直连 DeepSeek）。
+    #[serde(default)]
+    pub tools_proxy: ToolsProxyConfig,
     /// reqwest connection-pool settings, applied once when the shared HTTP client
     /// is built at startup. Hot reload does NOT rebuild the client; restart to apply.
     #[serde(default)]
@@ -352,9 +381,51 @@ mod tests {
             thinking_format: global_format,
             models_cache: ModelsCacheConfig::default(),
             health_check: HealthCheckConfig::default(),
+            tools_proxy: ToolsProxyConfig::default(),
             connection_pool: ConnectionPoolConfig::default(),
             config_generation: 1,
         }
+    }
+
+    #[test]
+    fn test_tools_proxy_defaults_to_deepseek() {
+        let cfg: Config = serde_yaml::from_str("openai_clients: []").unwrap();
+        assert_eq!(
+            cfg.tools_proxy.resolved_base_url(),
+            ToolsProxyConfig::DEFAULT_BASE_URL
+        );
+        assert_eq!(
+            cfg.tools_proxy.resolved_base_url(),
+            "https://api.deepseek.com"
+        );
+    }
+
+    #[test]
+    fn test_tools_proxy_parses_base_url_override() {
+        let yaml = r#"
+openai_clients: []
+tools_proxy:
+  base_url: "https://proxy.example.com"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.tools_proxy.resolved_base_url(),
+            "https://proxy.example.com"
+        );
+    }
+
+    #[test]
+    fn test_tools_proxy_blank_base_url_falls_back_to_deepseek() {
+        let yaml = r#"
+openai_clients: []
+tools_proxy:
+  base_url: "   "
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.tools_proxy.resolved_base_url(),
+            ToolsProxyConfig::DEFAULT_BASE_URL
+        );
     }
 
     #[test]

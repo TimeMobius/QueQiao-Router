@@ -24,6 +24,30 @@ vLLM / Rerank 扩展。请求经统一路由、思考格式归一化与响应转
 | `POST` | `/v1/classify` | `/classify` 的别名（兼容习惯带 `/v1` 前缀的客户端） |
 | `POST` | `/v1/systemone` | System One 分类协议（TypeSafe / OpenRouter Jev 等分类模型） |
 | `POST` | `/systemone` | System One 分类协议（不带 `/v1` 的写法） |
+| `POST` | `/v1/tools/fetch` | 工具直通代理（不经业务处理、不落库、不产生指标） |
+| `POST` | `/v1/tools/search` | 工具直通代理（不经业务处理、不落库、不产生指标） |
+
+## Tools 直通代理
+
+`/v1/tools/fetch` 与 `/v1/tools/search` 是在**中间件层**完成的透明转发，与模型接口互不影响：
+
+- 只按路径命中，**不做模型匹配，也不解析请求体**；
+- **不进入 handler / 调度 / 审计库，不产生 Prometheus 指标**；
+- 请求方法、path（含 query）与 `Authorization`、`x-api-key` 等 end-to-end 请求头
+  原样上行；`Connection` / `Transfer-Encoding` 等逐跳头与 `Host` / `Content-Length`
+  由网关按实际传输重建；
+- 请求体与响应体（含流式响应）按字节透传，响应状态码与响应头原样返回；
+- 缺省上游为 DeepSeek 官方端点 `https://api.deepseek.com`，可通过
+  `tools_proxy.base_url` 替换（支持热重载）：
+
+```yaml
+tools_proxy:
+  base_url: "https://api.deepseek.com"   # 缺省值；留空/省略同样回退 DeepSeek
+```
+
+`base_url` 可带结尾 `/`，也可写成 `https://host/v1`，网关会避免拼出 `/v1/v1/...`。
+鉴权头不会被替换为网关配置的 key：客户端需携带上游可接受的凭据。若编译了
+`check-api-auth` 插件，请求仍会先经过该插件鉴权，再转发到上游。
 
 ## 认证与凭据优先级
 

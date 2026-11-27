@@ -181,4 +181,12 @@ mod tests {
         assert!(should_skip_metrics("/health"));
         assert!(should_skip_metrics("/v1/models"));
     }
+
+    /// `/v1/tools/*` 是中间件层直通代理，明确不产生指标。
+    /// 若未来把它们加进白名单，这条测试会先失败。
+    #[test]
+    fn never_counts_tools_proxy_paths() {
+        assert!(should_skip_metrics("/v1/tools/fetch"));
+        assert!(should_skip_metrics("/v1/tools/search"));
+    }
 }

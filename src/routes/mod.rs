@@ -82,6 +82,12 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         // 同时把生效值放进请求扩展，供 `CustomJson` 生成可自解释的 413 错误体。
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(Extension(RequestBodyLimit(request_body_limit)))
+        // `/v1/tools/*` 在中间件层直接转发到上游：位于 CORS 之内（响应仍会补 CORS 头，
+        // 浏览器可直连）、业务路由之外；metrics 的白名单不含这两个路径，因此不产生指标。
+        .layer(axum_middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::middleware::tools_proxy::tools_proxy_middleware,
+        ))
         .layer(cors)
         .layer(axum_middleware::from_fn(metrics_middleware))
         .with_state(app_state)

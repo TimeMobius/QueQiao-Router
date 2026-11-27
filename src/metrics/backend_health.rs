@@ -270,6 +270,7 @@ mod tests {
             thinking_format: None::<ThinkingFormat>,
             models_cache: ModelsCacheConfig::default(),
             health_check: HealthCheckConfig::default(),
+            tools_proxy: Default::default(),
             connection_pool: ConnectionPoolConfig::default(),
             config_generation: 1,
         }

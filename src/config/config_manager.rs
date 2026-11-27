@@ -177,6 +177,20 @@ impl ConfigManager {
             );
         }
 
+        if let Some(base_url) = config
+            .tools_proxy
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+                return Err(format!(
+                    "tools_proxy.base_url must start with http:// or https://, got '{base_url}'"
+                ));
+            }
+        }
+
         let mut seen_names = std::collections::HashSet::new();
 
         for client in &config.openai_clients {
@@ -590,6 +604,40 @@ mod tests {
 
         let config = ConfigManager::load_config_typed(&as_str(&path)).expect("valid config");
         assert_eq!(config.openai_clients.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tools_proxy_accepts_http_and_https_base_urls() {
+        for base_url in ["https://api.deepseek.com", "http://127.0.0.1:9000"] {
+            let dir = temp_dir("toolsproxy-ok");
+            let path = write_config(
+                &dir,
+                &format!("{VALID}tools_proxy:\n  base_url: \"{base_url}\"\n"),
+            );
+
+            let config =
+                ConfigManager::load_config_typed(&as_str(&path)).expect("valid tools_proxy");
+            assert_eq!(config.tools_proxy.resolved_base_url(), base_url);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn tools_proxy_rejects_base_url_without_scheme() {
+        let dir = temp_dir("toolsproxy-bad");
+        let path = write_config(
+            &dir,
+            &format!("{VALID}tools_proxy:\n  base_url: \"api.deepseek.com\"\n"),
+        );
+
+        let error = ConfigManager::load_config_typed(&as_str(&path)).unwrap_err();
+        assert_eq!(error.kind, ConfigErrorKind::Validate);
+        assert!(
+            error.message.contains("tools_proxy.base_url"),
+            "{}",
+            error.message
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

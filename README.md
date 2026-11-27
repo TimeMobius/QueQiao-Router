@@ -168,6 +168,8 @@ docker run -d \
 | `POST` | `/v1/classify` | 文本分类接口 (`/classify` 别名) |
 | `POST` | `/v1/systemone` | System One 分类协议 (TypeSafe / OpenRouter Jev) |
 | `POST` | `/systemone` | System One 分类协议 (不带 `/v1` 的写法) |
+| `POST` | `/v1/tools/fetch` | 工具直通代理：原样转发到上游（缺省 DeepSeek），见 [Tools 直通代理](#tools-直通代理-tools_proxy) |
+| `POST` | `/v1/tools/search` | 工具直通代理：原样转发到上游（缺省 DeepSeek），见 [Tools 直通代理](#tools-直通代理-tools_proxy) |
 
 ---
 
@@ -189,7 +191,35 @@ connection_pool:
   max_idle_per_host: 64      # 每 host 最大空闲连接数
   idle_timeout_seconds: 15   # 空闲连接淘汰时间（秒）；0 表示不淘汰空闲连接
   tcp_keepalive_seconds: 30  # TCP keepalive 探测间隔（秒）；0 表示禁用 TCP keepalive
+
+# /v1/tools/fetch 与 /v1/tools/search 的直通代理（可选；缺省直连 DeepSeek）
+tools_proxy:
+  base_url: "https://api.deepseek.com"
 ```
+
+### Tools 直通代理 (tools_proxy)
+
+`/v1/tools/fetch` 与 `/v1/tools/search` 是**旁路端点**：请求在中间件层就被转发到上游，
+不进入模型路由、调度与审计流程，也没有对应的 handler。
+
+- **不做模型匹配、不解析请求体**：只按路径命中，请求体按字节原样上行；
+- **不写审计库、不产生 Prometheus 指标**；
+- 请求方法、path（含 query）与 `Authorization` 等 end-to-end 请求头原样透传；
+  `Connection` / `Transfer-Encoding` 等逐跳头以及 `Host` / `Content-Length`
+  由网关按实际连接重建；
+- 响应状态码、响应头与响应体（含流式）原样返回；
+- 缺省上游为 DeepSeek 官方端点 `https://api.deepseek.com`，可用
+  `tools_proxy.base_url` 替换；`base_url` 可带结尾 `/`，也可写成
+  `https://host/v1`（网关会避免拼出 `/v1/v1/...`）；
+- 鉴权头**不做替换**，客户端需携带上游可接受的凭据。若编译了
+  `check-api-auth` 插件，请求仍会先经过该插件鉴权，再转发到上游。
+
+```yaml
+tools_proxy:
+  base_url: "https://api.deepseek.com"   # 缺省值；留空/省略同样回退 DeepSeek
+```
+
+配置项支持热重载，修改后无需重启即可生效。
 
 ### 客户端配置项
 
