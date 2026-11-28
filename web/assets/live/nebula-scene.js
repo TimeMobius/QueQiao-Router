@@ -188,6 +188,8 @@ function backendColor(b){
 function rebuildClusters(models){
   clusters.forEach(c=>scene.remove(c.grp)); clusters.clear();
   labelEls.forEach(e=>e.remove()); labelEls.clear();
+  // 按 id 排序后再布局：同一批模型每次重建都落在同一个坑位
+  models=models.slice().sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0);
   POSITIONS=layoutPositions(models);
   models.forEach((m,i)=>{
     const grp=new THREE.Group(); grp.position.copy(POSITIONS[i]);
@@ -199,10 +201,13 @@ function rebuildClusters(models){
     const nb=(m.backends||[]).length||1;
     const cscale=Math.min(1.9, 0.70+0.15*(nb-1)+Math.min(.10,(m.active||0)*.008));
     const A=1.0*cscale,B=0.40*cscale,C=0.40*cscale;
+    // 粒子云用**按模型 id 播种的确定性随机**：重建后形状完全一致，
+    // 不会因为繁忙度变化重建而看起来像“朝向变了”
+    const PR=rng(hash(m.id+'|particles'));
     const N=340, pos=new Float32Array((N+60)*3);
-    for(let k=0;k<N;k++){const u=Math.random()*2-1,th=Math.random()*Math.PI*2,r=Math.sqrt(Math.max(0,1-u*u)),j=.93+Math.random()*.14;
+    for(let k=0;k<N;k++){const u=PR()*2-1,th=PR()*Math.PI*2,r=Math.sqrt(Math.max(0,1-u*u)),j=.93+PR()*.14;
       pos[k*3]=Math.cos(th)*r*A*j;pos[k*3+1]=u*B*j;pos[k*3+2]=Math.sin(th)*r*C*j;}
-    for(let k=0;k<60;k++){const u=Math.random()*2-1,th=Math.random()*Math.PI*2,r=Math.sqrt(Math.max(0,1-u*u)),t=Math.cbrt(Math.random())*.9;
+    for(let k=0;k<60;k++){const u=PR()*2-1,th=PR()*Math.PI*2,r=Math.sqrt(Math.max(0,1-u*u)),t=Math.cbrt(PR())*.9;
       pos[(N+k)*3]=Math.cos(th)*r*A*t;pos[(N+k)*3+1]=u*B*t;pos[(N+k)*3+2]=Math.sin(th)*r*C*t;}
     const sg=new THREE.BufferGeometry(); sg.setAttribute('position',new THREE.BufferAttribute(pos,3));
     const shell=new THREE.Points(sg,new THREE.PointsMaterial({map:GLOW,color:col,size:.15,transparent:true,opacity:.65,
@@ -210,7 +215,7 @@ function rebuildClusters(models){
     grp.add(shell);
     const neb=[];
     for(let k=0;k<3;k++){const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:GLOW,color:col,transparent:true,opacity:.12,blending:THREE.AdditiveBlending,depthWrite:false}));
-      sp.position.set((Math.random()-.5)*.5,(Math.random()-.5)*.25,(Math.random()-.5)*.5); sp.scale.setScalar(1.2+Math.random()*.6); grp.add(sp); neb.push(sp);}
+      sp.position.set((PR()-.5)*.5,(PR()-.5)*.25,(PR()-.5)*.5); sp.scale.setScalar(1.2+PR()*.6); grp.add(sp); neb.push(sp);}
     const RND=rng(hash(m.id)); const stars=[];
     const bn=Math.max(1,(m.backends||[]).length);
     (m.backends||[]).forEach((b,bi)=>{
@@ -239,7 +244,7 @@ function rebuildClusters(models){
     });
     const hit=new THREE.Mesh(new THREE.SphereGeometry(1.05*cscale,10,10),new THREE.MeshBasicMaterial({transparent:true,opacity:0,depthWrite:false,depthTest:false,colorWrite:false}));
     grp.add(hit);
-    clusters.set(m.id,{grp,shell,neb,stars,hit,m,cscale});
+    clusters.set(m.id,{grp,shell,neb,stars,hit,m,cscale,baseRot:grp.rotation.clone(),nebRot:0});
     const tt=textTexture(m.name,{font:'700 42px Inter,PingFang SC,sans-serif',color:'rgba(190,215,255,.85)',blur:16});
     const nameSpr=new THREE.Sprite(new THREE.SpriteMaterial({map:tt.tex,transparent:true,opacity:.26,
       depthWrite:false,depthTest:true,blending:THREE.NormalBlending}));
@@ -484,7 +489,9 @@ function unfocus(){
 async function load(){ try{ const r=await fetch('/dashboard/api/live',{cache:'no-store'}); applyLive(await r.json()); }catch(e){ /* ignore */ } }
 function applyLive(d){
   DATA=d; if(!d||!d.ready) return;
-  const key=d.models.map(m=>m.id).join('|');
+  // 后端按流量排序返回，顺序会随繁忙度抖动；用**排序后的 id 集合**做 key，
+  // 只有模型集合真的变化时才重建，避免朝向/位置被反复重置。
+  const key=d.models.map(m=>m.id).slice().sort().join('|');
   if(key!==idsKey){ idsKey=key; rebuildClusters(d.models); } else updateClusters(d.models);
   rpm=d.totals.rpm||0;
 }
