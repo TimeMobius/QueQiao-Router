@@ -116,7 +116,8 @@ import { createNebula } from './nebula-scene.js';
   grid.insertBefore(pair, grid.firstChild);
   pair.appendChild(card);
   const stageEl = card.querySelector('#nebulaStage');
-  createNebula(stageEl);
+  const nebula = createNebula(stageEl);
+  let lastStartTs = 0;
 
   const fsBtn = card.querySelector('#nebulaFs');
   const closeBtn = card.querySelector('#nebulaClose');
@@ -152,6 +153,17 @@ import { createNebula } from './nebula-scene.js';
       const r = await fetch('/dashboard/api/live', { cache: 'no-store' });
       const d = await r.json();
       if (!d || !d.ready) return;
+      // 真实调度事件 → 飞船（首帧只校准时间基线，不补放历史）
+      if (lastStartTs === 0) {
+        lastStartTs = d.ts || Date.now();
+      } else {
+        const fresh = (d.starts || []).filter(x => x.ts_ms > lastStartTs);
+        if (fresh.length) {
+          lastStartTs = Math.max(lastStartTs, ...fresh.map(x => x.ts_ms));
+          if (nebula) fresh.slice(-8).forEach(x => nebula.spawnFor(x.model, x.backend));
+        }
+      }
+
       const list = ov.querySelector('#ovList');
       const all = (d.models || []).slice().sort((a, b) => b.busy - a.busy);
       const top = all.slice(0, 4);

@@ -260,7 +260,6 @@ function wallR(z){
     if(z<=a[1]&&z>=b[1]){const k=(z-a[1])/(b[1]-a[1]);return a[0]+k*(b[0]-a[0]);}}
   return 0.34;
 }
-function findClusterByName(name){ for(const c of clusters.values()){ if(c.m&&c.m.name===name) return c; } return null; }
 function launchShip(pick,bi){
   if(!pick||!pick.stars||!pick.stars.length) return false;
   if(ships.length>44) return false;
@@ -287,19 +286,6 @@ function launchShip(pick,bi){
     esc:true,escT:0,escDur:1.35,escCurve,flight:null,exit:null,tangent:null});
   return true;
 }
-function spawnShip(){
-  const act=[...clusters.values()].filter(c=>c.m&&c.m.status!=='idle'&&((c.m.rpm||0)>0||(c.m.active||0)>0));
-  if(!act.length) return false;
-  return launchShip(act[Math.floor(Math.random()*act.length)],null);
-}
-function launchRecord(it){
-  const c=findClusterByName(it.model);
-  if(!c) return false;
-  let bi=(c.m.backends||[]).findIndex(b=>b.name===it.backend);
-  const key=it.model+'|'+it.backend;
-  recStats[key]=(recStats[key]||0)+1;
-  return launchShip(c, bi>=0?bi:null);
-}
 function loop(){
   requestAnimationFrame(loop);
   const dt=Math.min(.05,clock.getDelta());
@@ -313,8 +299,7 @@ function loop(){
   if(wormSpin) wormSpin.rotation.z+=dt*.9;
   if(wormGroup) wormGroup.visible=!focus;
 
-  acc+=(rpm/60)*dt;
-  while(acc>=1){ if(!spawnShip())acc=0; else acc-=1; }
+  // 飞船由真实请求事件驱动（spawnFor），不再按速率估算
 
   for(let i=ships.length-1;i>=0;i--){
     const s=ships[i]; let p;
@@ -463,5 +448,17 @@ function paint(h){
 }
 
 init();
-return {dispose(){ try{ renderer.dispose(); }catch(e){} }};
+return {
+  /** 按真实调度事件发射飞船：优先命中指定后端，找不到退回该星云内随机星球 */
+  spawnFor(modelId, backendName){
+    const c = clusters.get(modelId);
+    if(!c) return false;
+    const backends = (c.m && c.m.backends) || [];
+    let bi = backends.findIndex(b => b && b.name === backendName);
+    if(bi < 0) bi = Math.floor(Math.random() * Math.max(1, c.stars.length));
+    launchShip(c, bi);
+    return true;
+  },
+  dispose(){ try{ renderer.dispose(); }catch(e){} }
+};
 }

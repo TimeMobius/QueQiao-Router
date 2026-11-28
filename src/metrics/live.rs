@@ -64,6 +64,15 @@ static BUS: Lazy<broadcast::Sender<Arc<LiveEvent>>> = Lazy::new(|| broadcast::ch
 static RECENT: Lazy<Mutex<VecDeque<Arc<RequestMeta>>>> =
     Lazy::new(|| Mutex::new(VecDeque::with_capacity(RECENT_CAP)));
 static LAST_READ: AtomicI64 = AtomicI64::new(0);
+/// 最近 60s 的请求开始事件（驱动面板飞船）
+#[derive(Clone, Debug, Serialize)]
+pub struct StartMeta {
+    pub ts_ms: i64,
+    pub model: String,
+    pub backend: String,
+}
+static RECENT_STARTS: Lazy<Mutex<VecDeque<StartMeta>>> =
+    Lazy::new(|| Mutex::new(VecDeque::with_capacity(RECENT_CAP)));
 /// 由采样器每 2s 更新的近似当前时间，热路径上避免取系统时钟。
 static NOW_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -84,10 +93,21 @@ pub fn emit_start(model: &str, backend: &str) {
     if !active() {
         return;
     }
-    let _ = BUS.send(Arc::new(LiveEvent::Start {
+    let start = StartMeta {
         ts_ms: now_ms(),
         model: model.to_string(),
         backend: backend.to_string(),
+    };
+    if let Ok(mut buf) = RECENT_STARTS.lock() {
+        if buf.len() >= RECENT_CAP {
+            buf.pop_front();
+        }
+        buf.push_back(start.clone());
+    }
+    let _ = BUS.send(Arc::new(LiveEvent::Start {
+        ts_ms: start.ts_ms,
+        model: start.model,
+        backend: start.backend,
     }));
 }
 
@@ -106,6 +126,16 @@ pub fn emit_record(meta: RequestMeta) {
     let _ = BUS.send(Arc::new(LiveEvent::End {
         meta: (*arc).clone(),
     }));
+}
+
+fn recent_starts(since_ms: i64) -> Vec<StartMeta> {
+    let Ok(buf) = RECENT_STARTS.lock() else {
+        return Vec::new();
+    };
+    buf.iter()
+        .filter(|m| m.ts_ms >= since_ms)
+        .cloned()
+        .collect()
 }
 
 fn recent_since(since_ms: i64) -> Vec<RequestMeta> {
@@ -552,6 +582,7 @@ fn build_snapshot(samples: &VecDeque<Sample>) -> serde_json::Value {
         },
         "models": model_rows,
         "events": events,
+        "starts": recent_starts(now - 60_000),
     })
 }
 
