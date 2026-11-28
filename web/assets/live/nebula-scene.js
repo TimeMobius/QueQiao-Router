@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { loadCircuit, enrichModels } from './live-circuits.js';
 
 export function createNebula(container){
 const $=id=>container.querySelector('#'+id);
@@ -264,13 +265,43 @@ function updateClusters(models){
     c.shell.material.size=m.status==='idle'?.09:.12;
     c.neb.forEach(sp=>{sp.material.color.setHex(col);sp.material.opacity=m.status==='idle'?.06:.12;});
     c.stars.forEach((s,bi)=>{const b=(m.backends||[])[bi]; if(!b)return;
-      // 星球颜色独立于星云：跟着该后端自己的 level 变化
-      const bcol=backendColor(b);
-      s.material.emissive.setHex(bcol);
-      s.material.emissiveIntensity = b.status==='idle' ? 1.1 : (b.status==='jam' ? 3.4 : 2.8);
-      const glow=s.children && s.children[0];
-      if(glow && glow.material) glow.material.color.setHex(bcol);
-      s.scale.setScalar(.75+Math.min(1.4,(b.active||0)*.14));});
+      const circuit = (b.circuit===undefined||b.circuit===null)?-1:b.circuit;
+      const prevCircuit = s.userData.circuit===undefined?-1:s.userData.circuit;
+      s.userData.circuit = circuit;
+      const failed = circuit===1 || circuit===2;   // open / half_open：熔断或探测中
+      const disabled = circuit===3;                // 配置里显式停用
+
+      if(failed || disabled){
+        // 熔断/停用：暗红残骸 + 碎屑，不再按 level 上色
+        const deadCol = failed ? 0xff6b4a : 0x6b7280;
+        s.material.color.setHex(0x2a1512);
+        s.material.emissive.setHex(deadCol);
+        s.material.emissiveIntensity = failed ? 1.6 : 0.6;
+        const glow=s.children && s.children[0];
+        if(glow && glow.material) glow.material.color.setHex(deadCol);
+        if(!s.userData.debris) makeDebris(s);       // 首次熔断时生成残骸
+        s.scale.setScalar(failed?1.05:0.8);
+        // 文字带也暗掉
+        const belt=s.userData.belt;
+        if(belt && belt.material) belt.material.opacity=.25;
+      } else {
+        // 正常：解耦的等级色
+        const bcol=backendColor(b);
+        s.material.color.setHex(bcol);
+        s.material.emissive.setHex(bcol);
+        s.material.emissiveIntensity = b.status==='idle' ? 1.1 : (b.status==='jam' ? 3.4 : 2.8);
+        const glow=s.children && s.children[0];
+        if(glow && glow.material) glow.material.color.setHex(bcol);
+        s.scale.setScalar(.75+Math.min(1.4,(b.active||0)*.14));
+        if(prevCircuit>=1 && s.userData.debris){
+          // 恢复：残骸淡出移除
+          s.remove(s.userData.debris);
+          delete s.userData.debris; delete s.userData.debrisN; delete s.userData.debrisRing;
+        }
+        const belt=s.userData.belt;
+        if(belt && belt.material) belt.material.opacity=.98;
+      }
+    });
     c.m=m;
   });
 }
@@ -385,6 +416,16 @@ function loop(){
     f.fl.scale.setScalar(.35+1.5*k); f.fl.material.opacity=.95*(1-k);
     f.ring.scale.setScalar(1+4.5*k); f.ring.material.opacity=.9*(1-k);
   }
+  // 熔断残骸：缓慢自转 + 火花呼吸
+  clusters.forEach(c=>{(c.stars||[]).forEach(st=>{
+    const d=st.userData.debris;
+    if(d){
+      d.rotation.y+=dt*.6;
+      const t=performance.now()/1000;
+      if(st.userData.debrisN) st.userData.debrisN.material.opacity=.55+.35*Math.sin(t*3.1);
+      if(st.userData.debrisRing) st.userData.debrisRing.scale.setScalar(1+.12*Math.sin(t*2.2));
+    }
+  });});
   clusters.forEach(c=>{(c.stars||[]).forEach(st=>{ if(st.userData.flash!==undefined){
       st.userData.flash-=dt; if(st.userData.flash<=0){ st.material.emissiveIntensity=2.8; delete st.userData.flash; } } });});
   const _bq=new THREE.Quaternion();
@@ -486,9 +527,18 @@ function unfocus(){
   controls.enabled=false; focus=null; document.body.classList.remove('focused');
 }
 
-async function load(){ try{ const r=await fetch('/dashboard/api/live',{cache:'no-store'}); applyLive(await r.json()); }catch(e){ /* ignore */ } }
+async function load(){
+  try{
+    const [snap]=await Promise.all([
+      fetch('/dashboard/api/live',{cache:'no-store'}).then(r=>r.json()),
+      loadCircuit()
+    ]);
+    applyLive(snap);
+  }catch(e){ /* ignore */ }
+}
 function applyLive(d){
   DATA=d; if(!d||!d.ready) return;
+  enrichModels(d.models);
   // 后端按流量排序返回，顺序会随繁忙度抖动；用**排序后的 id 集合**做 key，
   // 只有模型集合真的变化时才重建，避免朝向/位置被反复重置。
   const key=d.models.map(m=>m.id).slice().sort().join('|');

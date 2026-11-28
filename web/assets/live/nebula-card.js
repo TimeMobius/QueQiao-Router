@@ -1,5 +1,6 @@
 /* 把完整 3D 场景与系统总览作为两张 chart-card 注入原 dashboard（同页直挂，无 iframe） */
 import { createNebula } from './nebula-scene.js';
+import { loadCircuit, enrichModels } from './live-circuits.js';
 (() => {
   // ---- 过滤 /metrics：只保留有真实后端的模型，去掉 '-'/'unknown'/'pending' ----
   function filterMetrics(txt){
@@ -152,9 +153,11 @@ import { createNebula } from './nebula-scene.js';
 
   async function poll() {
     try {
+      await loadCircuit();      // 先抓 /metrics 的熔断事实
       const r = await fetch('/dashboard/api/live', { cache: 'no-store' });
       const d = await r.json();
       if (!d || !d.ready) return;
+      enrichModels(d.models);   // 补全后端并贴熔断状态
       // 真实调度事件 → 飞船（首帧只校准时间基线，不补放历史）
       if (lastStartTs === 0) {
         lastStartTs = d.ts || Date.now();
@@ -175,7 +178,9 @@ import { createNebula } from './nebula-scene.js';
         const succ = ((m.successRate ?? 1) * 100).toFixed(1);
         return `<div class="ov-row">
           <div class="ov-l1"><i style="width:8px;height:8px;border-radius:50%;background:${c};display:inline-block"></i>
-            ${m.name}<em style="background:${c}22;color:${c}">${cn} ${m.busy.toFixed(0)}</em></div>
+            ${m.name}<em style="background:${c}22;color:${c}">${cn} ${m.busy.toFixed(0)}</em>
+            ${m.backendsBroken ? `<em style="background:#ff6b4a22;color:#ff6b4a">熔断 ${m.backendsBroken}</em>` : ''}
+            ${m.backendsDisabled ? `<em style="background:#94a3b822;color:#94a3b8">停用 ${m.backendsDisabled}</em>` : ''}</div>
           <div class="ov-l2"><span><b>${m.rpm.toFixed(1)}</b>/min</span><span>成功率 <b>${succ}%</b></span>
             <span>TTFT <b>${m.ttftP95 ? m.ttftP95.toFixed(1) + 's' : '—'}</b></span>
             <span>解码 <b>${m.decode ? m.decode.toFixed(0) : '—'}</b></span>
@@ -183,7 +188,8 @@ import { createNebula } from './nebula-scene.js';
           <div class="ov-busy"><i style="width:${Math.min(100, m.busy)}%;background:linear-gradient(90deg,${c}55,${c})"></i></div>
           ${(m.backends || []).slice(0, 4).map(b => `<div class="ov-bk"><span>${b.name}</span>
             <span class="bar"><i style="width:${Math.round((b.share || 0) * 100)}%"></i></span>
-            <u>${b.req ?? 0}次 / ${Math.round((b.share || 0) * 100)}% · 处理中 ${b.active ?? 0}</u></div>`).join('')}
+            <u>${b.req ?? 0}次 / ${Math.round((b.share || 0) * 100)}% · 处理中 ${b.active ?? 0}${
+              b.circuit === 1 ? ' · 💥熔断' : b.circuit === 2 ? ' · 探测中' : b.circuit === 3 ? ' · 已停用' : ''}</u></div>`).join('')}
         </div>`;
       }).join('') + (rest > 0 ? `<div class="ov-more">另有 ${rest} 个模型空闲或低负载</div>` : '');
     } catch (e) { /* ignore */ }
