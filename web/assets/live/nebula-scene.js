@@ -180,6 +180,11 @@ function layoutPositions(models){
   return pts;
 }
 
+// 星球的颜色只由**该后端自己**的 level 决定，与所属星云解耦
+function backendColor(b){
+  return LEVEL[b&&b.level]!==undefined ? LEVEL[b.level] : SAT.ok;
+}
+
 function rebuildClusters(models){
   clusters.forEach(c=>scene.remove(c.grp)); clusters.clear();
   labelEls.forEach(e=>e.remove()); labelEls.clear();
@@ -215,13 +220,17 @@ function rebuildClusters(models){
       const th=bi*2.399963+m.id.length;
       const band=0.52+((bi%3)*0.16);
       const p=new THREE.Vector3(Math.cos(th)*rr*band*A, y0*band*B, Math.sin(th)*rr*band*C);
+      const bcol=backendColor(b);
       const s=new THREE.Mesh(new THREE.SphereGeometry(.075,18,18),
-        new THREE.MeshStandardMaterial({color:0xffffff,emissive:col,emissiveIntensity:2.8,roughness:.2,metalness:.1}));
+        new THREE.MeshStandardMaterial({color:bcol,emissive:bcol,emissiveIntensity:2.2,roughness:.25,metalness:.05}));
       s.position.copy(p);
-      const h=new THREE.Sprite(new THREE.SpriteMaterial({map:GLOW,color:col,transparent:true,opacity:.85,blending:THREE.AdditiveBlending,depthWrite:false}));
+      s.userData.baseColor=bcol;
+      const h=new THREE.Sprite(new THREE.SpriteMaterial({map:GLOW,color:bcol,transparent:true,opacity:.85,blending:THREE.AdditiveBlending,depthWrite:false}));
       h.scale.setScalar(.55); s.add(h);
       // 水平环绕的文字带（绕球一圈，随球自转）
-      const bt=beltTexture(b.name, m.status==='jam'?'rgba(252,165,165,.95)':'rgba(165,243,252,.95)');
+      const beltCol = backendColor(b)===LEVEL.jam||backendColor(b)===LEVEL.over ? 'rgba(252,165,165,.95)'
+        : backendColor(b)===LEVEL.busy ? 'rgba(253,224,160,.95)' : 'rgba(165,243,252,.95)';
+      const bt=beltTexture(b.name, beltCol);
       const belt=new THREE.Mesh(new THREE.CylinderGeometry(.30,.30,.15,48,1,true),
         new THREE.MeshBasicMaterial({map:bt,transparent:true,opacity:.98,side:THREE.FrontSide,
           depthWrite:false,blending:THREE.AdditiveBlending}));
@@ -250,7 +259,13 @@ function updateClusters(models){
     c.shell.material.size=m.status==='idle'?.09:.12;
     c.neb.forEach(sp=>{sp.material.color.setHex(col);sp.material.opacity=m.status==='idle'?.06:.12;});
     c.stars.forEach((s,bi)=>{const b=(m.backends||[])[bi]; if(!b)return;
-      s.material.emissive.setHex(col); s.scale.setScalar(.75+Math.min(1.4,(b.active||0)*.14));});
+      // 星球颜色独立于星云：跟着该后端自己的 level 变化
+      const bcol=backendColor(b);
+      s.material.emissive.setHex(bcol);
+      s.material.emissiveIntensity = b.status==='idle' ? 1.1 : (b.status==='jam' ? 3.4 : 2.8);
+      const glow=s.children && s.children[0];
+      if(glow && glow.material) glow.material.color.setHex(bcol);
+      s.scale.setScalar(.75+Math.min(1.4,(b.active||0)*.14));});
     c.m=m;
   });
 }
@@ -397,10 +412,41 @@ function projectLabels(){
       const act=(b&&b.active)||0;
       nd.textContent=act;
       nd.classList.toggle('hot', act>0);
-      nd.style.transform=`translate(${(tmpV.x*.5+.5)*W+16}px,${(-tmpV.y*.5+.5)*H-14}px)`;
       nd.style.opacity=focus&&focus!==c?.08:1;
+      // 先按投影位置摆放，稍后统一做一次碰撞避让（见下方 resolveLabelOverlap）
+      nd.dataset.x=String((tmpV.x*.5+.5)*W+16);
+      nd.dataset.y=String((-tmpV.y*.5+.5)*H-14);
     });
   });
+  resolveLabelOverlap();
+}
+
+/** 数字标签防重叠：以投影点为锚，做几轮轻量力导向散开（只移动标签，不动星球） */
+function resolveLabelOverlap(){
+  const items=[];
+  labelEls.forEach(el=>{
+    if(!el.dataset.x) return;
+    const w=el.offsetWidth||22, h=el.offsetHeight||16;
+    items.push({el,x:parseFloat(el.dataset.x),y:parseFloat(el.dataset.y),ox:parseFloat(el.dataset.x),oy:parseFloat(el.dataset.y),w,h});
+  });
+  for(let iter=0; iter<8; iter++){
+    for(let i=0;i<items.length;i++){
+      for(let j=i+1;j<items.length;j++){
+        const a=items[i], b=items[j];
+        const dx=b.x-a.x, dy=b.y-a.y;
+        const minX=(a.w+b.w)*0.55, minY=(a.h+b.h)*0.62;
+        if(Math.abs(dx)>minX || Math.abs(dy)>minY) continue;
+        // 沿重叠较小的轴推开，并优先横向（避免竖着排一长串）
+        const pushX=(minX-Math.abs(dx))*(dx>=0?1:-1)*0.5;
+        const pushY=(minY-Math.abs(dy))*(dy>=0?1:-1)*0.5;
+        if(Math.abs(dx)>=Math.abs(dy)*0.6){ a.x-=pushX; b.x+=pushX; }
+        else { a.y-=pushY; b.y+=pushY; }
+      }
+    }
+    // 回弹：始终轻微吸回锚点，防止标签飘太远
+    items.forEach(it=>{ it.x+=(it.ox-it.x)*0.12; it.y+=(it.oy-it.y)*0.12; });
+  }
+  items.forEach(it=>{ it.el.style.transform=`translate(${it.x.toFixed(1)}px,${it.y.toFixed(1)}px)`; });
 }
 
 function onMove(e){

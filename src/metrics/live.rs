@@ -329,6 +329,33 @@ fn pct_buckets(
     out
 }
 
+/// 某模型下单个后端的直方图桶差分（用于后端粒度的 TTFT P95）
+fn pct_buckets_backend(
+    oldest: &HashMap<String, f64>,
+    newest: &HashMap<String, f64>,
+    fam: Fam,
+    model: &str,
+    backend: &str,
+) -> Vec<(f64, f64)> {
+    let mut acc: HashMap<u64, (f64, f64)> = HashMap::new();
+    for (k, v) in newest {
+        if !k.starts_with(&format!("{:?}\u{1}", fam)) {
+            continue;
+        }
+        let (m, be, _extra, _s, le) = split_key(k);
+        if m != model || be != backend {
+            continue;
+        }
+        let base = oldest.get(k).copied().unwrap_or(0.0);
+        let delta = (v - base).max(0.0);
+        let e = acc.entry(le.to_bits()).or_insert((le, 0.0));
+        e.1 += delta;
+    }
+    let mut out: Vec<(f64, f64)> = acc.values().copied().collect();
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 fn level_of(busy: f64) -> (&'static str, &'static str) {
     if busy >= 75.0 {
         ("over", "过载")
@@ -459,6 +486,62 @@ fn build_snapshot(samples: &VecDeque<Sample>) -> serde_json::Value {
             };
             b["share"] = serde_json::json!((share * 1000.0).round() / 1000.0);
         }
+        // 每个后端独立的繁忙度与颜色等级：与星云解耦，按自身用量/延迟/并发计算
+        for b in backends.iter_mut() {
+            let name = b
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let b_req = b.get("req").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let b_share = b.get("share").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let b_active = b.get("active").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let b_decode = b.get("decode").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let b_cap = per
+                .get(&format!("{model}\u{1}{name}"))
+                .map(|a| a.cap)
+                .unwrap_or(0.0);
+            let b_http_err = per
+                .get(&format!("{model}\u{1}{name}"))
+                .map(|a| a.http_err)
+                .unwrap_or(0.0);
+            let b_ttft = pct_buckets_backend(
+                &pct_old.values,
+                &newest.values,
+                Fam::TtftBucket,
+                model,
+                &name,
+            );
+            let b_p95 = quantile(&b_ttft, 0.95);
+            // 并发：以 1h 峰值为参考；无峰值记录时用 4 作为基准
+            let cap_ref = if b_cap > 0.0 { b_cap } else { 4.0 };
+            let b_load = (b_active / cap_ref).min(1.0);
+            let b_ttft_score = b_p95
+                .map(|t| ((1.0_f64 + t / 3.0).ln() / (1.0_f64 + 60.0 / 3.0).ln()).min(1.0))
+                .unwrap_or(0.0);
+            let b_speed = (1.0 - (b_decode / 120.0)).clamp(0.0, 1.0);
+            // 流量维度：该后端在自己的模型内占多少
+            let b_traffic = b_share.clamp(0.0, 1.0);
+            let b_busy =
+                100.0 * (0.35 * b_load + 0.25 * b_ttft_score + 0.20 * b_speed + 0.20 * b_traffic);
+            let b_err_rate = if b_req > 0.0 { b_http_err / b_req } else { 0.0 };
+            let (b_level, _b_cn) = level_of(b_busy);
+            let b_status = if b_err_rate > 0.10 || b_busy >= 75.0 {
+                "jam"
+            } else if b_busy >= 50.0 {
+                "warn"
+            } else if b_active <= 0.0 && b_req <= 0.0 {
+                "idle"
+            } else {
+                "ok"
+            };
+            b["busy"] = serde_json::json!((b_busy * 10.0).round() / 10.0);
+            b["level"] = serde_json::json!(b_level);
+            b["status"] = serde_json::json!(b_status);
+            b["ttftP95"] = serde_json::json!(b_p95.map(|v| (v * 100.0).round() / 100.0));
+            b["errRate"] = serde_json::json!((b_err_rate * 10000.0).round() / 10000.0);
+        }
+
         backends.sort_by(|a, b| {
             let sa = a.get("share").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let sb = b.get("share").and_then(|v| v.as_f64()).unwrap_or(0.0);
