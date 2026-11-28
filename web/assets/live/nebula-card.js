@@ -170,7 +170,13 @@ import { loadCircuit, enrichModels } from './live-circuits.js';
       }
 
       const list = ov.querySelector('#ovList');
-      const all = (d.models || []).slice().sort((a, b) => b.busy - a.busy);
+      // 排序：先对话类（chat/completions/messages/responses），再按近 60s 用量降序，
+      // 用量相同才看繁忙度；嵌入/重排这类非对话模型始终排在后面
+      const rank = m => (m.dialogue ? 1 : 0);
+      const all = (d.models || []).slice().sort((a, b) =>
+        rank(b) - rank(a) ||
+        (b.rpm || 0) - (a.rpm || 0) ||
+        (b.busy || 0) - (a.busy || 0));
       const top = all.slice(0, 4);
       const rest = all.length - top.length;
       list.innerHTML = top.map(m => {
@@ -180,7 +186,8 @@ import { loadCircuit, enrichModels } from './live-circuits.js';
           <div class="ov-l1"><i style="width:8px;height:8px;border-radius:50%;background:${c};display:inline-block"></i>
             ${m.name}<em style="background:${c}22;color:${c}">${cn} ${m.busy.toFixed(0)}</em>
             ${m.backendsBroken ? `<em style="background:#ff6b4a22;color:#ff6b4a">熔断 ${m.backendsBroken}</em>` : ''}
-            ${m.backendsDisabled ? `<em style="background:#94a3b822;color:#94a3b8">停用 ${m.backendsDisabled}</em>` : ''}</div>
+            ${m.backendsDisabled ? `<em style="background:#94a3b822;color:#94a3b8">停用 ${m.backendsDisabled}</em>` : ''}
+            ${m.dialogue ? '' : `<em style="background:#64748b22;color:#64748b">非对话</em>`}</div>
           <div class="ov-l2"><span><b>${m.rpm.toFixed(1)}</b>/min</span><span>成功率 <b>${succ}%</b></span>
             <span>TTFT <b>${m.ttftP95 ? m.ttftP95.toFixed(1) + 's' : '—'}</b></span>
             <span>解码 <b>${m.decode ? m.decode.toFixed(0) : '—'}</b></span>

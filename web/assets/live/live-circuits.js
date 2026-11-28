@@ -1,7 +1,14 @@
 /** 熔断状态：从 /metrics 读取并补全到模型/后端列表（前端自算，不改后端） */
 
 /** 从 /metrics 解析熔断状态：返回 {"model\u0001backend": {state, cooldown}} 与 backend-only 兜底表 */
-export const CIRCUIT={ paired:new Map(), byBackend:new Map(), pairs:new Set() };
+const CHAT_ENDPOINTS = [/\/v1\/chat\/completions$/, /\/v1\/completions$/, /\/v1\/messages$/, /\/v1\/responses$/];
+const isChatEndpoint = (ep) => CHAT_ENDPOINTS.some(re => re.test(ep));
+
+export const CIRCUIT={
+  paired:new Map(), byBackend:new Map(), pairs:new Set(),
+  /** 模型 → {chat, other}：只按接口类型区分对话/非对话流量 */
+  traffic:new Map(),
+};
 
 export function parseCircuit(text){
   const paired=new Map(), byBackend=new Map(), pairs=new Set();
@@ -13,6 +20,18 @@ export function parseCircuit(text){
     const line=raw.trim();
     if(!line || line[0]==='#') continue;
 
+    // 对话类 vs 非对话类流量（排序用）
+    if(line.startsWith('gpt_api_requests_total{')){
+      const mm=line.match(/model="([^"]*)"/);
+      const em=line.match(/endpoint="([^"]*)"/);
+      const v=num(/}\s+([-0-9.eE+]+)\s*$/, line);
+      if(mm && em && v!==null && mm[1] && mm[1]!=='-' && mm[1]!=='unknown'){
+        const cur=CIRCUIT.traffic.get(mm[1]) || {chat:0, other:0};
+        if(isChatEndpoint(em[1])) cur.chat+=v; else cur.other+=v;
+        CIRCUIT.traffic.set(mm[1], cur);
+      }
+      continue;
+    }
     // 模型 × 后端
     if(line.startsWith('gpt_api_model_backend_circuit_state{')){
       const bm=line.match(/backend="([^"]*)"/), mm=line.match(/model="([^"]*)"/);
@@ -95,12 +114,23 @@ export function enrichModels(models){
       b.registered = c.state>=0;
       if(c.state===1||c.state===2) broken++;
       else if(c.state===3) disabled++;
+      if(!b.synthetic && (b.req||0)<=0 && (b.active||0)<=0 && !(b.circuit>=1)){
+        b.busy = 0; b.level='idle';
+      }
       if(b.synthetic){
         b.busy  = c.state===1?100:(c.state===2?80:0);
         b.level = c.state===1?'fault':(c.state===2?'over':'idle');
         b.status= (c.state===1||c.state===2)?'jam':'idle';
       }
     });
+    const t = CIRCUIT.traffic.get(m.id) || {chat:0, other:0};
+    m.chatRequests = Math.round(t.chat);
+    m.otherRequests = Math.round(t.other);
+    m.dialogue = t.chat > 0;          // 至少处理过一次对话请求
+    // 60s 无请求、也无并发 → 空闲，不应因为“TPS 效率”拿分而排在前面
+    if((m.rpm||0) <= 0 && ((m.active||0) <= 0)){
+      m.busy = 0; m.level='idle'; m.levelCn='空闲';
+    }
     m.backendsTotal = m.backends.length;
     m.backendsBroken = broken;
     m.backendsDisabled = disabled;
