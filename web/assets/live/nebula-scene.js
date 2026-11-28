@@ -231,6 +231,7 @@ function rebuildClusters(models){
         new THREE.MeshStandardMaterial({color:bcol,emissive:bcol,emissiveIntensity:2.2,roughness:.25,metalness:.05}));
       s.position.copy(p);
       s.userData.baseColor=bcol;
+      s.userData.backendName=b.name;   // 按名字绑定，避免顺序变化后错位
       const h=new THREE.Sprite(new THREE.SpriteMaterial({map:GLOW,color:bcol,transparent:true,opacity:.85,blending:THREE.AdditiveBlending,depthWrite:false}));
       h.scale.setScalar(.55); s.add(h);
       // 水平环绕的文字带（绕球一圈，随球自转）
@@ -251,8 +252,9 @@ function rebuildClusters(models){
       depthWrite:false,depthTest:true,blending:THREE.NormalBlending}));
     nameSpr.scale.set(1.9*cscale,1.9*cscale*tt.h/tt.w,1); nameSpr.position.set(0,0,-0.05); nameSpr.renderOrder=-1;
     grp.add(nameSpr);
-    (m.backends||[]).forEach((b,bi)=>{const nd=document.createElement('div'); nd.className='lab num'; nd.textContent=(b.active||0);
-      labels.appendChild(nd); labelEls.set('n_'+m.id+'_'+bi,nd);});
+    (m.backends||[]).forEach(b=>{const nd=document.createElement('div'); nd.className='lab num';
+      nd.textContent=(b.active||0); nd.dataset.backend=b.name;
+      labels.appendChild(nd); labelEls.set('n_'+m.id+'_'+b.name,nd);});
   });
 }
 
@@ -264,7 +266,11 @@ function updateClusters(models){
     c.shell.material.opacity=m.status==='idle'?.22:.5;
     c.shell.material.size=m.status==='idle'?.09:.12;
     c.neb.forEach(sp=>{sp.material.color.setHex(col);sp.material.opacity=m.status==='idle'?.06:.12;});
-    c.stars.forEach((s,bi)=>{const b=(m.backends||[])[bi]; if(!b)return;
+    const byName=new Map((m.backends||[]).map(b=>[b.name,b]));
+    c.stars.forEach(s=>{
+      const b=byName.get(s.userData.backendName);
+      if(!b){ s.visible=false; return; }
+      s.visible=true;
       const circuit = (b.circuit===undefined||b.circuit===null)?-1:b.circuit;
       const prevCircuit = s.userData.circuit===undefined?-1:s.userData.circuit;
       s.userData.circuit = circuit;
@@ -451,10 +457,12 @@ function projectLabels(){
     c.grp.getWorldPosition(tmpV); tmpV.y+=0.34*(c.cscale||1); tmpV.project(camera);
     const ct=new THREE.Vector3(); c.grp.getWorldPosition(ct); ct.project(camera);
     const projectedClusterX=(ct.x*.5+.5)*W, projectedClusterY=(-ct.y*.5+.5)*H;
-    (c.stars||[]).forEach((s,bi)=>{
+    const byName=new Map((c.m.backends||[]).map(b=>[b.name,b]));
+    (c.stars||[]).forEach(s=>{
+      const b=byName.get(s.userData.backendName);
+      const nd=labelEls.get('n_'+id+'_'+s.userData.backendName);
+      if(!nd||!b){ if(nd) nd.style.opacity=0; return; }
       s.getWorldPosition(tmpV); tmpV.project(camera);
-      const nd=labelEls.get('n_'+id+'_'+bi); if(!nd) return;
-      const b=(c.m.backends||[])[bi];
       const act=(b&&b.active)||0;
       nd.textContent=act;
       nd.classList.toggle('hot', act>0);
@@ -541,7 +549,9 @@ function applyLive(d){
   enrichModels(d.models);
   // 后端按流量排序返回，顺序会随繁忙度抖动；用**排序后的 id 集合**做 key，
   // 只有模型集合真的变化时才重建，避免朝向/位置被反复重置。
-  const key=d.models.map(m=>m.id).slice().sort().join('|');
+  // 模型集合 或 任一模的后端集合变化时才重建（新后端需要有星球可挂）
+  const key=d.models.map(m=>m.id+':'+(m.backends||[]).map(b=>b.name).slice().sort().join(','))
+              .sort().join('|');
   if(key!==idsKey){ idsKey=key; rebuildClusters(d.models); } else updateClusters(d.models);
   rpm=d.totals.rpm||0;
 }
