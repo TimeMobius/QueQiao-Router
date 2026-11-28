@@ -5,10 +5,11 @@ export function createNebula(container){
 const $=id=>container.querySelector('#'+id);
 
 const labels=document.createElement('div'); labels.id='labels';
-labels.style.cssText='position:absolute;inset:0;pointer-events:none;overflow:hidden';
+labels.style.cssText='position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:2';
 container.appendChild(labels);
 const tip=document.createElement('div');
 tip.style.cssText='position:absolute;left:0;top:0;pointer-events:none;padding:6px 9px;border-radius:7px;background:rgba(6,14,26,.92);border:1px solid rgba(103,232,249,.25);color:#dbeafe;font-size:11.5px;line-height:1.5;opacity:0;transition:opacity .12s;white-space:nowrap;transform:translate(-50%,-100%)';
+tip.style.zIndex='3';
 container.appendChild(tip);
 const SAT={ok:0x67e8f9,warn:0xfbbf24,jam:0xfb7185,idle:0x5b6b82};
 const LEVEL={smooth:0x67e8f9,normal:0x34d399,busy:0xfbbf24,over:0xfb7185,fault:0xef4444,idle:0x5b6b82};
@@ -393,9 +394,11 @@ function projectLabels(){
       s.getWorldPosition(tmpV); tmpV.project(camera);
       const nd=labelEls.get('n_'+id+'_'+bi); if(!nd) return;
       const b=(c.m.backends||[])[bi];
-      nd.textContent=(b&&b.active)||0;
-      nd.style.transform=`translate(${(tmpV.x*.5+.5)*W+14}px,${(-tmpV.y*.5+.5)*H-16}px)`;
-      nd.style.opacity=focus&&focus!==c?.08:.85;
+      const act=(b&&b.active)||0;
+      nd.textContent=act;
+      nd.classList.toggle('hot', act>0);
+      nd.style.transform=`translate(${(tmpV.x*.5+.5)*W+16}px,${(-tmpV.y*.5+.5)*H-14}px)`;
+      nd.style.opacity=focus&&focus!==c?.08:1;
     });
   });
 }

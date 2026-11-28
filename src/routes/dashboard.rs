@@ -24,7 +24,6 @@ struct DashboardAssets;
 pub fn dashboard_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(index_handler))
-        .route("/classic", get(classic_page))
         .route("/records", get(records_page))
         .route("/analysis", get(analysis_page))
         .route("/api/live", get(live_snapshot))
@@ -49,10 +48,6 @@ async fn live_snapshot() -> axum::Json<serde_json::Value> {
 
 async fn index_handler(headers: HeaderMap) -> Response {
     serve_asset("index.html", &headers)
-}
-
-async fn classic_page(headers: HeaderMap) -> Response {
-    serve_asset("classic.html", &headers)
 }
 
 async fn records_page(headers: HeaderMap) -> Response {

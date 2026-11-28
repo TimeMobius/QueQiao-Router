@@ -446,7 +446,8 @@ fn build_snapshot(samples: &VecDeque<Sample>) -> serde_json::Value {
                 "decode": (acc.tps * 10.0).round() / 10.0,
             }));
         }
-        if total_req <= 0.0 && active <= 0.0 {
+        // 即使 60s 内没有流量也要保留：面板需要显示“空闲模型”而不是让它凭空消失
+        if backends.is_empty() {
             continue;
         }
         for b in backends.iter_mut() {

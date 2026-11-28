@@ -69,8 +69,10 @@ import { createNebula } from './nebula-scene.js';
   #nebulaCard .lab.mdl{color:#dbeafe;font-weight:600;font-size:11px}
   #nebulaCard .lab.idle{color:#94a3b8;font-size:9.5px;opacity:.55}
   #nebulaCard .lab.be{color:#a5f3fc;font-size:9px;background:rgba(2,8,16,.55);padding:1px 5px;border-radius:4px;border:1px solid rgba(103,232,249,.18)}
-  #nebulaCard .lab.num{color:rgba(165,243,252,.9);font-size:10.5px;font-weight:600;background:rgba(2,8,16,.42);
-    border:1px solid rgba(103,232,249,.22);border-radius:999px;padding:1px 6px}
+  #nebulaCard .lab.num{color:#e6feff;font-size:11px;font-weight:700;line-height:1.35;
+    background:rgba(2,10,20,.72);border:1px solid rgba(103,232,249,.45);border-radius:999px;
+    padding:1px 7px;box-shadow:0 0 10px rgba(34,211,238,.35);font-variant-numeric:tabular-nums}
+  #nebulaCard .lab.num.hot{color:#06202b;background:#67e8f9;border-color:#a5f3fc}
   /* 响应式栅格：2 列 + dense 流式填充，半幅卡自动补位 */
   @media (min-width: 1150px){
     .charts-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;grid-auto-flow:row dense!important}
@@ -137,7 +139,7 @@ import { createNebula } from './nebula-scene.js';
   ov.innerHTML = `<div class="chart-header">
       <div>
         <div class="chart-title">系统总览</div>
-        <div class="chart-subtitle">繁忙度、成功率与后端流量分布</div>
+        <div class="chart-subtitle">繁忙度、成功率与后端流量分布（近 60s 请求数 · 该后端流量占比 · 当前正在处理的请求数）</div>
       </div>
     </div><div id="ovList"></div>`;
   pair.appendChild(ov);
@@ -181,7 +183,7 @@ import { createNebula } from './nebula-scene.js';
           <div class="ov-busy"><i style="width:${Math.min(100, m.busy)}%;background:linear-gradient(90deg,${c}55,${c})"></i></div>
           ${(m.backends || []).slice(0, 4).map(b => `<div class="ov-bk"><span>${b.name}</span>
             <span class="bar"><i style="width:${Math.round((b.share || 0) * 100)}%"></i></span>
-            <u>${b.req ?? 0} 次 · ${Math.round((b.share || 0) * 100)}% · 并发${b.active ?? 0}</u></div>`).join('')}
+            <u>${b.req ?? 0}次 / ${Math.round((b.share || 0) * 100)}% · 处理中 ${b.active ?? 0}</u></div>`).join('')}
         </div>`;
       }).join('') + (rest > 0 ? `<div class="ov-more">另有 ${rest} 个模型空闲或低负载</div>` : '');
     } catch (e) { /* ignore */ }
